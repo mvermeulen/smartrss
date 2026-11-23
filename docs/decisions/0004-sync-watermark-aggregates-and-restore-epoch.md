@@ -1,7 +1,7 @@
 # 0004: Committed Sync Watermark, Aggregate Sync Surface & Restore Epoch
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22
+- **Status**: Accepted
+- **Date**: 2026-11-22 (accepted 2026-11-23, with the transaction-boundary clarification above)
 
 ## Context
 The initial design allocated `sync_seq` using a PostgreSQL `SEQUENCE` (`nextval()`). Because concurrent transactions can allocate sequence numbers in one order and commit in another, a client pulling between commits could advance its cursor past a late-committing transaction and permanently miss records. Furthermore, child entities (`item_enrichments`, `item_tags`, `research_sources`, `feedback_events`) and deletions/cluster removals lacked explicit sync contracts, and restoring PostgreSQL from a backup could rewind `sync_seq` behind a client's stored cursor.
@@ -11,6 +11,7 @@ The initial design allocated `sync_seq` using a PostgreSQL `SEQUENCE` (`nextval(
    - Maintain a single-row `sync_state(id=1, current_seq BIGINT, instance_epoch UUID)` table and an append-only `sync_changes(seq BIGINT PK, entity_type TEXT, entity_id UUID, op TEXT, changed_at TIMESTAMPTZ)` table.
    - At the **end** of any write transaction that mutates synced state, acquire `SELECT current_seq FROM sync_state WHERE id = 1 FOR UPDATE`, increment `current_seq`, and insert the corresponding `sync_changes` row(s) before committing.
    - Because the row lock serializes commit ordering of synced writes (taking sub-millisecond time at SmartRSS's ~200 items/day single-user scale), no committed row can ever become visible with a `seq` lower than an already-committed higher `seq`. Pull queries (`WHERE seq > :since_seq ORDER BY seq ASC LIMIT :page_size`) can never skip rows.
+   - **Transaction boundary is critical**: any slow I/O — above all the `LLMAdapter` call in `enrich_item`, but also outbound HTTP fetches — must complete *before* opening this final write transaction. The transaction that takes the `sync_state FOR UPDATE` lock should contain only the already-computed result write, the watermark increment, and the `sync_changes` insert, then commit immediately. Wrapping the LLM call itself inside this transaction would serialize every other synced write (item ingestion, read/star mutations, feed config changes) behind LLM latency (~10–25s/item), violating the 2-minute visibility and 5-second outbox-flush targets in `NFR-SYNC-02` — a correctness bug in the implementation, not in this design.
    - *(Alternative considered: `pg_snapshot_xmin(pg_current_snapshot())` stable-watermark filtering; rejected as more complex to reason about and test when single-user write concurrency is very low.)*
 2. **Aggregate-shaped Sync Surface & Explicit Tombstones**:
    - Synced entities are explicitly enumerated in `docs/data-model.md` §5.

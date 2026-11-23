@@ -1,6 +1,6 @@
 # System Architecture
 
-> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
+> **Status:** Approved *(2026-11-23, by project owner)*
 
 ## 1. High-Level Overview
 SmartRSS uses a **containerized home-LAN backend** paired with **local-first clients** that run from a stable secure origin (`localhost` on Ubuntu laptops in Phase 1; native/Capacitor shell on Android in Phase 2), cache curated items/metadata locally, and queue offline mutations when detached from the home network.

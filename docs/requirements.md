@@ -1,6 +1,6 @@
 # Requirements
 
-> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
+> **Status:** Approved *(2026-11-23, by project owner)*
 
 ## 1. Problem Statement
 Standard RSS readers fetch raw feeds chronologically and leave all triage, organization, and enrichment to the user. High-volume or overlapping feeds create noise and duplication, RSS entries often contain only short teasers or commentary pointing to deeper primary sources (such as research papers or technical reports), and client-only readers repeat fetching/processing across devices without shared intelligence.

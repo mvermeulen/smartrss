@@ -1,7 +1,7 @@
 # 0003: PostgreSQL-Backed Job Queue & Async LLM Pipeline
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22 (Updated 2026-11-23 for cron/batch execution & stage timing metrics)
+- **Status**: Accepted
+- **Date**: 2026-11-22 (Updated 2026-11-23 for cron/batch execution & stage timing metrics; accepted 2026-11-23)
 
 ## Context
 Feed polling, full-text extraction, PDF mini-research, local LLM enrichment, and clustering are I/O- and compute-bound tasks that can take seconds to tens of seconds per item and may face transient failures (down feeds, busy/restarting local LLM server). At ~25 feeds and ~200 items/day, throughput is modest, but durability, deduplication, stale-lease recovery, priority ordering, observability, and low operational complexity are critical.

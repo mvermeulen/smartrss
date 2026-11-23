@@ -1,7 +1,7 @@
 # 0005: Phase 1 Client Origin, Frontend Stack & Offline Shell
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22
+- **Status**: Accepted
+- **Date**: 2026-11-22 (accepted 2026-11-23)
 
 ## Context
 The Phase 1 Ubuntu client can run on a **laptop that leaves the home LAN**. Serving a browser SPA from a plain LAN HTTP origin (`http://192.168.1.x` or `http://smartrss.lan`) fails detached-mode requirements: browsers restrict Service Workers (needed to load the app shell offline) and `navigator.storage.persist()` (needed to protect IndexedDB and the unsynced mutation outbox from storage eviction) to **secure contexts** (`https://` or `http://localhost`), and IndexedDB data is orphaned if the server's LAN IP or hostname ever changes. Meanwhile, managing a self-signed local CA across Ubuntu and Android adds operational friction.

@@ -1,6 +1,6 @@
 # Data Model
 
-> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
+> **Status:** Approved *(2026-11-23, by project owner)*
 
 ## 1. Core Entities
 SmartRSS persists a complete historical log in PostgreSQL 16+ (`pgvector` enabled) with a commit-ordered append-only sync change log and explicit per-field conflict metadata.

@@ -1,6 +1,6 @@
 # Development, Testing & Documentation Process
 
-> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
+> **Status:** Approved *(2026-11-23, by project owner)*
 
 This document defines **how** SmartRSS is developed, tested, documented, and evolved. It applies to both human contributors and AI coding agents.
 

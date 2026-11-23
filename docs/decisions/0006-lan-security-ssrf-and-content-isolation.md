@@ -1,7 +1,7 @@
 # 0006: LAN Security, SSRF Prevention & Untrusted Content Isolation
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22
+- **Status**: Accepted
+- **Date**: 2026-11-22 (accepted 2026-11-23, with the transport-risk note above)
 
 ## Context
 Although SmartRSS is single-user and LAN-only, leaving the API unauthenticated and server fetchers unrestricted creates four real attack vectors:
@@ -33,3 +33,4 @@ Although SmartRSS is single-user and LAN-only, leaving the API unauthenticated a
 ## Consequences
 - **Positive**: Closes LAN CSRF/DNS-rebinding/unauthorized-access vectors with near-zero user friction (pair once per device); eliminates SSRF into the home network and host LLM; protects both the browser client and worker host against hostile feeds and crafted PDFs.
 - **Trade-offs**: Adds a small `devices`/`pairing_codes` table, a one-time pairing step per new device, slightly more complex HTTP transport code (IP pinning), and subprocess overhead for extraction (negligible at ~200 items/day).
+- **Accepted residual risk — plain-HTTP token transport**: The client-to-API LAN hop remains plain HTTP (ADR 0002 and ADR 0005 only guarantee a secure *origin* for the client itself, not transport encryption to the server), so a bearer token is sent in cleartext on every request. Anything able to observe LAN traffic — a rogue or compromised device on the same Wi-Fi, or an attacker who has captured the WPA handshake — can sniff a valid token and gain standing read/write access until it's revoked. This is accepted as a residual risk given the stated threat model (a trusted home LAN, not hostile co-tenants), consistent with ADR 0002 already trading away LAN TLS once for the same cert-friction reasons. If the threat model changes (e.g., guests or untrusted devices regularly join the home network), revisit with LAN TLS via a local CA or short-rotation tokens re-issued on each `bootstrap`.

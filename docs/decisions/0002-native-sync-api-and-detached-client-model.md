@@ -1,7 +1,7 @@
 # 0002: Native Sync API & Detached Client Architecture
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22 (Updated 2026-11-22 after design review)
+- **Status**: Accepted
+- **Date**: 2026-11-22 (Updated 2026-11-22 after design review; accepted 2026-11-23)
 
 ## Context
 SmartRSS clients must support an Ubuntu laptop that leaves the LAN (Phase 1) and Android (Phase 2), operate primarily on a home LAN without VPN/public exposure, and detach cleanly from the home server while retaining general internet access to open external RSS links. Clients also need to display rich LLM metadata (TL;DR, takeaways, depth, 5-tier relevance + rationale, mini-research context, clusters) and queue offline mutations including explicit feedback, bulk mark-read, and content-related feed config edits (e.g., unsubscribing/muting).

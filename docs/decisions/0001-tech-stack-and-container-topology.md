@@ -1,7 +1,7 @@
 # 0001: Backend Tech Stack & Container Topology
 
-- **Status**: Proposed *(pending owner approval)*
-- **Date**: 2026-11-22 (Updated 2026-11-22 after design review)
+- **Status**: Accepted
+- **Date**: 2026-11-22 (Updated 2026-11-22 after design review; accepted 2026-11-23)
 
 ## Context
 SmartRSS needs a self-hosted home-LAN backend running on Ubuntu Linux (packaged cleanly as Docker containers for a diverse homelab environment) that handles ~25 feeds (~200 items/day), full-text HTML extraction, PDF research-paper parsing, local LLM inference on an AMD Ryzen AI Max+ 395 (128 GB unified memory) host via Ollama or `llama.cpp`, full-text search, and cross-feed story clustering.
