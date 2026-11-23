@@ -1,122 +1,135 @@
 # Requirements
 
-> **Status:** In Review — Core requirements captured across discovery rounds; ready for review before locking architecture and component designs.
+> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
 
 ## 1. Problem Statement
 Standard RSS readers fetch raw feeds chronologically and leave all triage, organization, and enrichment to the user. High-volume or overlapping feeds create noise and duplication, RSS entries often contain only short teasers or commentary pointing to deeper primary sources (such as research papers or technical reports), and client-only readers repeat fetching/processing across devices without shared intelligence.
 
-**SmartRSS** is a self-hosted, distributed RSS system for a single user. A containerized backend server on the home LAN pre-fetches feeds, extracts full article content and selectively performs deeper "mini-research" on primary referenced sources (including PDFs and reports), uses a local LLM to generate structured display and curation metadata, clusters duplicate/overlapping stories, and persists a full historical log in a database. Clients provide a classic RSS reading experience enhanced with smart metadata, sync over home Wi-Fi, and operate seamlessly when detached from the home network.
+**SmartRSS** is a self-hosted, distributed RSS system for a single user. A containerized backend server on the home LAN pre-fetches feeds, extracts full article content and selectively performs deeper "mini-research" on primary referenced sources (including PDFs and reports), uses a local LLM to generate structured display and curation metadata, clusters duplicate/overlapping stories, and persists a full historical log in PostgreSQL. Local-first clients provide a classic RSS reading experience enhanced with smart metadata, sync over home Wi-Fi, and operate seamlessly when detached from the home network.
 
 ## 2. Goals & Non-Goals
+
 ### Goals
-- **Local LLM Enrichment & Customizable Curation**: Use local LLMs (`Ollama` or `llama.cpp`) to generate structured display metadata (TL;DR, key takeaways, topic/category tags, content depth) and curation metadata (relevance score + "why" rationale), with user-editable prompts, interest profiles, and per-feed curation instructions.
-- **Selective "Mini-Research" on Primary Sources**: When an RSS item references or discusses an underlying primary source (e.g., a research paper PDF, technical report, or primary article), selectively fetch and synthesize context from that source—guided by per-feed configuration and user feedback.
+- **Local LLM Enrichment & Customizable Curation**: Use local LLMs (`Ollama` or `llama.cpp`) to generate structured display metadata (TL;DR, key takeaways, topic tags, content depth) and curation metadata (5-tier calibrated relevance + "why" rationale), with user-editable prompts, interest profiles, and per-feed guidance.
+- **Selective "Mini-Research" on Primary Sources**: When an RSS item references or discusses an underlying primary source (e.g., research paper PDF, technical report, or primary article), selectively fetch and synthesize context from that source—guided by per-feed configuration and user feedback.
 - **Distributed Client-Server Architecture**:
-  - **Server**: Pre-fetches feeds politely, extracts full content and primary references, clusters duplicate/overlapping topics, runs local LLM enrichment/curation, tracks feed health, and persists all history and state.
-  - **Clients**: Provide a classic RSS reader experience backed by the server, caching enriched items and metadata locally, opening external web URLs in a browser, and syncing back read/star state, explicit feedback, and content-related configuration changes.
-- **Local-Network First with Detached Operation**: Designed around a home LAN / Wi-Fi model. Clients sync when connected to the home LAN and detach cleanly when away (assuming general internet access is still available to follow external article URLs, just without access to the home backend server).
-- **Proven RSS & Content Management Patterns**: Incorporate feed hygiene (polite polling, backoff, feed health), categories/folders and tags, cross-feed deduplication/clustering, read/unread and star/save management, configurable unread expiration with a retained historical log, and full-text search.
-- **Feedback-Driven Evolution**: Start with simple, explicit user feedback controls (including prompt/curation customization and research hints like "fetch PDFs here") while keeping the design extensible for more sophisticated adaptation over time.
+  - **Server**: Pre-fetches feeds politely, enforces SSRF and parser-isolation guardrails, extracts full content and primary references, clusters duplicate/overlapping topics, runs local LLM enrichment/curation, tracks feed health, and persists all history and state.
+  - **Clients**: Provide a classic RSS reader experience backed by the server, caching enriched items and metadata locally, opening external web URLs directly in the browser, and syncing back read/star state, bulk actions, explicit feedback, and content-related configuration changes.
+- **Local-Network First with Reliable Detached Operation**: Designed around a home LAN / Wi-Fi model with per-device pairing auth. Clients sync when connected to the home LAN and detach cleanly when away (assuming general internet access is still available to follow external URLs, just without access to the home backend server).
+- **Proven RSS & Content Management Patterns**: Incorporate feed hygiene (polite polling, backoff, feed health, OPML), categories/folders and tags, cross-feed deduplication/clustering, read/unread, bulk mark-read, star/save, configurable unread expiration with a retained historical log, and full-text + detached local search.
+- **Feedback-Driven Evolution**: Start with simple, explicit user feedback controls and an offline evaluation harness so curation quality can be measured and improved over time.
 
 ### Non-Goals
-- **Multi-user / Multi-tenant support**: Designed primarily for a single user (no user accounts, sharing, or per-user tenant isolation required).
-- **Third-party RSS client protocol compatibility** (e.g., Fever API, Google Reader API): Not required; a native SmartRSS API will expose LLM metadata, mini-research context, clusters, explicit feedback, and offline config mutations as first-class concepts.
-- **Public internet / VPN remote access**: Initial scope assumes local LAN / home Wi-Fi sync only (no public exposure or VPN-specific workflows required).
+- **Multi-user / Multi-tenant support**: Designed for a single personal user (no user accounts, sharing, or per-user tenant isolation).
+- **Third-party RSS client protocol compatibility** (Fever API, Google Reader API): **Permanent non-goal** (see [ADR 0002](decisions/0002-native-sync-api-and-detached-client-model.md)); the native SmartRSS Sync API stays cleanly aggregate-shaped for LLM metadata, clusters, feedback, and offline config mutations.
+- **Public internet / VPN remote access**: Initial scope assumes local LAN / home Wi-Fi sync only (no public internet hosting or VPN-specific workflows).
 - **Full external webpage / media mirroring on clients**: Detached clients cache server-curated records and metadata rather than mirroring external linked web pages; clicking a link opens the external URL via the client's internet connection.
 
-## 3. Target Users, Scale & Platforms
+## 3. Target Users, Scale & User Stories
+
 - **Primary User**: Single personal user running a home/LAN backend server.
 - **Target Scale**: ~25 feeds, ~200 items/day (~73k items/year), with headroom to scale to ~50–100 feeds without redesign.
 - **Target Platforms**:
-  - **Server**: Ubuntu Linux, packaged primarily as Docker containers (Docker Compose) connecting to a local LLM runtime (`Ollama` or `llama.cpp`) running on an AMD Ryzen AI Max+ 395 class machine (128 GB unified memory).
-  - **Client — Phase 1**: Linux / Ubuntu desktop (browser-based UI or browser-integrated interface for effortless opening of external URLs).
-  - **Client — Phase 2**: Android client supporting detached caching and offline triage/config edits away from home Wi-Fi.
+  - **Server**: Ubuntu Linux via Docker Compose connecting to a host-native local LLM runtime (`Ollama` or `llama.cpp`) on an AMD Ryzen AI Max+ 395 class machine (128 GB unified memory, preference toward fast MoE models).
+  - **Client — Phase 1**: Ubuntu **laptop** (which leaves the home LAN) running a localhost-served local-first Web App / lightweight desktop shell (see [ADR 0005](decisions/0005-phase1-client-origin-and-offline-shell.md)).
+  - **Client — Phase 2**: Android client supporting detached caching, browser handoff, and home-Wi-Fi sync.
+
+### Core User Stories
+- **US-01 (Morning Triage)**: *As the user on my Ubuntu laptop, I open SmartRSS sorted by relevance tier then recency, scan grouped story clusters with TL;DRs, takeaways, depth badges, and "why" rationales, open high-tier articles in browser tabs, star keepers, and mark clusters or feeds read quickly with keyboard shortcuts or sort buttons.*
+- **US-02 (Detached Laptop Reading & Config Edits)**: *As the user away from home Wi-Fi with internet access, I open SmartRSS on my laptop without hitting the home server, search my cached items locally, open external article/PDF URLs in my browser, mark items/feeds read, give relevance feedback, and mute or unsubscribe noisy feeds—knowing all changes will sync reliably when I return home.*
+- **US-03 (Dig Deeper on a Research Paper)**: *As the user reading an AI/LLM blog post that summarizes a new paper, SmartRSS either automatically fetches the linked arXiv/PDF paper per the feed's research policy or lets me click "Dig Deeper" / "Fetch PDFs for this feed", surfacing synthesized methodology and takeaways alongside a direct link to the PDF.*
+- **US-04 (Tuning & Evaluating Curation)**: *As the user noticing mis-scored items, I click thumbs up/down with an optional short reason, adjust my editable Interest Profile or prompt template, and run an offline evaluation against my feedback history to confirm the change improved scoring accuracy.*
+- **US-05 (Clean Feed Onboarding)**: *As the user importing an OPML file of ~25 feeds, SmartRSS ingests the feed list, caps initial unread enrichment to the newest N items per feed so the LLM isn't buried for days, and surfaces any broken or redirected feeds in Feed Health.*
 
 ## 4. Functional Requirements
 
 ### 4.1 Feed Management, Hygiene & Ingestion
-- **Feed Subscriptions & Organization**: Add, edit, pause/mute, and unsubscribe feeds; organize feeds into categories/folders; import/export subscriptions via OPML.
-- **Polite Polling & Resilience**: Support HTTP conditional requests (`ETag`, `Last-Modified`), per-feed polling intervals, user-agent identification, request timeouts, and exponential backoff on transient failures.
-- **Feed Health Monitoring**: Track and surface per-feed health (last successful fetch, HTTP status/error message, consecutive error count, item cadence, stale/broken indicators).
-- **Server-Side Full Content Extraction**: Fetch and extract clean article text from linked URLs on the backend whenever feasible so the local LLM analyzes full content rather than truncated RSS teasers.
-- **Per-Feed Intelligence & Research Configuration**: Allow per-feed attributes/guidance (e.g., custom instructions, whether to perform mini-research, whether to follow and parse linked PDFs/papers, expiration overrides).
+- **`FR-FEED-01` Subscriptions & Organization**: Add, edit, pause, mute, and unsubscribe feeds; organize feeds into categories/folders; import/export subscriptions via OPML.
+- **`FR-FEED-02` Polite Polling & Resilience**: Support HTTP conditional requests (`ETag`, `Last-Modified`), `304 Not Modified`, `301` URL migration (handling uniqueness collisions safely), `410 Gone`, `429` + `Retry-After`, `Cache-Control`, polling jitter, per-feed intervals, request timeouts, exponential backoff on failures, and per-domain rate limiting for article fetches.
+- **`FR-FEED-03` Feed Health Monitoring**: Separate user intent (`active`/`paused`/`muted`/`unsubscribed`) from server health (`healthy`/`degraded`/`broken`/`gone`) and surface last successful fetch, HTTP error, consecutive error count, and staleness in a Feed Health view.
+- **`FR-FEED-04` Full Content Extraction**: Fetch and extract clean article text from linked URLs on the backend whenever feasible, falling back cleanly to the RSS summary on paywall/403/failure.
+- **`FR-FEED-05` Configurable Backfill Cap**: On new feed subscription or OPML import, ingest feed entries into the historical log, mark only the newest `N` items per feed (configurable, default `N = 10`) as `unread` and enqueue them for extraction/enrichment, and mark older backfilled items `expired` without auto-enrichment (manual enrichment remains available).
+- **`FR-FEED-06` Per-Feed Configuration**: Support per-feed expiration overrides, full-text toggle, custom prompt hints, and mini-research policies (`enabled`, `fetch_pdfs`, `guidance`, `max_hops`).
 
 ### 4.2 Selective Deeper Fetching ("Mini-Research")
-- Detect when an RSS item is primarily commentary on or a pointer to an underlying primary source (e.g., research paper PDF/arXiv link, technical report, primary announcement).
-- Driven by a combination of **per-feed guidance** (e.g., *"for this LLM feed, locate and summarize linked papers"*), **item heuristics**, and **user feedback** (e.g., *"fetch PDFs for this feed"* or *"dig deeper on this item"*).
-- Extract text from supported primary sources (HTML articles and PDF documents) and feed relevant excerpts to the local LLM to synthesize primary-source context.
-- Enforce strict, tunable server-side guardrails: max link depth (default 1 hop), max document size, fetch timeouts, allowed content types, and polite rate limiting.
+- **`FR-RES-01` Primary-Source Detection & Triggers**: Detect when an RSS item is primarily commentary on or a pointer to an underlying primary source (PDF/arXiv paper, technical report, primary announcement), triggered via per-feed policy, link heuristics, or explicit user action ("dig deeper" / enabling `fetch_pdfs` on the feed).
+- **`FR-RES-02` Extraction & Synthesis**: Extract clean text from supported primary sources (HTML and PDF) within strict safety guardrails and pass bounded excerpts to the local LLM to synthesize primary-source context alongside direct source links.
+- **`FR-RES-03` Tunable Guardrails**: Enforce max hop depth (default `1`), max file size (e.g., 20 MB PDF / 5 MB HTML), max PDF page count (e.g., 50 pages), timeouts, allowed content types, and per-domain rate limits.
 
-### 4.3 Local LLM Metadata, Curation & Customization
-- **Display Metadata** (stored per item):
-  - **TL;DR Summary**: Concise high-signal summary.
-  - **Key Takeaways**: Scannable bullet points of main findings or claims.
-  - **Topic / Category Tags**: Normalized tags for filtering and discovery.
-  - **Depth / Content Type**: Structured classification (e.g., `news-brief`, `deep-dive`, `paper-report`, `opinion`, `release-notes`, `discussion`).
-  - **Primary Source / Research Context** (when triggered): Synthesized context and direct link(s) to the underlying paper/report/source.
-- **Curation Metadata** (stored per item):
-  - **Relevance Score**: Numeric/tiered relevance rating tailored to the user's interests.
-  - **Relevance Rationale ("Why")**: Short human-readable explanation of why the item was scored as it was.
-- **Deduplication & Story Clustering**:
-  - Detect exact/canonical URL duplicates across feeds.
-  - Cluster items across overlapping feeds that cover the same story, announcement, or paper so the user can view a single grouped story with links to all covering sources rather than reading redundant summaries.
-- **Inspectable & Customizable LLM Configuration**:
-  - User-editable interest profile / curation criteria, system/task prompt templates, and per-feed prompt hints.
-  - Versioned or logged prompt/config changes so the user can iteratively tune output quality and optionally re-process selected items.
+### 4.3 Local LLM Metadata, Curation & Clustering
+- **`FR-LLM-01` Display Metadata**: Generate and persist per item: concise **TL;DR**, **2–5 key takeaways**, **LLM topic tags** (LLM-only in Phase 1; manual per-item tag editing deferred), **content depth/type** (`news-brief`, `deep-dive`, `paper-report`, `opinion`, `release-notes`, `discussion`), and **primary-source research context** (when triggered).
+- **`FR-LLM-02` Curation Metadata (5 Calibrated Tiers)**: Generate a **5-tier relevance rating** (`1: Skip`, `2: Low`, `3: Worth a Look`, `4: High`, `5: Must Read`) plus a concise human-readable **"why" rationale**.
+- **`FR-LLM-03` Deduplication & Story Clustering**: Detect cross-feed exact canonical-URL duplicates and cluster items covering the same underlying story/paper via versioned embeddings (with optional LLM confirmation on borderline matches). Support user "Split from cluster" corrections.
+- **`FR-LLM-04` Inspectable & Versioned Prompt/Profile Config**: Provide user-editable Interest Profile and system/task prompt templates stored with version history, seeded safely from shipped defaults without clobbering user edits across upgrades.
 
-### 4.4 Explicit Feedback & Evolution
-- Provide simple, low-friction explicit feedback controls on items and feeds:
-  - Item relevance feedback (e.g., thumbs up / thumbs down, optional short reason or quick tags like *"more like this"*, *"less like this"*, *"wrong score"*).
-  - Feed/enrichment feedback (e.g., *"fetch PDFs here"*, *"mute/unsubscribe"*, adjust feed priority or research guidance).
-- Persist all feedback in the historical log and incorporate it into future curation/scoring (e.g., via evolving interest profile / recent feedback examples / per-feed directives).
-- Keep the feedback model extensible so future phases can add automated profile refinement, embedding-based preference learning, or implicit signals.
+### 4.4 Explicit Feedback & Evaluation
+- **`FR-FB-01` Low-Friction Feedback Controls**: Allow explicit item feedback (`thumbs_up`, `thumbs_down`, optional short reason/tag), cluster split feedback (`split_cluster`), and feed research shortcuts (e.g., *"fetch PDFs here"* modeled as a feed config mutation + audit event).
+- **`FR-FB-02` Feedback Calibration**: Persist all feedback in the historical log and inject bounded, diverse, relevant feedback examples into curation prompts alongside the active Interest Profile.
+- **`FR-FB-03` Offline Relevance Evaluation**: Build a repeatable evaluation set from historical thumbs up/down feedback runnable via the opt-in `live_llm` suite to measure whether prompt, profile, or model changes improve tier alignment.
 
-### 4.5 Reading State, Archiving & Expiration
-- **Item States**: Unread, Read, Starred/Saved, Expired (aged out of active unread queue).
-- **Full Historical Log**: Retain a permanent log of ingested items, LLM metadata, clusters, and user feedback/actions for search, deduplication memory, and future model evolution.
-- **Configurable Unread Expiration**:
-  - Unread, unstarred items older than a configurable TTL automatically age out (`Expired`) from the active unread views so the inbox stays manageable.
-  - Global default expiration policy plus **per-feed expiration overrides** (including "never expire").
-  - **Starred/saved items never expire** and remain easily accessible in a dedicated Saved view.
-- **Search & Filtering**: Filter by category/folder, feed, tag, depth, relevance threshold, cluster, and state (Unread / Starred / All / Expired log); full-text search across titles, summaries, takeaways, tags, and content.
+### 4.5 Reading State, Bulk Actions, Archiving & Search
+- **`FR-STATE-01` Item States & History**: Track `unread`, `read`, `expired`, and independent `is_starred` state per item per the state machine in [docs/data-model.md](data-model.md). Retain a permanent historical log of all ingested items, enrichments, clusters, and feedback.
+- **`FR-STATE-02` Configurable Unread Expiration**: Automatically transition `unread`, unstarred items older than `effective_ttl` (measured from `fetched_at`) to `expired` using feed override → global default (30 days); `0` = never expire; starred items never expire.
+- **`FR-STATE-03` Grouped Cluster & Bulk Read Actions**: Display exact duplicates and clustered stories as a single grouped entry (expandable to individual sources). Reading an item marks only that item read; provide 1-click **"Mark cluster read"** (expanded to explicit known item IDs) and bounded **"Mark feed / category / all / older-than-X read"** actions (scoped to `sync_seq <= N` or explicit IDs so unseen items are never marked read offline).
+- **`FR-STATE-04` Connected & Detached Search**: Support full-text search across the full PostgreSQL archive (titles, extracted text, TL;DRs, takeaways, tags) when connected to the home LAN, and **local search over cached working-set items** when detached (with a clear UI indicator).
 
 ### 4.6 Distributed Sync & Detached Mode
-- **Downstream Sync (Server → Client)**: Clients pull incremental updates (feeds, categories, curated items, clusters, LLM metadata, curation settings) over the home LAN and persist them in a local client cache.
-- **Detached Reading**: When away from the home LAN, clients operate seamlessly off locally cached data. Opening an article or primary-source link launches the external URL directly via the client's internet connection.
-- **Upstream Sync (Client → Server)**: While detached, clients record and queue mutations locally and sync them idempotently back to the server upon reconnecting to the home LAN:
-  - Reading actions: mark read/unread, star/unstar, mark cluster read.
-  - Explicit feedback: relevance votes, notes/reasons, research hints (e.g., "fetch PDFs here").
-  - Content-related configuration changes: unsubscribe/mute/pause feed, update feed category/expiration/research settings, edit curation preferences.
-- **Conflict Resolution**: Deterministic, timestamped reconciliation (per-field / per-action last-write-wins with idempotent mutation IDs) so offline edits from desktop and Android never corrupt state or duplicate actions.
+- **`FR-SYNC-01` Bootstrap & Committed Delta Pull**: Clients initialize via `bootstrap` (working set: feeds, categories, active profile/settings, unread + starred + last 14 days read items + `watermark` + `instance_epoch`) and pull strictly commit-ordered incremental deltas via `sync/pull` with explicit tombstones and automatic resync on `instance_epoch` change.
+- **`FR-SYNC-02` Detached Operation & Outbox**: When away from the home LAN, clients load reliably from their local origin, serve cached data, open external article/PDF links directly via the internet, and queue mutations persistently in an outbox.
+- **`FR-SYNC-03` Offline vs. Online-Only Mutation Scope**:
+  - **Supported Offline (Queued)**: Read/unread, star/unstar, bounded bulk mark-read, mark cluster read, split cluster, item feedback (`thumbs_up`/`thumbs_down`/reason), feed status (`active`/`paused`/`muted`/`unsubscribed`), feed category, feed expiration override, and feed `research_policy` toggles (e.g., `fetch_pdfs`).
+  - **Online-Only (Require LAN)**: Adding new feeds, OPML import/export, editing long free-text fields (`interest_profiles`, `prompt_configs`, `custom_prompt_hint`), triggering on-demand mini-research/re-enrichment, and device pairing/revocation. *(Future enhancement: optimistic-versioned offline editing for free-text fields.)*
+- **`FR-SYNC-04` Idempotent Push, Conflict Resolution & Rollback UX**: Every mutation carries `client_mutation_id` + `client_timestamp`. Server returns per-mutation outcome (`applied`, `superseded`, `rejected` with reason). Clients reconcile via per-field LWW with server clock-skew clamping and roll back + surface a clear toast/banner if any optimistic mutation is rejected.
 
 ### 4.7 Client Reading Experience
-- Classic RSS reader workflow enhanced with smart metadata views (category/feed navigation, relevance-sorted or chronological item list, detail pane showing TL;DR, takeaways, depth badge, tags, relevance + why, cluster siblings, and mini-research context).
-- Browser-centric / browser-friendly UX allowing effortless opening of original article URLs and referenced primary sources in browser tabs.
-- Keyboard shortcuts for fast triage on desktop (navigate, mark read, star, open in browser, give feedback).
+- **`FR-UI-01` Classic RSS + Smart Metadata Views**: Category/feed navigation, grouped cluster list with TL;DR/takeaways/depth badge/tags/5-tier relevance + "why"/research context, one-click external browser handoff, and keyboard shortcuts (`j`/`k`, `m`, `s`, `o`, feedback shortcuts).
+- **`FR-UI-02` Flexible Sorting & Filtering**: Default relevance view sorts by **relevance tier descending, then newest first**; include **sort buttons/headers across item tables/lists** to re-sort quickly by relevance, date, feed, or depth, plus filters by category, feed, tag, depth, tier, and state (Unread / Starred / All / Expired).
 
 ## 5. Non-Functional Requirements
-- **Network Model**: Local LAN / home Wi-Fi first; automatic non-blocking detection of server reachability (Connected vs. Detached indicator) with seamless transition between modes.
-- **Local LLM Runtime & Hardware Profile**:
-  - Backend talks to `Ollama` or `llama.cpp` via a clean OpenAI-compatible HTTP abstraction so models and runtimes are swappable.
-  - Targeted at an AMD Ryzen AI Max+ 395 class machine with 128 GB unified memory (supporting strong local reasoning/summarization models and local embeddings).
-  - Fully asynchronous background processing pipeline: ingestion and UI never block on LLM inference; raw items remain visible and usable even if the LLM runtime is temporarily busy or offline, with automatic retry/backfill.
-- **Deployment & Packaging**:
-  - Core server components packaged as Docker containers (Docker Compose) for clean deployment into a diverse Ubuntu homelab environment.
-  - Clean connectivity to a host-native or LAN-hosted Ollama / `llama.cpp` service (avoiding brittle GPU container passthrough requirements).
-- **Data Integrity & Backups**: Durable local storage with straightforward backup/export (DB backups + OPML + prompt/config export).
-- **Observability**: Clear visibility into ingestion jobs, LLM processing queue, prompt versions, token/latency metrics, mini-research fetches, and feed errors.
+
+### Security & Isolation
+- **`NFR-SEC-01` Per-Device LAN Authentication**: Require one-time device pairing code → revocable per-device bearer token on all API endpoints except pairing/health; enforce strict `Host` header allow-list, CORS allow-list, and JSON-only mutation endpoints to prevent unauthorized LAN access, CSRF, and DNS rebinding ([ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md)).
+- **`NFR-SEC-02` SSRF Prevention**: All server-side fetchers (feed polling, full-text extraction, mini-research) validate resolved DNS IPs on initial request and every redirect hop, rejecting loopback/private/link-local/CGNAT/Docker ranges and non-HTTP(S) schemes, and pin the resolved IP for the connection.
+- **`NFR-SEC-03` Content & Parser Safety**: Sanitize feed HTML with DOMPurify, enforce a strict SPA CSP, render LLM outputs safely, delimit untrusted article/PDF text in LLM prompts, and run HTML/PDF parsing in a resource-bounded isolated subprocess/container.
+- **`NFR-SEC-04` Restricted Host-LLM Binding**: Host-native `Ollama`/`llama.cpp` must be bound to the Docker bridge IP or restricted via host firewall to the Docker subnet (never unrestricted `0.0.0.0`).
+
+### Sync, Performance & Reliability
+- **`NFR-SYNC-01` Gap-Free Sync**: Concurrent server transactions must never cause `sync/pull` to skip or duplicate records; backup restores must safely trigger client resync via `instance_epoch`.
+- **`NFR-SYNC-02` Latency & Throughput**:
+  - New ingested items become visible to connected clients within **2 minutes** of the poll that fetched them, regardless of whether LLM enrichment has completed.
+  - Flushing an offline outbox of **500 mutations** completes in under **5 seconds** on the home LAN.
+  - Detached client reloads cleanly offline with zero lost outbox mutations (`navigator.storage.persist()` requested on startup).
+- **`NFR-LLM-01` Local LLM Resilience & Capacity**:
+  - Configurable chat & embedding models (optimized for fast MoE models on Ryzen AI Max+ 395 / 128 GB); runtime-specific `LLMAdapter` supporting both `Ollama` and `llama.cpp`.
+  - Global LLM concurrency = `1`, priority queueing (interactive > steady-state > backfill), optional pause/quiet-hours control, and non-blocking graceful degradation if the LLM server is offline.
+- **`NFR-OPS-01` Packaging, Backups & Observability**:
+  - Docker Compose deployment (`web`, `api`, `worker`, `db`) on Ubuntu.
+  - Nightly local `pg_dump` with 14-day retention, optional simple `rsync`/SSH copy hook to another LAN host, OPML/config export, and a documented/tested restore drill.
+  - Built-in System Health view showing feed health, job queue depth/dead-letters, LLM startup connectivity, and latency/token metrics.
 
 ## 6. Milestones / Phasing
-- **Phase 1 (MVP — Ubuntu + Home LAN Server)**:
-  - Containerized backend server (feed ingestion, polite polling, feed health, full-text + PDF/primary-source mini-research, local LLM enrichment & relevance scoring, deduplication/clustering, expiration + full history log, customizable prompts/preferences).
-  - Browser-based Linux/Ubuntu client with local offline cache, detached mode, upstream mutation sync, classic RSS views, and explicit feedback controls.
-- **Phase 2 (Android Detached Client)**:
-  - Android client talking to the same native Sync API, with local caching, detached triage/reading, browser link handoff, and queued upstream sync for read state, feedback, and content-config edits on home Wi-Fi reconnect.
-- **Phase 3 (Evolution & Intelligence Upgrades)**:
-  - Automated feedback-driven interest profile suggestions, richer multi-step mini-research, semantic search, and optional implicit feedback signals.
+
+### Phase 1 — Ubuntu Server & Local-First Laptop Client (Vertical Slices `1a`–`1g`)
+| Milestone | Scope | Key Exit / Acceptance Criteria |
+| :--- | :--- | :--- |
+| **1a — Backend Foundation, Auth, Polling & Extraction** | Docker Compose (`db`, `api`, `worker`), Alembic migrations, Postgres job queue (dedupe, leases, reclaim, leader lock), device pairing auth + `Host`/CORS, polite polling + feed health + OPML, SSRF-safe & isolated full-text extraction, backfill cap (`N=10`), expiration sweeper, backup script. | Real-Postgres integration tests & SSRF/auth/backoff/expiration invariants pass (`>= 90%` core coverage); 25 real feeds poll and extract cleanly via CLI/API. |
+| **1b — Server Sync Engine, Conflict Resolution & Search** | `sync_state`/`sync_changes` commit-ordered watermark, `bootstrap` snapshot, `instance_epoch`, idempotent `sync/push`, per-field LWW merge + clock-skew clamping, bounded bulk mark-read, PostgreSQL FTS. | Concurrent-commit `sync_seq` test, `hypothesis` conflict convergence tests, 500-mutation flush benchmark (`< 5s`), and DB restore-epoch drill all pass. |
+| **1c — Local-First Ubuntu Reader UI & Detached Mode** | Localhost-served React + TypeScript + Dexie.js SPA, device pairing UI, Service Worker offline shell, `navigator.storage.persist()`, persistent mutation outbox + rejection rollback UX, classic 3-pane/list reader with sort buttons, detached local search, DOMPurify + CSP, System Health UI. | Playwright E2E test passes: load → disconnect LAN → reload offline → search locally + mutate/unsubscribe → reconnect → zero lost mutations; XSS fixtures neutralized. |
+| **1d — Local LLM Adapter, Enrichment & Prompt Config** | `LLMAdapter` (`Ollama` + `llama.cpp` structured outputs & `<think>` handling), TL;DR, takeaways, LLM tags, depth, 5-tier relevance + rationale, seeded/versioned prompt & Interest Profile editor, LLM concurrency/priority/quiet-hours. | Dual-runtime contract fixtures pass; `live_llm` MoE smoke & throughput benchmark confirms steady-state 200 items/day budget; raw items visible within 2 min even if LLM offline. |
+| **1e — Deduplication & Story Clustering** | Versioned `item_embeddings`, pre-enrichment URL & embedding dedup/clustering, grouped cluster list UI, 1-click "Mark cluster read", "Split from cluster" action. | Cross-feed duplicates collapse pre-enrichment; cluster merge/split and tombstone sync tests pass. |
+| **1f — Mini-Research & Sandboxed PDFs** | Resource-isolated PyMuPDF/HTML extractor, per-feed `research_policy` & guardrails, link heuristics, "Dig Deeper" / "Fetch PDFs here" triggers, primary-source context display. | Hostile PDF/bomb/redirect/SSRF fixtures blocked cleanly; paper-heavy feeds synthesize primary-source context with direct PDF links. |
+| **1g — Explicit Feedback Loop & Evaluation** | Thumbs up/down + reasons UI, diverse/bounded feedback example selection in prompts, offline relevance evaluation harness (`live_llm`) measuring tier alignment across prompt/model versions. | Feedback syncs idempotently across devices; offline eval suite produces repeatable tier-accuracy metrics before/after prompt changes. |
+
+### Phase 2 — Android Detached Client
+- Android client (Capacitor native-HTTP wrapper or native Kotlin) consuming `/api/v1/sync/*` with QR device pairing, `networkSecurityConfig` for LAN HTTP, `WorkManager` home-Wi-Fi background sync, detached reading, local search, browser link handoff, and queued offline mutations.
+
+### Phase 3 — Evolution & Future Enhancements
+- Automated feedback-driven Interest Profile update suggestions, manual per-item tag editing (if needed based on usage), richer multi-hop mini-research, semantic archive search, and optional implicit feedback signals.
 
 ## 7. Open Questions
-*(To be resolved as we move into `docs/architecture.md` and `docs/data-model.md`)*
-1. **Tech Stack Confirmation**: Python (FastAPI + background workers) + PostgreSQL (`pgvector` + full-text search) + TypeScript Web UI (local-first with IndexedDB cache) — does this stack fit your comfort level and Ubuntu/Android goals?
-2. **Phase 2 Android Client Form Factor**: Prefer a dedicated lightweight Android app (e.g., Kotlin/Capacitor over plain LAN HTTP with background Wi-Fi sync) or an HTTPS-hosted PWA on the LAN?
-3. **LLM Hosting Topology**: Will Ollama / `llama.cpp` run natively on the Ubuntu host (recommended for Ryzen 395+ unified-memory GPU acceleration) with the Dockerized SmartRSS backend calling it over the host/LAN network?
+All initial architectural questions (`Q-01`–`Q-11`) have been answered by the owner and recorded in [ADR 0001](decisions/0001-tech-stack-and-container-topology.md)–[ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md) (currently `Proposed`, awaiting final owner sign-off to move to `Accepted`).
+
+Remaining design-level choices to finalize inside the milestone component specs (`docs/design/`):
+1. **Phase 1 Localhost Launcher**: Exact packaging for the Ubuntu `localhost` runner (lightweight local static HTTP server via systemd user unit vs. Tauri desktop wrapper) — to finalize in `1c` client design.
+2. **Phase 2 Android Wrapper Choice**: Capacitor (with native HTTP plugin) vs. native Kotlin client — to finalize before Phase 2.
+3. **Default Candidate MoE & Embedding Models**: Concrete default model pair to benchmark first on Ryzen 395+ in `1d` (`live_llm` suite).

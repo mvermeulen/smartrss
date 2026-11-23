@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-22
 - **Scope:** Requirements, architecture, data model, development process, ADR 0001–0003, and documentation index
-- **Status:** Open — resolve blockers and owner decisions before writing component-level designs
+- **Status:** Addressed — all blockers (`B-01`–`B-05`), major findings (`M-01`–`M-14`), minor findings, and owner decisions resolved in updated docs and ADRs `0001`–`0006` (pending owner sign-off to move docs to `Approved` and ADRs to `Accepted`).
 
 ## Review outcome
 
@@ -162,3 +162,51 @@ Phase 1 bundles core ingestion, every enrichment feature, clusters, feedback, sy
 4. Update architecture and data model for state machines, SSRF controls, queue leases, embedding versioning, and LLM capacity.
 5. Move accepted ADRs to `Accepted`, and update the documentation index/statuses.
 6. Only then begin the lower-level component designs in vertical-slice order.
+
+
+---
+
+## Resolution Tracker (2026-11-22)
+
+All findings and owner decisions from this review have been addressed across the updated architecture docs and ADRs `0001`–`0006` (cross-referenced with [Claude's initial design review](2026-11-22-initial-design-review.md)):
+
+### Blockers
+| ID | Resolution | Where Recorded |
+| :--- | :--- | :--- |
+| **B-01** | Replaced `nextval()` with single-row `sync_state` (`FOR UPDATE` at tx end) + append-only `sync_changes` log; added real-Postgres concurrent-commit invariant test. | [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), `data-model.md` §4.2, `development-process.md` §2.4 |
+| **B-02** | Defined explicit Sync Surface table; `item` syncs as an aggregate embedding current enrichment, LLM tags, research summaries, cluster ID, and current vote; `category`/`cluster` removals emit explicit `delete` tombstones. | [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), `data-model.md` §5.1 |
+| **B-03** | Owner confirmed Phase 1 laptop leaves LAN and chose a `localhost`-served SPA / lightweight desktop shell (React + TS + Dexie.js) with `navigator.storage.persist()`, Service Worker offline shell, fixed server addressing, and Playwright offline-reload E2E test. | [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md), `architecture.md` §2 & §3.4, `development-process.md` §2.4 |
+| **B-04** | Added one-time device pairing → revocable per-device bearer tokens (`devices`, `pairing_codes`), strict `Host` allow-list, strict CORS allow-list, JSON-only mutations, and security invariant tests. | [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-01`, `data-model.md` §4.1, `development-process.md` §2.4 |
+| **B-05** | Required shared `SafeHttpClient` across all server fetchers (polling, extraction, mini-research) validating DNS IPs on initial fetch + every redirect hop, rejecting private/loopback/link-local/CGNAT/Docker/non-HTTP(S) targets, and pinning resolved IPs. | [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-02`, `AGENTS.md`, `development-process.md` §2.4 |
+
+### Major Findings
+| ID | Resolution | Where Recorded |
+| :--- | :--- | :--- |
+| **M-01** | Split `read_state_updated_at` & `starred_updated_at`, added per-field `feeds.field_updated_at` + `config_version`, clock-skew clamping (`+5m` cap), per-field merge table, online-only versioned free-text edits, push response contract, and `hypothesis` convergence tests. | `data-model.md` §4.4, §4.5 & §5.2, `requirements.md` `FR-SYNC-03`/`04`, `development-process.md` §2.4 |
+| **M-02** | Added Mermaid Item State and Feed Intent/Health State diagrams; clarified `expired`/star/archive transitions, per-item read state with grouped display, explicit-ID "Mark cluster read", `muted`/`paused`/`unsubscribed`, `410`, and re-subscribe semantics. | `data-model.md` §3.1–§3.3, `requirements.md` `FR-STATE-01`/`03` |
+| **M-03** | Added bounded `mark_bulk_read` (feed/category/all/older-than-X) scoped by `up_to_sync_seq` or explicit `item_ids[]`. | `requirements.md` `FR-STATE-03` & `FR-SYNC-03`, `data-model.md` §5.2 |
+| **M-04** | Added `GET /api/v1/sync/bootstrap`, `sync_state.instance_epoch`, backup-restore epoch rotation + resync preserving pending outbox, and client 14-day local eviction / out-of-window delta rules. | [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), `architecture.md` §4.2, `data-model.md` §6.2, `development-process.md` §2.4 |
+| **M-05** | Added dedicated model-versioned `item_embeddings(item_id, model_name, dimensions, embedding)`, locked canonical `title + lead_excerpt` input, per-model thresholds, pre-enrichment clustering order, representative/merge/split rules, and user "Split from cluster" action. | `data-model.md` §4.7 & §4.8, `architecture.md` §3.3 & §4.1, `requirements.md` `FR-LLM-03` |
+| **M-06** | Added MoE-oriented throughput/capacity budget, per-stage token & PDF truncation budgets, global LLM concurrency = `1`, priority levels (`10`/`50`/`90`), optional pause/quiet-hours, and configurable backfill cap (`N = 10` default). | `architecture.md` §5.1–§5.3, `requirements.md` `FR-FEED-05` & `NFR-LLM-01` |
+| **M-07** | Defined internal `LLMAdapter` with runtime capability profiles (`ollama`, `llamacpp`), `<think>` stripping, L2-normalized embeddings, and mandatory recorded contract fixtures for both runtimes. | [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), `architecture.md` §5.4, `development-process.md` §2.1 & §2.4 |
+| **M-08** | Specified Docker bridge IP binding or host firewall subnet restriction for host-native Ollama/`llama.cpp` + startup health check surfaced in System Health. | [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `architecture.md` §6.1, `requirements.md` `NFR-SEC-04` |
+| **M-09** | Added XML/fence prompt delimitation, DOMPurify allow-list HTML sanitization, strict SPA CSP, plain-text/safe-Markdown LLM rendering, isolated bounded extraction subprocess (CPU/RAM/wall-clock/50-page/size caps), and hostile fixture tests. | [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-03`, `architecture.md` §6.2, `development-process.md` §2.4 |
+| **M-10** | Added `dedupe_key` + partial unique index, `locked_by`, `lease_expires_at`, `heartbeat_at`, `finished_at`, `updated_at`, stale-lease reaper, dead-letter UI retry, advisory-lock scheduler leadership, per-stage idempotency, and 30-day `done` retention. | [ADR 0003](../decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md), `data-model.md` §4.9 |
+| **M-11** | Separated `feeds.status` vs `feeds.health_state`, defined `301` collision handling, `410`, `429`/`Retry-After`, `Cache-Control`, jitter, per-domain article fetch rate limiting, `content_hash` update rules, and unstable-GUID fallback. | `data-model.md` §3.2–§3.3 & §4.4, `requirements.md` `FR-FEED-02`/`03` |
+| **M-12** | Anchored expiration strictly on `COALESCE(unexpired_at, fetched_at)` (clamping display `published_at <= fetched_at`), added exact TTL pseudocode, and aligned with configurable `N = 10` backfill cap. | `data-model.md` §6.1, `requirements.md` `FR-FEED-05` & `FR-STATE-02` |
+| **M-13** | Switched to 5 calibrated relevance tiers (`1..5`), bounded diverse feedback-example selection, offline `live_llm` evaluation harness over feedback history, and single-source-of-truth feed config mutation + audit event for `fetch_pdfs`. | `requirements.md` `FR-LLM-02` & `FR-FB-01..03`, `data-model.md` §4.6 & §4.8, `architecture.md` §5.2 |
+| **M-14** | Split Phase 1 into 7 testable vertical milestones (`1a`–`1g`), added user stories (`US-01`–`US-05`), requirement IDs, and measurable exit/acceptance criteria. | `requirements.md` §3–§6, `docs/design/README.md` |
+
+### Minor Findings & Owner Decisions
+- **Stale open questions / ADR statuses**: Closed resolved questions in `requirements.md` §7 with links to ADRs `0001`–`0006` (pending owner approval).
+- **Architecture diagram vs. single entry point**: Updated `architecture.md` diagram so all clients route through `Reverse Proxy / Web`.
+- **Frontend & Phase 2 Android choices**: Selected React + TypeScript + Vite + Dexie.js + DOMPurify ([ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md)) and documented Android `networkSecurityConfig`, Capacitor mixed-content, and `WorkManager` trade-offs ([ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md)).
+- **Detached search**: Local search over cached working-set items (`requirements.md` `FR-STATE-04`).
+- **Offline feed management & push rollback**: Explicit offline vs. online-only split + `applied`/`superseded`/`rejected` rollback contract (`requirements.md` `FR-SYNC-03`/`04`, `data-model.md` §5.2).
+- **`search_vector` maintenance**: Application-layer rebuild, configurable language (`english`), 64 KB `extracted_text` slice cap (`data-model.md` §4.5).
+- **Storage & retention**: Re-estimated at ~3–6 GB/year with 30-day `jobs` and 90-day `sync_mutations`/`sync_changes` retention (`data-model.md` §6.3).
+- **User-editable tags**: Dropped manual per-item tag editing from Phase 1 per owner decision (LLM tags + user feed categories only; `data-model.md` §4.8, `requirements.md` `FR-LLM-01`).
+- **Prompt seeding/versioning**: `origin` (`default`|`user`) + `default_revision` preserving user edits on upgrades (`data-model.md` §4.9).
+- **Development process gaps**: Documented local-only `make check` (no GitHub Actions CI per owner decision), `docker compose --profile test` / `testcontainers` Postgres setup, owner `Approved`/`Accepted` git sign-off mechanism, and security invariants (`development-process.md` §1, §2.1, §2.4, §4.1).
+- **Backups**: Nightly local `pg_dump` (14-day rotation) + optional simple `rsync`/SSH LAN copy hook + `make restore-drill` rotating `instance_epoch` (`architecture.md` §7).
+- **Owner Decisions 1–10**: All confirmed by project owner on 2026-11-22 (1: laptop leaves LAN + `localhost`/desktop shell; 2: one-time pairing → per-device bearer token; 3: configurable models preferring MoE on Ryzen 395+ + concurrency 1/priority/quiet-hours; 4: 5 tiers + tier-then-recency + interactive table sort buttons; 5: grouped display + per-item read + 1-click "Mark cluster read"; 6: configurable backfill cap `N=10`; 7: detached local cache search; 8: vertical slices `1a`–`1g`; 9: Fever/GReader permanent non-goal; 10: simple local backup + optional LAN `rsync`/SSH hook).

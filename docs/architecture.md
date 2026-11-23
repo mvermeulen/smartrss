@@ -1,11 +1,11 @@
 # System Architecture
 
-> **Status:** In Review
+> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
 
 ## 1. High-Level Overview
-SmartRSS uses a **containerized home-LAN backend** paired with **local-first clients** that cache curated items/metadata and queue offline mutations when detached from the home network.
+SmartRSS uses a **containerized home-LAN backend** paired with **local-first clients** that run from a stable secure origin (`localhost` on Ubuntu laptops in Phase 1; native/Capacitor shell on Android in Phase 2), cache curated items/metadata locally, and queue offline mutations when detached from the home network.
 
-A key design decision is decoupling the **Dockerized SmartRSS services** from the **host-native local LLM runtime** (`Ollama` or `llama.cpp`). On an AMD Ryzen AI Max+ 395 (128 GB unified memory) Ubuntu host, running the LLM server natively avoids brittle GPU passthrough inside containers while keeping the SmartRSS backend portable via Docker Compose.
+All client traffic enters through a **single LAN reverse-proxy entry point** (`web`, which serves the connected SPA fallback and reverse-proxies `/api/` to `api`). Outbound server fetches pass through a shared SSRF-hardened `SafeHttpClient`, and untrusted HTML/PDF parsing runs inside a resource-bounded subprocess. The local LLM runtime (`Ollama` or `llama.cpp`) runs natively on the Ubuntu host—restricted to the Docker bridge / firewall allow-list—to leverage Ryzen AI Max+ 395 unified-memory acceleration cleanly.
 
 ```mermaid
 flowchart LR
@@ -15,30 +15,30 @@ flowchart LR
     end
 
     subgraph Host["Ubuntu Home Server (Ryzen 395+ / 128 GB)"]
-        LLM["Local LLM Runtime\n(Ollama / llama.cpp)\nOpenAI-compatible HTTP API"]
+        LLM["Host-Native LLM Runtime\n(Ollama / llama.cpp)\nBound to Docker bridge / FW-restricted"]
 
         subgraph Docker["Docker Compose Stack"]
-            Web["Web UI Container\n(Static SPA + Reverse Proxy)"]
-            API["API Server\n(Python / FastAPI)"]
-            Worker["Background Worker\n(Ingestion, Mini-Research,\nLLM, Clustering, Expiry)"]
-            DB[("PostgreSQL + pgvector\n(Data, FTS, Vectors, Job Queue)")]
+            Proxy["Reverse Proxy / Web\n(Single LAN Entry Point)"]
+            API["API Server\n(Python / FastAPI\nBearer Auth, Host/CORS)"]
+            Worker["Background Worker\n(SafeHttpClient + Isolated Extractor\n+ LLMAdapter + Job Queue)"]
+            DB[("PostgreSQL 16 + pgvector\n(Data, FTS, Vectors, Sync Log, Jobs)")]
         end
     end
 
     subgraph LAN["Home Wi-Fi / LAN Clients"]
-        UbuntuClient["Phase 1: Ubuntu Browser Client\n(Local-First SPA + IndexedDB)"]
-        AndroidClient["Phase 2: Android Client\n(Local Cache + Wi-Fi Sync)"]
+        UbuntuClient["Phase 1: Ubuntu Laptop\n(localhost SPA / Tauri + Dexie.js\n+ Service Worker + Outbox)"]
+        AndroidClient["Phase 2: Android Client\n(Local Cache + WorkManager Wi-Fi Sync)"]
     end
 
-    Feeds --> Worker
-    WebPages --> Worker
-    Worker <-->|"Chat + Embeddings\n(host.docker.internal)"| LLM
+    Feeds -->|"SafeHttpClient"| Worker
+    WebPages -->|"SafeHttpClient"| Worker
+    Worker <-->|"LLMAdapter\n(Docker bridge)"| LLM
     Worker <--> DB
     API <--> DB
-    Web --> API
+    Proxy -->|"/api/v1/*"| API
 
-    UbuntuClient <-->|"LAN HTTP Sync & UI"| Web
-    AndroidClient <-->|"LAN HTTP Sync API"| API
+    UbuntuClient <-->|"LAN HTTP + Bearer Token\n(CORS allow-list)"| Proxy
+    AndroidClient <-->|"LAN HTTP + Bearer Token"| Proxy
     UbuntuClient -.->|"Open Article / PDF\n(Direct Internet)"| WebPages
     AndroidClient -.->|"Open Article / PDF\n(Direct Internet)"| WebPages
 ```
@@ -47,91 +47,120 @@ flowchart LR
 
 | Layer | Choice | Rationale |
 | :--- | :--- | :--- |
-| **API Server** | Python 3.12+ / FastAPI | Fast development, strong typing (Pydantic v2), async HTTP, OpenAPI contract generation for both Web and Android clients. |
-| **Background Worker** | Python async worker + PostgreSQL `SKIP LOCKED` queue | Reuses the exact same domain models/DB layer as API; eliminates Redis/Celery operational overhead while remaining durable and inspectable at ~200 items/day. |
-| **Feed & Content Extraction** | `feedparser`, `httpx`, `trafilatura`, `pymupdf` (PyMuPDF) | Mature, battle-tested libraries for messy RSS/Atom XML, conditional HTTP, clean article extraction, and fast PDF text extraction for research papers. |
-| **Database & Search** | PostgreSQL 16+ with `pgvector` and built-in `tsvector` FTS | Single containerized datastore handling concurrent API + worker writes, full-text search across articles + LLM metadata, vector similarity for story clustering, and durable job queues. |
-| **Local LLM Client** | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`) | Works transparently with both `Ollama` and `llama.cpp` server; easy to swap chat vs. embedding models independently. |
-| **Phase 1 Client (Ubuntu)** | TypeScript SPA (React or Svelte) + IndexedDB (`Dexie.js` or `idb`) | Browser-native reading & one-click external link opening; full local-first cache and offline mutation outbox; served directly from the Docker stack. |
-| **Phase 2 Client (Android)** | Thin Android app (Capacitor wrapping the Web UI, or native Kotlin) consuming the versioned Sync API | Works over plain home LAN HTTP without self-signed HTTPS/PWA certificate friction on Android, and enables native background sync on home Wi-Fi. |
-| **Packaging** | Docker Compose (`web`, `api`, `worker`, `db`) | Clean, reproducible deployment in a diverse Ubuntu homelab environment. |
+| **API Server** | Python 3.12+ / FastAPI / Pydantic v2 / SQLAlchemy + Alembic | Strong typing, OpenAPI contract generation for Web and Android clients, reversible SQL migrations. |
+| **Background Worker** | Python async worker + PostgreSQL `SKIP LOCKED` queue | Reuses domain models/DB layer; eliminates Redis/Celery overhead while supporting dedupe keys, leases, priorities, advisory-lock scheduling, and dead-letter inspection ([ADR 0003](decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md)). |
+| **Safe Fetching & Extraction** | Shared `SafeHttpClient` (`httpx` + DNS/IP pinning), `feedparser`, `trafilatura`, `pymupdf` in bounded subprocess | Protects the home LAN from SSRF across all fetchers and isolates C-level PDF/HTML parsers from crashing or exhausting the worker ([ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md)). |
+| **Database & Search** | PostgreSQL 16+ with `pgvector` and `tsvector` FTS | Single containerized datastore for relational state, commit-ordered `sync_changes` log, full-text search, versioned vector embeddings, and job queue ([ADR 0001](decisions/0001-tech-stack-and-container-topology.md), [ADR 0004](decisions/0004-sync-watermark-aggregates-and-restore-epoch.md)). |
+| **Local LLM Adapter** | Internal `LLMAdapter` with runtime capability profiles (`Ollama` & `llama.cpp`) | Handles runtime differences in structured JSON-schema output (`format` vs `response_format`/GBNF), reasoning-model `<think>` output, and embedding batching/normalization rather than assuming uniform OpenAI compatibility. |
+| **Phase 1 Client (Ubuntu Laptop)** | React + TypeScript (`strict: true`) + Vite + **Dexie.js** + **DOMPurify**, served from fixed `localhost` origin (local runner or Tauri shell) | Guarantees a secure context for Service Workers and `navigator.storage.persist()` when the laptop leaves the LAN, avoids LAN CA/cert friction, and prevents XSS ([ADR 0005](decisions/0005-phase1-client-origin-and-offline-shell.md)). |
+| **Phase 2 Client (Android)** | Capacitor (native HTTP plugin) or native Kotlin consuming `/api/v1/sync/*` | Handles Android 9+ cleartext `networkSecurityConfig`, avoids WebView mixed-content blocks, and enables `WorkManager` background sync on home Wi-Fi ([ADR 0002](decisions/0002-native-sync-api-and-detached-client-model.md)). |
+| **Packaging** | Docker Compose (`web`, `api`, `worker`, `db`) | Reproducible Ubuntu homelab deployment through a single LAN entry point. |
 
 ## 3. Components & Responsibilities
 
-### 3.1 API Server (`api`)
-- Exposes a versioned REST/JSON API (`/api/v1/...`).
-- **Sync Endpoints**:
-  - Downstream delta sync (`GET /api/v1/sync/pull?since_seq=...`) returning updated feeds, categories, items, enrichments, clusters, and settings using a monotonic server sequence number (`sync_seq`).
-  - Upstream batch mutation sync (`POST /api/v1/sync/push`) accepting idempotent, client-timestamped actions (read/unread, star/unstar, feedback events, feed config updates).
-- **Interactive / Management Endpoints**:
-  - Feed CRUD, OPML import/export, feed health diagnostics.
-  - Full-text & metadata search (server-side over full historical log).
-  - Prompt template & user interest profile editor (with version history) and manual re-process / on-demand mini-research trigger.
-  - System observability (worker queue status, LLM connectivity, recent errors).
+### 3.1 Reverse Proxy / Web (`web`)
+- Single exposed LAN entry point (e.g., port `8080`).
+- Reverse-proxies `/api/` to `api` (preserving `Host` and forwarding client headers) and serves the static SPA bundle with strict security headers (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`).
 
-### 3.2 Background Worker (`worker`)
-Runs a lightweight scheduler + concurrent async job consumers backed by PostgreSQL:
-1. **Feed Poller**: Schedules feed fetches using per-feed intervals, sends `If-None-Match` (`ETag`) and `If-Modified-Since`, respects HTTP 304/301/410, applies exponential backoff on errors, and updates feed health metrics.
-2. **Content Extractor**: Normalizes entry metadata, canonicalizes URLs, fetches full HTML article text (`trafilatura`) when enabled, and falls back gracefully to the RSS summary on paywall/error.
-3. **Mini-Research Fetcher**: Evaluates per-feed research policy, item heuristics (e.g., links to arXiv, PDFs, reports, or aggregator commentary links), and explicit user hints (`fetch_pdfs`). Fetches primary source(s) within strict guardrails (max depth, max MB, timeout) and extracts clean text (`trafilatura` or `pymupdf`).
-4. **LLM Enrichment & Curation Stage**:
-   - Generates embeddings for clustering/deduplication.
-   - Calls local LLM with active system prompt, user interest profile, recent explicit feedback context, per-feed guidance, article text, and mini-research excerpts.
-   - Enforces structured JSON schema output (`tldr`, `takeaways`, `tags`, `depth`, `relevance_score`, `relevance_rationale`, `research_context`).
-5. **Deduplication & Story Clusterer**:
-   - Exact/canonical URL match deduplication.
-   - Cross-feed topic clustering via `pgvector` cosine similarity within a sliding time window (e.g., 72 hours), optionally confirmed by a fast LLM check for borderline matches.
-6. **Expiration Sweeper**: Periodically marks unread, unstarred items older than their feed override (or global default) TTL as `expired` while preserving the full historical log.
+### 3.2 API Server (`api`)
+- Exposes versioned REST/JSON endpoints (`/api/v1/...`).
+- **Security Middleware**: Enforces `Host` allow-list, strict CORS allow-list, JSON-only mutation `Content-Type`, and per-device `Authorization: Bearer <token>` validation on all routes except `/api/v1/health` and `/api/v1/auth/pair`.
+- **Device Pairing**: CLI-bootstrapped (and paired-device UI/QR) one-time pairing codes exchanged for individually revocable per-device bearer tokens.
+- **Sync Endpoints** ([ADR 0004](decisions/0004-sync-watermark-aggregates-and-restore-epoch.md)):
+  - `GET /api/v1/sync/bootstrap`: Returns active working set + `watermark` + `instance_epoch`.
+  - `GET /api/v1/sync/pull?since_seq=<N>&limit=<K>`: Returns strictly commit-ordered aggregate upserts & tombstones from `sync_changes`, plus `watermark` and `instance_epoch`.
+  - `POST /api/v1/sync/push`: Applies idempotent client mutations (`client_mutation_id`), returning per-mutation `{status: applied|superseded|rejected, reason?, server_state?}`.
+- **Interactive / Management Endpoints**: Feed CRUD (online-only add/OPML), Feed Health, server-side full-archive FTS search, versioned prompt/Interest Profile editor, manual re-process / on-demand mini-research trigger, and System Health / dead-letter queue management.
 
-### 3.3 Database (`db` — PostgreSQL + `pgvector`)
-- System of record for all feeds, raw/normalized items, full historical log, LLM enrichments, research sources, clusters, explicit feedback, versioned prompt/profile configs, sync sequence log, and background jobs.
-- Details documented in [docs/data-model.md](data-model.md).
+### 3.3 Background Worker (`worker`)
+Uses PostgreSQL advisory locks (`pg_try_advisory_lock`) for singleton scheduler leadership and `SKIP LOCKED` with lease heartbeats for job execution across six idempotent stages:
+1. **Feed Poller (`poll_feed`)**: Uses `SafeHttpClient`, conditional HTTP (`ETag`, `Last-Modified`), `304`/`301`/`410`/`429` (`Retry-After`), jitter, and exponential backoff; enforces backfill cap (`N = 10` default) on newly subscribed feeds; separates `status` (user intent) from `health_state`.
+2. **Isolated Content Extractor (`extract_content`)**: Fetches full linked HTML via `SafeHttpClient` (with per-domain rate limiting) and extracts text (`trafilatura`) inside a resource-bounded subprocess (CPU, RAM, wall-clock caps); falls back cleanly to RSS summary on block/error.
+3. **Pre-Enrichment Dedup & Story Clusterer (`cluster_item`)**: Runs **before** LLM enrichment to avoid redundant LLM calls on exact duplicates. Matches exact `canonical_url` first, then computes a normalized embedding (`title + lead_excerpt`) using the active embedding model and queries active in-window clusters via `pgvector`. Assigns cluster membership (and records a `sync_changes` event).
+4. **Mini-Research Fetcher (`mini_research`)**: Triggered by per-feed `research_policy`, primary-source link heuristics (PDF/arXiv/report links), or explicit user request ("dig deeper"). Fetches primary sources via `SafeHttpClient` within strict guardrails (default 1 hop, 20 MB PDF / 5 MB HTML, max 50 pages, timeout) and extracts text (`pymupdf` / `trafilatura`) inside the isolated extraction subprocess.
+5. **Cluster-Aware LLM Enricher (`enrich_item`)**: Acquires the global LLM concurrency slot (`concurrency = 1`), builds a token-budgeted, prompt-injection-delimited prompt (system rubric + active Interest Profile + bounded diverse feedback examples + per-feed hint + article text + mini-research excerpts), calls `LLMAdapter`, validates structured JSON output via Pydantic (5 calibrated relevance tiers, rationale, TL;DR, takeaways, tags, depth, research context), updates `search_vector`, and emits an aggregate `item` upsert in `sync_changes`.
+6. **Maintenance Schedulers**: `expire_items` (marks unread unstarred items past effective TTL based on `fetched_at` as `expired`), stale-lease job reaper, and retention cleanup (`jobs` > 30 days, `sync_mutations` & `sync_changes` > 90 days).
 
-### 3.4 Local-First Client (`web` + Phase 2 Android)
-- Maintains a local database (IndexedDB on Web; SQLite/IndexedDB on Android) holding the active working set (all feeds/categories/settings + recent/unread/starred items & enrichments).
-- **Automatic Reachability Detection**: Non-blocking health check determines `Connected (LAN)` vs. `Detached` state without interrupting reading.
-- **Offline Mutation Outbox**: Every user action (read, star, feedback, unsubscribe/mute, feed config change) is applied optimistically to local storage and appended to a persistent outbox with a client-generated UUID and timestamp. When back on the home LAN, the outbox flushes idempotently to `/api/v1/sync/push`, followed by `/api/v1/sync/pull`.
-- **External Link Handoff**: Clicking an article URL or primary-source PDF opens directly in the system browser using the client's internet connection.
+### 3.4 Local-First Client (`localhost` Ubuntu Phase 1 & Phase 2 Android)
+- Runs from a stable `localhost` secure origin (Phase 1) with `navigator.storage.persist()` requested on startup and a Service Worker caching the app shell for offline launch.
+- Stores feeds, categories, active profile/settings, unread + starred items, and last 14 days of read items in IndexedDB (`Dexie.js`); evicts older read/expired unstarred items locally.
+- Supports **detached local search** over cached working-set fields, **sortable tables/lists**, **DOMPurify** sanitization + strict CSP, and a persistent **offline mutation outbox** with rejection rollback & notification UX.
+- Opens external article and PDF URLs directly in the user's browser over the client's internet connection.
 
 ## 4. Key Data Flows
 
-### 4.1 Ingestion → Mini-Research → LLM Enrichment → Clustering
-1. **Scheduler** enqueues `poll_feed` jobs when `next_fetch_at <= now()`.
-2. **Feed Poller** fetches XML/JSON, creates new `items` rows (skipping known GUIDs/canonical URLs), updates feed health, and enqueues `extract_content` for each new item.
-3. **Content Extractor** fetches full article HTML (if enabled), stores cleaned text, checks mini-research triggers (feed policy + link inspection), and enqueues `mini_research` (if triggered) or directly `enrich_item`.
-4. **Mini-Research Fetcher** fetches primary linked PDF/HTML (respecting guardrails), stores `research_sources`, and enqueues `enrich_item`.
-5. **LLM Enricher** computes item embedding, runs structured LLM completion against `Ollama`/`llama.cpp`, persists `item_enrichments` + `item_tags`, and enqueues `cluster_item`.
-6. **Clusterer** queries recent items via `pgvector` similarity; either assigns the item to an existing `cluster` or creates a new single-item cluster, bumping `sync_seq` so clients pick up the enriched record on next sync.
+### 4.1 Ingestion → Pre-Enrichment Clustering → Mini-Research → Enrichment
+1. **Scheduler** dispatches `poll_feed` when `next_fetch_at <= now()`.
+2. **`poll_feed`** ingests new entries (applying backfill cap on initial poll), commits `items` + `sync_changes` (so items appear immediately in clients as `pending` enrichment), and enqueues `extract_content`.
+3. **`extract_content`** extracts clean article text in an isolated subprocess, updates `search_vector`, and enqueues `cluster_item`.
+4. **`cluster_item`** matches exact `canonical_url` duplicates or computes the canonical `title + lead_excerpt` embedding and assigns/creates a cluster.
+   - If the item is an **exact canonical-URL duplicate** of an already-enriched item in the cluster, it links to the cluster and optionally skips redundant LLM synthesis (marking enrichment `inherited` / referencing primary context) unless distinct commentary exists.
+   - Otherwise, enqueues `mini_research` (if triggered by feed policy/heuristics) or directly `enrich_item`.
+5. **`mini_research`** fetches & extracts primary source(s) in the isolated subprocess, persists `research_sources`, and enqueues `enrich_item`.
+6. **`enrich_item`** runs `LLMAdapter` under the concurrency-1 slot, validates structured JSON, persists `item_enrichments` + LLM `item_tags`, updates `search_vector` and cluster representative/tier, and records an `item` upsert in `sync_changes`.
 
-### 4.2 Detached Reading & Reconnect Sync
-1. While on home Wi-Fi, client calls `POST /api/v1/sync/push` (if outbox non-empty) then `GET /api/v1/sync/pull?since_seq=<cursor>` and updates local cache + cursor.
-2. Client leaves home Wi-Fi → server probe fails → UI smoothly transitions to `Detached` badge; user reads cached items, opens links in browser, marks read/starred, gives feedback, or mutes/unsubscribes a feed.
-3. All edits write to local cache + persistent outbox.
-4. Client returns to home Wi-Fi → reachability check succeeds → client flushes outbox (server deduplicates via `client_mutation_id`, reconciles via per-field timestamps) and pulls latest server deltas.
+### 4.2 Detached Reading, Reconnect Sync & Restore Recovery
+1. On home Wi-Fi, client checks `/api/v1/health`, flushes any pending outbox via `POST /api/v1/sync/push` (processing per-mutation `applied`/`superseded`/`rejected` responses), and pulls `GET /api/v1/sync/pull?since_seq=<cursor>`.
+2. If `instance_epoch` differs from the client's stored epoch, `cursor > watermark`, or the server returns `resync_required` (offline past `sync_changes` retention), the client keeps any unsynced outbox items intact, calls `GET /api/v1/sync/bootstrap` to rebuild its local cache, and then flushes the outbox.
+3. Away from home Wi-Fi, probe fails cleanly → `Detached` badge shown → user reads, searches locally, opens external URLs in browser, marks read/starred/bulk-read, gives feedback, or mutes/unsubscribes feeds → all edits apply optimistically to Dexie and persist in the outbox.
 
-### 4.3 Explicit Feedback & Prompt Evolution
-1. User clicks thumbs up/down, adds a short reason, or triggers a feed hint (e.g., *"fetch PDFs here"*).
-2. Client records a `feedback_event` (synced immediately or via outbox).
-3. Feed-level hints (like *"fetch PDFs here"*) directly update the feed's `research_policy` and optionally enqueue a `mini_research` + re-enrichment job for recent items.
-4. Item-level relevance feedback is stored in `feedback_events` and injected as compact recent positive/negative calibration examples into subsequent LLM curation prompts—while also being surfaced in the Curation Settings UI so the user can refine their editable Interest Profile and prompt templates.
+## 5. LLM Capacity, Context Budget & Runtime Contract
 
-## 5. External Integrations & Failure Modes
+### 5.1 Capacity Budget (Ryzen AI Max+ 395 / 128 GB, MoE-Optimized)
+- **Target Steady State**: ~200 items/day (~8.3 items/hour average; bursts up to ~40 items/hour).
+- **Model Profile**: Configurable chat & embedding models with strong preference for **Mixture-of-Experts (MoE)** chat models (e.g., 20B–35B total / ~3B active parameters running at ~30–60+ tok/s generation and fast prompt eval on Ryzen 395+ GPU/unified memory) paired with a fast dedicated embedding model (`< 50 ms`/item).
+- **Estimated Per-Item Cost**: ~2,500–6,000 prompt tokens + ~350–500 structured output tokens → **~10–25 seconds/item** on a fast MoE model → ~200 items/day takes **~35–85 minutes of total GPU time per day** (< 6% daily utilization).
+- **Backfill Drain**: With the `N = 10` per-feed backfill cap across 25 feeds (~250 items max), an initial OPML import drains in **~45–90 minutes** instead of days.
+
+### 5.2 Per-Stage Token Budgets & Truncation Policy
+- **Embedding input**: Canonical `title + first 1,500 chars of extracted_text (or raw_summary)` (~400 tokens).
+- **Standard enrichment prompt budget** (target <= 8k tokens default, configurable per model):
+  - System rubric + JSON schema: ~600 tokens
+  - Active Interest Profile: capped at ~800 tokens
+  - Calibration feedback examples (up to 6 diverse examples): capped at ~700 tokens
+  - Feed hint + item metadata: ~200 tokens
+  - Article text: capped at ~4,500 tokens (head + tail truncation preserving intro and conclusion).
+- **Mini-research excerpt budget**: Up to ~4,000 additional tokens extracted from primary source(s) (for PDFs: title/abstract + introduction + key findings/conclusion prioritized, capped at 50 parsed pages before section truncation).
+
+### 5.3 Concurrency, Priority & Shared-Host Controls
+- **Global LLM concurrency = `1`** (prevents thrashing unified memory/GPU).
+- **Job priorities**: `10` (user-triggered "Dig Deeper" / manual re-enrich) > `50` (steady-state new items) > `90` (initial backfill / bulk re-enrich / re-embed).
+- **Shared-host friendliness**: UI pause toggle + optional configurable quiet hours (e.g., pause background priority `>= 50` during active interactive sessions on the host).
+
+### 5.4 `LLMAdapter` Runtime Contract (`Ollama` & `llama.cpp`)
+Because Ollama and `llama.cpp` diverge on structured-output parameters, reasoning tags, and embeddings:
+- Define an internal `LLMAdapter` abstraction with explicit runtime profiles (`ollama`, `llamacpp`) and capability flags (`structured_output_mode`, `disable_thinking_param`, `strip_think_tags`, `max_embed_batch`, `normalize_embeddings`).
+- Both runtimes are covered by recorded contract-test fixtures (valid JSON, malformed JSON recovery, `<think>` stripping, embedding L2 normalization, timeouts, HTTP 503).
+
+## 6. Security, Networking & Failure Modes
+
+### 6.1 Host-Native LLM Networking
+- Never bind `Ollama` or `llama.cpp` to unrestricted `0.0.0.0` on the LAN.
+- **Supported setup**: Bind the LLM server strictly to the Docker bridge gateway IP (e.g., `172.17.0.1` or custom compose bridge subnet) OR bind with an explicit host firewall rule (`ufw`/`nftables`) allowing only the SmartRSS Docker subnet to reach the LLM port.
+- Worker performs a startup LLM health & model-availability check surfaced in System Health.
+
+### 6.2 Failure Modes & Mitigations
 
 | Failure Mode | Mitigation |
 | :--- | :--- |
-| **Flaky / down RSS feed** | Timeouts, HTTP 304/301/410 handling, exponential backoff (`next_fetch_at`), error surfaced in Feed Health view without blocking other feeds. |
-| **Full-text fetch blocked / paywalled (403/429)** | Log extraction status as `fallback_rss`, proceed with RSS summary/content so item is still enriched and readable. |
-| **Mini-research bad link / huge PDF / redirect loop** | Strict guardrails: max 1 hop by default, max response size (e.g., 20 MB PDF / 5 MB HTML), max extracted chars fed to LLM, per-domain timeout & concurrency cap. |
-| **Local LLM offline or saturated** | Items remain visible immediately in clients in `pending_enrichment` state; `enrich_item` jobs retry with backoff until Ollama/`llama.cpp` responds. |
-| **Malformed LLM JSON output** | Use JSON schema / structured output mode supported by Ollama & `llama.cpp`, validate with Pydantic, retry once with repair prompt, then log error cleanly. |
-| **Duplicate offline sync submissions** | Every client mutation carries a UUID (`client_mutation_id`); server checks `sync_mutations` table so retries are 100% idempotent. |
+| **SSRF via feed / article / redirect URL** | Shared `SafeHttpClient` resolves DNS, rejects private/loopback/link-local/CGNAT/Docker IPs and non-HTTP(S) schemes, re-checks every redirect hop, and pins the resolved IP ([ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md)). |
+| **LAN CSRF / DNS rebinding / unauthorized device** | Per-device bearer token (one-time pairing), strict `Host` allow-list, strict CORS allow-list, JSON-only mutations ([ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md)). |
+| **XSS in feed HTML or LLM output** | DOMPurify allow-list sanitization, strict SPA CSP, plain-text/safe-Markdown rendering for LLM fields. |
+| **Crafted PDF / HTML bomb** | Isolated extraction subprocess with CPU/RAM/wall-clock limits, 20 MB / 50-page caps, pinned `pymupdf`. |
+| **Prompt injection in article/PDF** | System-prompt rubric, explicit XML/fence delimiters around untrusted content, strict Pydantic schema validation. |
+| **Flaky / down / 410 / 429 RSS feed** | `ETag`/`Last-Modified`, `Retry-After`, jitter, exponential backoff, separate `health_state` in Feed Health UI. |
+| **Local LLM offline or saturated** | Items appear immediately in `pending` state; `enrich_item` retries with backoff; UI remains fully usable. |
+| **Backup restore rewinds DB sequence** | Restore procedure rotates `instance_epoch`; clients detect mismatch and cleanly re-bootstrap while preserving unsynced outbox. |
 
-## 6. Deployment & Operations
+## 7. Deployment, Backups & Operations
 - **Docker Compose Services**:
-  - `db`: `pgvector/pgvector:pg16` with named persistent volume.
+  - `db`: `pgvector/pgvector:pg16` with named persistent volume (`pgdata`).
   - `api`: FastAPI container (uvicorn) connecting to `db`.
-  - `worker`: Same Python image as `api` with worker entrypoint, connecting to `db` and host LLM endpoint via `extra_hosts: ["host.docker.internal:host-gateway"]`.
-  - `web`: Nginx/Caddy serving the compiled SPA and reverse-proxying `/api/` to `api` on a single LAN port.
-- **Configuration**: `.env` for infrastructure (DB credentials, LAN port, default LLM URL/models) + database-stored `app_settings` & `prompt_configs` for everything user-tunable via UI.
-- **Backups**: Scheduled `pg_dump` script to host directory + OPML/config JSON export endpoint.
-- **Observability**: Structured JSON logs (`stdout`), plus a built-in **System Health / Queue** UI tab showing pending/failed jobs, LLM latency/tokens, and feed fetch health.
+  - `worker`: Same Python image as `api` (worker entrypoint) with bounded extraction subprocess limits, connecting to `db` and host LLM over the Docker bridge gateway.
+  - `web`: Nginx/Caddy single LAN entry point serving static SPA fallback + reverse-proxying `/api/` to `api`.
+- **Configuration**: `.env` for infrastructure (DB credentials, LAN port, allowed `Host`/CORS origins, LLM URL/runtime/models) + database `app_settings` & `prompt_configs` for user-tunable behavior.
+- **Backups & Restore Drill**:
+  - Simple scheduled nightly `pg_dump` (compressed custom format) written to a host backup directory with **14-day local rotation**.
+  - Optional simple `rsync`/SSH copy hook to another machine on the home LAN (configured via env/script; more elaborate backup tooling deferred to a later phase).
+  - Documented & tested **restore drill** script: restores dump into a fresh DB, rotates `sync_state.instance_epoch`, verifies health, and confirms paired clients cleanly resync without losing pending outbox mutations.
+- **Observability**: Structured JSON logs (`stdout`) + System Health UI tab (LLM connectivity, job queue depth/dead-letters with manual retry, feed health, token/latency metrics).

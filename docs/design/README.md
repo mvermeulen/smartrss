@@ -1,9 +1,12 @@
 # Component Designs
 
-Detailed design documents for individual subsystems and features live in this directory.
+Detailed design documents for individual subsystems live in this directory, sequenced to match the vertical-slice milestones in [docs/requirements.md](../requirements.md) §6. Each component design should be reviewed and marked **`Approved`** before implementing its milestone.
 
-## Planned Specs
-- `ingestion-and-mini-research.md` — Polite RSS/Atom polling, feed health, full-text extraction, primary-source/PDF mini-research heuristics & guardrails.
-- `llm-pipeline-and-feedback.md` — Local LLM adapter (`Ollama`/`llama.cpp`), structured output schemas, prompt versioning, interest profile & explicit feedback loop, story clustering.
-- `sync-protocol-and-offline-client.md` — `/api/v1/sync/pull` & `/api/v1/sync/push` contracts, `sync_seq` pagination, idempotent mutation outbox, conflict resolution, and Phase 2 Android considerations.
-- `client-ui-and-ux.md` — Classic RSS layout enhanced with smart metadata, cluster views, feedback controls, prompt/feed configuration UI, and detached-mode indicators.
+## Planned Specs (Milestone Order)
+1. **`1a-backend-ingestion-and-security.md`** *(Milestone 1a)* — Docker Compose stack, Alembic schema, Postgres job queue (`SKIP LOCKED`, dedupe, leases, advisory-lock scheduler), per-device pairing auth + `Host`/CORS middleware, shared `SafeHttpClient` SSRF protection, polite polling (`ETag`/`Last-Modified`/`301`/`410`/`429`), isolated full-text extraction, backfill cap (`N=10`), expiration sweeper, and backup/restore scripts.
+2. **`1b-sync-protocol-and-search.md`** *(Milestone 1b)* — Commit-ordered `sync_changes` watermark, `/api/v1/sync/bootstrap`, `/api/v1/sync/pull`, `/api/v1/sync/push` payloads & error/rollback contract, `instance_epoch` restore recovery, per-field LWW reconciliation, bounded bulk mark-read, and PostgreSQL FTS maintenance.
+3. **`1c-client-ui-and-offline-shell.md`** *(Milestone 1c)* — Localhost-served React + TypeScript + Dexie.js SPA (runner/Tauri packaging), Service Worker offline shell, `navigator.storage.persist()`, persistent mutation outbox & rejection rollback UX, detached local search, classic 3-pane/list UX with sortable headers & keyboard shortcuts, DOMPurify + strict CSP, and System Health UI.
+4. **`1d-llm-adapter-and-enrichment.md`** *(Milestone 1d)* — `LLMAdapter` runtime contract (`Ollama` & `llama.cpp`), structured JSON output & `<think>` handling, token budgets & prompt delimitation, 5-tier relevance rubric, seeded/versioned prompt & Interest Profile editor, concurrency/priority/quiet-hours controls, and `live_llm` MoE smoke benchmark.
+5. **`1e-deduplication-and-clustering.md`** *(Milestone 1e)* — Versioned `item_embeddings`, canonical `title + lead_excerpt` embedding pipeline, pre-enrichment URL & cosine-similarity clustering, merge/split semantics, grouped cluster UI, and "Mark cluster read" / "Split from cluster".
+6. **`1f-mini-research-and-pdfs.md`** *(Milestone 1f)* — Isolated PyMuPDF/HTML extractor limits, primary-source link heuristics, per-feed `research_policy` & guardrails, on-demand "Dig Deeper" & "Fetch PDFs here" workflow, and synthesized primary-source context.
+7. **`1g-feedback-and-evaluation.md`** *(Milestone 1g)* — Explicit feedback UI/storage, diverse/bounded calibration example selection, and offline relevance evaluation harness (`live_llm`) measuring tier alignment across prompt/model versions.

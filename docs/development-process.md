@@ -1,6 +1,6 @@
 # Development, Testing & Documentation Process
 
-> **Status:** In Review
+> **Status:** In Review *(Revised after 2026-11-22 design reviews; ready for owner approval)*
 
 This document defines **how** SmartRSS is developed, tested, documented, and evolved. It applies to both human contributors and AI coding agents.
 
@@ -12,7 +12,7 @@ SmartRSS follows a **spec-first, test-integrated, docs-synchronized** workflow:
 
 1. **Align with Specs First**: Before writing code for a feature or significant change, review the relevant docs in `docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, and `docs/design/`. If requirements or contracts are unclear or changing, update the spec first.
 2. **Implement + Test Together**: Write automated tests alongside production code—never defer tests to a "later cleanup pass."
-3. **Verify Locally**: Run linting, type-checking, and the full relevant test suite (including coverage checks) before considering a task done.
+3. **Verify Locally**: Run `make check` (linting, type-checking, unit + real-Postgres integration tests, coverage gates) before considering a task done. *(No GitHub Actions CI is required; local verification gates are mandatory on every change.)*
 4. **Sync Documentation**: Update affected design docs, schemas, ADRs, and `AGENTS.md` in the **same change** as the code.
 5. **Small, Focused Commits**: Keep commits cohesive (feature + its tests + its doc updates together) with clear commit messages describing *why* as well as *what*.
 
@@ -22,24 +22,24 @@ SmartRSS follows a **spec-first, test-integrated, docs-synchronized** workflow:
 
 Testing is an integral part of every code change, not an optional verification step.
 
-### 2.1 Test Layers
-| Layer | Scope | Tooling (Planned) | Requirements |
+### 2.1 Test Layers & Infrastructure
+| Layer | Scope | Tooling | Requirements |
 | :--- | :--- | :--- | :--- |
-| **Unit Tests** | Pure domain logic: URL canonicalization, expiration TTL resolution, conflict resolution, mini-research guardrails, prompt rendering, Pydantic schema validation, feed backoff math | Backend: `pytest`<br>Frontend: `vitest` | Fast (milliseconds), deterministic, zero network or DB dependencies. |
-| **Integration Tests** | FastAPI endpoints, PostgreSQL + `pgvector` queries, `SKIP LOCKED` job queue, FTS indexing, migrations, full sync push/pull flows | `pytest` + test PostgreSQL (`pgvector`) instance | Exercise real SQL, transactions, constraints, and `sync_seq` ordering—do not mock away Postgres behavior. |
-| **External Boundary & Contract Tests** | RSS/Atom parsing, HTML/PDF extraction, OpenAI-compatible LLM adapter (`Ollama` / `llama.cpp`) | Recorded HTTP fixtures (`respx` / `pytest-httpx`) + sample HTML/PDF/RSS test fixtures | Deterministic in CI/local runs; test both happy paths and hostile inputs (malformed XML, broken PDFs, 403/429/500 responses, invalid LLM JSON, timeouts). |
-| **Client Offline & Sync Tests** | IndexedDB cache, persistent outbox queueing, reconnect flush, optimistic UI updates, detached-mode transitions | `vitest` + `fake-indexeddb` (plus Playwright E2E for critical user flows) | Verify no data loss or duplicate mutations across disconnect/reconnect cycles. |
-| **Optional Live-LLM Smoke / Eval Suite** | Prompt quality & structured output reliability against actual local `Ollama` / `llama.cpp` models | `pytest -m live_llm` (opt-in, excluded from default fast suite) | Used when tuning prompts, interest profiles, or upgrading local models. |
+| **Unit Tests** | Pure domain logic: URL canonicalization, expiration TTL resolution, per-field LWW conflict merge, clock-skew clamping, SSRF IP range validation, mini-research guardrails, prompt rendering/delimitation, Pydantic schemas, feed backoff math | Backend: `pytest` + `hypothesis` (property-based tests for sync convergence)<br>Frontend: `vitest` | Fast (milliseconds), deterministic, zero network or DB dependencies. |
+| **Integration Tests (Real PostgreSQL)** | FastAPI endpoints, `sync_state`/`sync_changes` concurrent-commit ordering, `bootstrap`/`pull`/`push`, `instance_epoch` restore drill, PostgreSQL + `pgvector` clustering, `SKIP LOCKED` job queue + lease reclaim, FTS indexing, Alembic migrations | `pytest` against a real `pgvector/pgvector:pg16` test database started via `docker compose --profile test` (or `testcontainers`) | Exercise real SQL, transactions, locks, constraints, and `sync_seq` ordering—never mock away PostgreSQL behavior. |
+| **External Boundary & Contract Tests** | RSS/Atom parsing, HTML/PDF extraction in bounded subprocess, `SafeHttpClient` SSRF/redirect/IP-pinning, `LLMAdapter` for **both** `Ollama` and `llama.cpp` | Recorded HTTP fixtures (`respx` / `pytest-httpx`) + sanitized sample & hostile HTML/PDF/RSS/LLM fixtures | Deterministic in default runs; cover both runtimes (`Ollama` & `llama.cpp`) and hostile inputs (malformed XML, crafted PDF bombs, redirect loops, private-IP SSRF, 403/410/429, invalid LLM JSON, `<think>` blocks, timeouts). |
+| **Client Offline, Security & E2E Tests** | Dexie.js IndexedDB cache, persistent outbox queueing, optimistic rollback on `rejected`, detached local search, Service Worker offline reload, DOMPurify XSS neutralization, strict CSP | `vitest` + `fake-indexeddb` + Playwright E2E | Must include an offline-reload E2E test: load app → disconnect LAN API → reload → search locally + perform offline mutations → reconnect → verify zero lost mutations. |
+| **Opt-In Live-LLM Smoke & Eval Suite** | Real MoE structured-output reliability, throughput benchmarking, and offline relevance evaluation against historical thumbs up/down feedback | `pytest -m live_llm` (opt-in, excluded from default fast suite) | Run during `1d` model benchmarking, `1g` eval setup, and whenever upgrading models or editing prompts/Interest Profile. |
 
 ### 2.2 Coverage Expectations
 - **Target Coverage**:
   - **Backend overall**: **>= 80%** line coverage (`pytest --cov`).
-  - **Critical core modules** (sync reconciliation, expiration policy, job queue, URL canonicalization/dedup, mini-research guardrails, LLM output validation): **>= 90%** line/branch coverage.
-  - **Frontend core logic** (local store, sync engine, outbox/conflict handling, state reducers): **>= 80%** line coverage.
+  - **Critical core modules** (sync watermark & reconciliation, per-field LWW merge, expiration policy, job queue & lease reclaim, URL canonicalization/dedup, SSRF `SafeHttpClient`, mini-research guardrails, LLM schema validation): **>= 90%** line/branch coverage.
+  - **Frontend core logic** (Dexie local store, sync engine, outbox/rollback handling, detached search, HTML sanitization): **>= 80%** line coverage.
 - **Quality Over Vanity Metrics**:
   - Do **not** write low-value tests that merely assert mock call counts or test framework boilerplate to inflate numbers.
   - Assert observable behavior, state transitions, invariants, and error handling.
-  - Coverage should never decrease silently on touched modules without an explicit reason.
+  - Coverage must not silently regress on touched modules.
 
 ### 2.3 Regression Testing Policy (Mandatory)
 - **Every bug fix MUST include a regression test**:
@@ -50,11 +50,16 @@ Testing is an integral part of every code change, not an optional verification s
 
 ### 2.4 Non-Negotiable Invariant Test Matrix
 The following SmartRSS invariants must always have dedicated automated test coverage:
-- **Offline Sync Idempotency & Ordering**: Replaying the same `client_mutation_id` multiple times produces the exact same server state; out-of-order timestamps obey deterministic per-field last-write-wins; `sync_seq` pagination never drops or duplicates records.
-- **Non-Destructive Expiration & Starred Immunity**: Unread unstarred items transition to `expired` using feed override → global default TTL; `expiration_days_override = 0` never expires; starred items **never** expire; expired items remain in the historical log.
-- **Mini-Research Guardrails**: Enforces max hop depth, max response size (HTML & PDF), timeout caps, unsupported content-type rejection, and redirect limits.
-- **Graceful LLM Degradation**: Ingestion and API sync continue normally when `Ollama`/`llama.cpp` is unreachable; items appear in `pending` enrichment state and backfill cleanly when LLM returns; malformed JSON triggers bounded retry + clean failure state.
-- **Polite Feed Polling**: Sends `ETag`/`Last-Modified`, handles `304 Not Modified` / `301` / `410`, increments `consecutive_errors` and applies exponential backoff on failures, resets error state on recovery.
+- **Gap-Free Committed Sync Watermark**: Real-Postgres concurrency test interleaving two transactions so the earlier-starting transaction commits later, proving `sync/pull` never skips or duplicates records.
+- **Backup Restore & `instance_epoch` Recovery**: Test simulating a DB restore that rewinds `current_seq` and rotates `instance_epoch`, proving clients preserve unsynced outboxes, cleanly re-bootstrap, and flush mutations idempotently.
+- **Offline Sync Idempotency & Conflict Convergence**: Replay tests for duplicate `client_mutation_id`s, clock-skew clamping tests, `hypothesis` property-based tests proving per-field LWW convergence regardless of mutation arrival order, and bounded bulk mark-read tests proving unseen items are untouched.
+- **Detached Client Survival (Playwright)**: Load app on `localhost` origin → disconnect API → reload page offline → verify app loads via Service Worker, detached local search works, and outbox survives reload and flushes on reconnect (including rejection rollback UX).
+- **LAN Auth, CSRF & DNS Rebinding Security**: Verify missing/invalid/revoked bearer tokens return `401`, disallowed `Host` headers are rejected, disallowed CORS origins are blocked, non-JSON mutation posts are rejected, and expired/reused pairing codes fail.
+- **SSRF Protection Across All Fetchers**: Verify `SafeHttpClient` blocks loopback, RFC1918, link-local, CGNAT, IPv6 ULA, Docker subnets, non-HTTP(S) schemes, and multi-hop redirects pointing to private IPs (plus IP pinning against DNS rebinding) in polling, extraction, and mini-research.
+- **XSS, CSP & Parser Isolation**: Verify hostile feed HTML/LLM output is sanitized by DOMPurify under strict CSP, untrusted prompt text is delimited and schema-validated, and oversized/pathological PDFs/HTML hit subprocess CPU/RAM/page/byte limits without crashing the worker.
+- **Non-Destructive Expiration & Starred Immunity**: Verify `fetched_at`-based TTL (and `unexpired_at` reset), feed override → global default, `0` = never expire, starred immunity, backfill cap (`N = 10`), and permanent history retention.
+- **Graceful LLM Degradation & Dual-Runtime Contract**: Verify ingestion/UI work normally when LLM is offline, `Ollama` and `llama.cpp` fixtures both pass (including malformed JSON recovery and `<think>` stripping), and concurrency stays bounded to `1`.
+- **Polite Feed Polling & Job Queue Resilience**: Verify `ETag`/`Last-Modified`, `304`/`301` (including URL collision)/`410`/`429` + `Retry-After`, exponential backoff, separate `status` vs `health_state`, job dedupe uniqueness, and stale-lease reclaim after worker crash.
 
 ---
 
@@ -62,54 +67,45 @@ The following SmartRSS invariants must always have dedicated automated test cove
 
 - **Backend (Python 3.12+)**:
   - Formatting & linting: `ruff format` and `ruff check`.
-  - Static typing: `mypy` or `pyright` on strict/standard settings; Pydantic v2 models for all API/LLM boundaries.
-  - Database migrations: Versioned migrations (`alembic`); every schema change must have a reversible migration tested against a clean database.
+  - Static typing: `mypy` or `pyright`; Pydantic v2 models for all API and LLM boundaries.
+  - Database migrations: Versioned `alembic` migrations; every schema change must have a reversible migration tested against a clean PostgreSQL database.
 - **Frontend (TypeScript)**:
-  - `strict: true` in `tsconfig.json`; no untyped `any` across API/sync boundaries.
+  - `strict: true` in `tsconfig.json`; React + Vite + Dexie.js + DOMPurify; no untyped `any` across API/sync boundaries.
   - Linting & formatting: `eslint` + `prettier` (or `biome`).
-- **Automated Checks**: Provide a single repeatable command (e.g., `Makefile` or `justfile` targets like `make check`, `make test`, `make test-cov`) so both humans and agents run the exact same verification gates.
+- **Repeatable Local Verification (`Makefile`)**:
+  - Provide standard targets (`make check`, `make test`, `make test-unit`, `make test-int`, `make test-e2e`, `make test-cov`, `make test-live-llm`, `make backup`, `make restore-drill`) so humans and agents run the exact same local verification gates.
 
 ---
 
-## 4. Documentation Maintenance Standards
+## 4. Documentation Maintenance & Approval Standards
 
-Documentation is treated as a **first-class deliverable**, kept continuously synchronized with the codebase.
+Documentation is a **first-class deliverable**, kept continuously synchronized with the codebase.
 
-### 4.1 Docs-in-the-Same-Change Rule
-Whenever a code change alters any of the following, the corresponding documentation **must** be updated in the same commit/PR:
-- **New or changed API endpoints / Sync protocol fields** → Update `docs/design/sync-protocol-and-offline-client.md` (and OpenAPI schema).
-- **Database tables, columns, indexes, or retention rules** → Update `docs/data-model.md`.
-- **Service topology, external dependencies, or pipeline stages** → Update `docs/architecture.md`.
-- **LLM prompts, structured output schema, mini-research rules, or feedback mechanics** → Update `docs/design/llm-pipeline-and-feedback.md` / `docs/design/ingestion-and-mini-research.md`.
-- **Scope, goals, or milestone changes** → Update `docs/requirements.md`.
-- **Environment variables, Docker setup, or operational commands** → Update root `README.md` / `docs/architecture.md`.
+### 4.1 Approval Mechanism (Coding Gate)
+- `AGENTS.md` gates application coding on approved specs.
+- **Who approves**: The project owner explicitly reviews and approves specs and ADRs.
+- **How approval is recorded**: Updating the document status to **`Approved`** (in the doc header and [docs/README.md](README.md)) and ADR status from `Proposed` to **`Accepted`** in a git commit.
+- Component designs in `docs/design/` are approved milestone-by-milestone (`1a`, `1b`, …) before implementing each milestone.
 
-### 4.2 Architecture Decision Records (ADRs)
-Create a new ADR in `docs/decisions/NNNN-short-title.md` (and update `docs/decisions/README.md`) whenever making or revising a decision that:
-- Introduces or swaps a core dependency, container, or protocol.
-- Changes data lifecycle, sync conflict semantics, or security/network boundaries.
-- Involves meaningful trade-offs that a future contributor might otherwise question or accidentally undo.
+### 4.2 Docs-in-the-Same-Change Rule
+Whenever a code change alters any of the following, update the corresponding docs in the **same commit**:
+- API endpoints, sync protocol, or push/pull schemas → `docs/design/sync-protocol-and-offline-client.md` (and OpenAPI).
+- Database tables, columns, indexes, state machines, or retention rules → `docs/data-model.md`.
+- Service topology, networking, security boundaries, or pipeline stages → `docs/architecture.md`.
+- LLM prompts, adapter contracts, clustering, or mini-research rules → `docs/design/` specs.
+- Scope, acceptance criteria, or milestones → `docs/requirements.md`.
+- Environment variables, Docker setup, or backup/restore commands → root `README.md` / `docs/architecture.md`.
 
-When an older ADR is replaced, mark it `Superseded by NNNN` rather than deleting it.
-
-### 4.3 Keeping Status & Index Accurate
-- Update [docs/README.md](README.md) whenever documents are added or move between `Draft`, `In Review`, and `Approved`.
-- Periodically review `docs/` during milestone transitions to retire stale notes and verify doc links remain valid.
+### 4.3 Architecture Decision Records (ADRs)
+Create a new ADR in `docs/decisions/NNNN-short-title.md` (and update `docs/decisions/README.md`) whenever introducing/swapping a core dependency, protocol, security/network boundary, or data/sync invariant. Mark replaced ADRs `Superseded by NNNN` rather than deleting them.
 
 ---
 
 ## 5. Evolving `AGENTS.md` & Project Skills Based on Feedback
 
-The development process itself should improve over time based on real experience and user feedback:
-
-- **When to update `AGENTS.md`**:
-  - Whenever the user corrects an agent behavior, clarifies a recurring convention, or establishes a new guardrail.
-  - Keep `AGENTS.md` concise and high-signal (well under the 24 KB rule cap): state the **rule/guardrail directly**, and link to detailed specs in `docs/` rather than duplicating long explanations.
-- **When to update `docs/development-process.md`**:
-  - When expanding detailed testing strategies, coverage rules, tooling commands, or release/migration procedures.
-- **When to create a Project Skill (`.agents/skills/<name>/SKILL.md`)**:
-  - When a multi-step engineering workflow repeats across tasks (e.g., adding a DB migration + updating `data-model.md`, running the live-LLM prompt eval suite, or executing a spec-to-implementation checklist).
-  - Skills keep detailed step-by-step runbooks out of always-on context until needed.
+- **When to update `AGENTS.md`**: Whenever the user corrects an agent behavior, clarifies a recurring convention, or establishes a new guardrail. Keep `AGENTS.md` lean (well under the 24 KB limit) and link to `docs/` for bulky details.
+- **When to update `docs/development-process.md`**: When refining testing standards, invariant matrices, tooling commands, or release/backup drills.
+- **When to create a Project Skill (`.agents/skills/<name>/SKILL.md`)**: When a multi-step engineering procedure repeats across sessions (e.g., `re-embed-and-recluster`, `add-alembic-migration`, `run-live-llm-eval`, `restore-drill`).
 
 ---
 
@@ -117,8 +113,8 @@ The development process itself should improve over time based on real experience
 
 Before marking any implementation task complete (or committing), verify:
 - [ ] Behavior matches the approved specs in `docs/` (or specs were updated first).
-- [ ] Unit and integration tests cover the new behavior and edge cases.
+- [ ] Unit, real-Postgres integration, and boundary/E2E tests cover new behavior and edge cases.
 - [ ] Bug fixes include a dedicated regression test that failed before the fix.
-- [ ] Linter, type checker, and test suite pass cleanly, meeting coverage targets.
-- [ ] Affected docs (`docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, `docs/design/*`, `docs/decisions/*`, `docs/README.md`) are updated in the same change.
+- [ ] Local verification (`make check` / coverage gates) passes cleanly.
+- [ ] Affected docs (`docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, `docs/design/*`, `docs/decisions/*`, `docs/README.md`) are updated in the same commit.
 - [ ] Any new convention, guardrail, or lesson learned from user feedback is reflected in `AGENTS.md`, `docs/development-process.md`, or `.agents/skills/`.

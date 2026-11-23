@@ -3,7 +3,7 @@
 - **Date**: 2026-11-22
 - **Scope**: `docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, `docs/decisions/0001–0003`, `docs/development-process.md`, `AGENTS.md` (as of commit `2599cdb`)
 - **Reviewer**: Claude Code (at the project owner's request)
-- **Status**: Open. Resolve every item below before starting the detailed component designs in `docs/design/`.
+- **Status**: Addressed — all findings (`R-01`–`R-34`) and owner questions (`Q-01`–`Q-11`) resolved across updated docs and ADRs `0001`–`0006` (pending owner sign-off to mark docs `Approved` and ADRs `Accepted`).
 
 ## How to use this document
 
@@ -30,7 +30,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   3. **Change-log table**: Write an append-only `sync_changes(seq, entity_type, entity_id, op)` row in the same transaction as each change, with one of the two ordering fixes above applied to it. This also solves R-02.
   
   Add an integration test that interleaves two transactions so they commit out of order and asserts that no row is skipped.
-- **Resolution**:
+- **Resolution**: Adopted options 2 + 3 together in [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md) and `data-model.md` §4.2: added a single-row `sync_state` counter locked `FOR UPDATE` at transaction end to allocate strictly commit-ordered sequence numbers into an append-only `sync_changes(seq, entity_type, entity_id, op, changed_at)` log. Added the interleaved concurrent-commit real-PostgreSQL test to `development-process.md` §2.4 and `requirements.md` `NFR-SYNC-01` / Milestone `1b`.
 
 ### R-02 — Downstream sync has no complete definition of tombstones, deletions, or child-row changes
 - **Docs**: `data-model.md` §3, §5
@@ -41,7 +41,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Cluster merges and splits: when items move between clusters, or a cluster becomes empty, nothing defines how the client removes the old cluster.
   - `feedback_events`: it isn't stated whether these sync down so a second device can show that a thumbs-up was already given.
 - **Recommendation**: Add a "Sync Surface" table listing every entity that is synced down, its parent or aggregate, how a change is signalled, and how a deletion is signalled. Consider syncing **aggregates**: an item record that embeds its current enrichment, tags, and research-source summaries, with any change to a child bumping the item's `sync_seq`. That keeps the protocol much simpler than syncing every table separately. A change-log table (R-01 option 3) gives you deletions for free.
-- **Resolution**:
+- **Resolution**: Added an explicit **Sync Surface Table** in `data-model.md` §5.1 and recorded the aggregate sync design in [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md). `item` syncs as an aggregate embedding current `item_enrichment`, LLM `tags[]`, `research_sources[]` summaries, `cluster_id`, and current user item vote (`thumbs_up`/`thumbs_down`/reason); child changes emit parent `item` `upsert` rows in `sync_changes`. Soft-deleted `categories` and emptied/merged `clusters` emit explicit `delete` tombstones; `prompt_configs` and internal tables are explicitly marked online-only / not pushed via `sync_changes`.
 
 ### R-03 — Phase 1 detached mode is not achievable as designed (plain-HTTP LAN origin)
 - **Docs**: ADR 0002, `architecture.md` §2 and §3.4, `requirements.md` §4.6
@@ -57,7 +57,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - **(c)** A browser flag such as `unsafely-treat-insecure-origin-as-secure`. Fragile; not recommended.
   
   Option (a) also lines up with a Capacitor-based Phase 2. Whichever you choose, require `navigator.storage.persist()` and fixed server addressing (hostname or mDNS), and add a Playwright test: load the app, go offline, reload, and confirm the app works and the outbox survives.
-- **Resolution**:
+- **Resolution**: Owner confirmed Phase 1 Ubuntu can be a laptop that leaves the LAN (`Q-01`) and selected option (a) (`Q-02`). Added [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md) (and updated ADR 0002, `architecture.md` §2 & §3.4, `requirements.md` §3 & `NFR-SYNC-02`, `AGENTS.md`) specifying a fixed `localhost` secure origin (local static runner or lightweight Tauri shell), `navigator.storage.persist()`, fixed server hostname/mDNS addressing decoupled from client origin, CORS allow-listing, and the required Playwright offline-reload/outbox E2E test (`development-process.md` §2.4, Milestone `1c`).
 
 ### R-04 — No authentication or LAN attack-surface protection
 - **Docs**: `requirements.md` §2 (Non-Goals), `architecture.md` §3.1 and §6
@@ -71,7 +71,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - A CORS allow-list.
   
   Record this as an ADR, since it changes the network and security boundary.
-- **Resolution**:
+- **Resolution**: Owner confirmed one-time device pairing → per-device revocable bearer token (`Q-03`). Recorded in [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-01`, `architecture.md` §3.2 & §6.2, `data-model.md` §4.1 (`devices` & `pairing_codes`), `AGENTS.md`, and `development-process.md` §2.4 (auth/Host/CORS/CSRF security tests).
 
 ### R-05 — Server-side fetching is an SSRF vector into the home network
 - **Docs**: `requirements.md` §4.2, `architecture.md` §3.2 and §5
@@ -82,7 +82,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Allow only `http` and `https` schemes.
   
   Add this to the AGENTS.md guardrail list and the §2.4 invariant matrix.
-- **Resolution**:
+- **Resolution**: Added shared `SafeHttpClient` covering ALL server-side fetchers (feed polling, full-text extraction, mini-research) in [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-02`, `architecture.md` §2, §3.3 & §6.2, `AGENTS.md` Architectural & Security Guardrails, and `development-process.md` §2.4 invariant matrix.
 
 ---
 
@@ -97,7 +97,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - The interaction between server-driven `expired` and client actions is undefined. Can a client mark an expired item read or unread? Does starring an expired item un-expire it? Does expiration itself count as a "write" in LWW?
   - LWW on large free-text fields (interest profile, prompt hints) silently discards a whole offline edit.
 - **Recommendation**: In the sync design doc, write a per-field merge table. For each mutable field, give the merge rule, the timestamp source, and how it interacts with expiration. Store a timestamp per field (`read_state_updated_at`, `starred_updated_at`, ...), or keep a field-level version map. Make free-text config edits either online-only or versioned with a visible conflict. Consider property-based tests (for example with `hypothesis`) for reconciliation convergence.
-- **Resolution**:
+- **Resolution**: Split `items` into independent `read_state_updated_at` and `starred_updated_at` (`data-model.md` §4.5), replaced `feeds.config_updated_at` with per-field `field_updated_at JSONB` + `config_version` (`data-model.md` §4.4), added the **Per-Field Conflict Resolution & Merge Table** (`data-model.md` §5.2) with clock-skew clamping (`LEAST(client_timestamp, server_now + 5m)`), defined `expired` interaction rules, made long free-text edits (`interest_profiles`, `prompt_configs`, `custom_prompt_hint`) online-only with optimistic version checks (`409 Conflict`), and added `hypothesis` property-based convergence tests to `development-process.md` §2.1 & §2.4.
 
 ### R-07 — Item state model needs a state diagram
 - **Docs**: `requirements.md` §4.5, `data-model.md` §3.3 and §5
@@ -107,13 +107,13 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - What does "mark cluster read" do to items that join the cluster *after* the mutation was queued offline?
   - What happens to an exact duplicate (the same URL in two feeds)? Is it one unread item or two? Does reading one mark the other read?
 - **Recommendation**: Add an explicit state machine (a mermaid `stateDiagram`) with every transition and who triggers it. Define cluster-level actions as expanding to an **explicit list of item IDs the client knew about** at the time of the action, so they stay idempotent and time-independent. Decide whether read state is tracked per item or per cluster.
-- **Resolution**:
+- **Resolution**: Added explicit Mermaid Item State Machine (`data-model.md` §3.1) clarifying orthogonal `is_starred`, archive viewing (`expired -> read`), explicit restore (`expired -> unread` via `unexpired_at`), and next-sweep expiration after un-starring. Per owner decision (`Q-06`), read state is tracked **per item**, exact duplicates/clusters display grouped, and **"Mark cluster read"** expands on the client into explicit known `item_ids[]` (`requirements.md` `FR-STATE-03`, `data-model.md` §5.2).
 
 ### R-08 — "Mark all as read" is missing
 - **Docs**: `requirements.md` §4.6 and §4.7
 - **Problem**: The standard RSS actions "mark feed/category/all as read" (and "mark older than X as read") are absent from the mutation list. Done naively offline, they would also mark items the client has never seen.
 - **Recommendation**: Add them, with semantics bounded by what the client has seen: "all items in scope with `sync_seq <= N`", or an explicit ID list.
-- **Resolution**:
+- **Resolution**: Added bounded `mark_bulk_read` (feed/category/all/older-than-X) scoped to `{scope, up_to_sync_seq, older_than_ts?}` or explicit `item_ids[]` in `requirements.md` `FR-STATE-03` & `FR-SYNC-03`, `data-model.md` §5.2, and `development-process.md` §2.4.
 
 ### R-09 — Client bootstrap, cache window, eviction, and server restore are undefined
 - **Docs**: `data-model.md` §5 (line 192), `architecture.md` §4.2
@@ -127,7 +127,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Define client-side eviction rules.
   - Add a server **epoch / instance ID** to every pull response. When it changes, or the cursor is ahead of the server, the client must do a full resync.
   - Add tests for each of these.
-- **Resolution**:
+- **Resolution**: Defined `GET /api/v1/sync/bootstrap`, `sync_state.instance_epoch`, backup-restore epoch rotation + cursor-regression resync preserving pending outbox, and explicit client eviction & out-of-window delta handling in [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), `architecture.md` §3.2 & §4.2, `data-model.md` §6.2, `requirements.md` `FR-SYNC-01`, and `development-process.md` §2.4.
 
 ### R-10 — Embedding dimension and model changes are not handled
 - **Docs**: `data-model.md` §3.4 (line 119), §3.7, §4
@@ -142,7 +142,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Document the re-embed and re-cluster procedure (a project skill would suit this).
   - Make thresholds per-model settings.
   - Restrict similarity queries to current, in-window rows.
-- **Resolution**:
+- **Resolution**: Moved embeddings into dedicated `item_embeddings(item_id, model_name, dimensions, input_kind, embedding)` (`data-model.md` §4.7), locked one canonical input (`title + first 1,500 chars of extracted_text or raw_summary`), stored similarity thresholds per model in `app_settings`, scoped queries & HNSW indexing to the active model + active clustering time window, and noted `re-embed-and-recluster` as a planned project skill (`development-process.md` §5).
 
 ### R-11 — Clustering design gaps
 - **Docs**: `architecture.md` §3.2 (step 5) and §4.1 (step 6), `data-model.md` §4
@@ -156,14 +156,14 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Define merge and split rules.
   - Add "not the same story" / "split from cluster" feedback.
   - Specify which item represents the cluster and what relevance score the cluster shows.
-- **Resolution**:
+- **Resolution**: Settled pipeline order in `architecture.md` §3.3 & §4.1 and [ADR 0003](../decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md): `poll_feed` → `extract_content` → **`cluster_item` (pre-enrichment canonical-URL + `title + lead_excerpt` embedding)** → `mini_research` → **cluster-aware `enrich_item`** (skipping redundant LLM synthesis on exact-URL duplicates via `status='inherited'`). Defined representative selection, `max_relevance_tier` display, merge/split tombstone rules, `cluster_exclusions`, and user **"Split from cluster"** feedback in `data-model.md` §4.8 & §5.2 and `requirements.md` `FR-LLM-03`, `FR-FB-01`.
 
 ### R-12 — LLM capacity, context budget, and backfill planning are missing
 - **Docs**: `requirements.md` §3 and §5, `architecture.md` §3.2, ADR 0003
 - **Problem**:
   - There's no throughput estimate. On a Ryzen AI Max+ 395, a dense ~70B model typically manages only a few tokens per second of generation, and prompt processing is slow too. At several thousand prompt tokens per item (article + PDF excerpts + profile + feedback examples), steady state might be fine, but an **OPML import backfill (25 feeds × ~50 items)**, a "re-process after prompt change", or a re-embed could take days.
   - Nothing defines the context-window budget or the truncation and chunking strategy for long articles and 20 MB PDFs.
-  - Nothing limits concurrency to the single GPU, sets job priorities (user-triggered "dig deeper" should jump the queue), or covers sharing the LLM host with other homelab workloads.
+  - Nothing limits concurrency to the single GPU, sets job priorities (user-triggered "dig deeper" should jump the queue), or covers sharing the LLM host with other workloads.
   - The chat and embedding models are not chosen. Mixture-of-experts models are much faster on this hardware and should be considered.
 - **Recommendation**: In `llm-pipeline-and-feedback.md`, add:
   - A capacity budget (tokens per item, items per hour, backlog drain time).
@@ -171,19 +171,19 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - A global LLM concurrency limit and job priorities.
   - A backfill policy, for example "on subscribe, enrich only the N newest; mark older ones read or expired".
   - Benchmark candidate models early with the opt-in live-LLM suite.
-- **Resolution**:
+- **Resolution**: Added full **LLM Capacity, Context Budget & Runtime Contract** in `architecture.md` §5 (MoE-oriented throughput estimates for Ryzen 395+, per-stage token budgets & head+tail/PDF-section truncation, global LLM concurrency = `1`, priorities `10`/`50`/`90`, optional pause/quiet-hours), added configurable backfill cap (`N = 10` per feed default, `Q-07`) in `requirements.md` `FR-FEED-05` & `data-model.md` §3.1/§4.4, and moved early MoE benchmarking into Milestone `1d` (`requirements.md` §6).
 
 ### R-13 — The "OpenAI-compatible" abstraction leaks around structured output
 - **Docs**: `architecture.md` §2 and §5, ADR 0001
 - **Problem**: Ollama and `llama.cpp` support JSON-schema output through different mechanisms and with different completeness: Ollama uses its `format` parameter on the native API and `response_format` on its OpenAI-compatible endpoint, while `llama.cpp` uses `response_format` / `json_schema` / GBNF grammars. Behaviour differs on details such as `enum` and `minItems`. Reasoning models (for example the Qwen3 family) may emit `<think>` content or need the thinking mode disabled. Embedding endpoints also differ in how they handle batching and normalization.
 - **Recommendation**: Define a small `LLMAdapter` interface with per-runtime implementations or capability flags. Record a contract-test fixture set for **both** runtimes. Specify handling of reasoning output and whether embeddings are normalized for cosine similarity.
-- **Resolution**:
+- **Resolution**: Updated [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), `architecture.md` §2 & §5.4, `data-model.md` §4.7 (L2-normalized embeddings), and `development-process.md` §2.1 & §2.4 to define an internal `LLMAdapter` with runtime-specific capability profiles (`ollama`, `llamacpp`), `<think>` handling, embedding normalization, and mandatory recorded contract fixtures for **both** runtimes.
 
 ### R-14 — Host-native LLM networking is under-specified
 - **Docs**: ADR 0001, `architecture.md` §6 (line 133)
 - **Problem**: Ollama binds to `127.0.0.1` by default, and `llama.cpp`'s server also defaults to localhost. Neither is reachable from a container through `host-gateway`. The common fix, binding to `0.0.0.0`, exposes an unauthenticated LLM to the whole LAN.
 - **Recommendation**: Document the supported approach: bind to the Docker bridge IP, or bind to `0.0.0.0` with a host firewall rule allowing only the Docker subnet. Add a startup connectivity check that shows up in System Health.
-- **Resolution**:
+- **Resolution**: Documented Docker bridge IP binding / host firewall subnet restriction and startup LLM health check surfaced in System Health across [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `architecture.md` §6.1, `requirements.md` `NFR-SEC-04`, and `AGENTS.md`.
 
 ### R-15 — Prompt injection and untrusted HTML rendering
 - **Docs**: `requirements.md` §4.3, `architecture.md` §3.4
@@ -191,13 +191,13 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Article and PDF text goes straight into prompts, so a page can instruct the model ("rate this 100", "summarize as ..."). The blast radius is limited to scores and summaries, but it should be acknowledged and mitigated: delimit untrusted content, keep scoring instructions in the system prompt, and validate against the schema.
   - `raw_summary` is feed-provided HTML, and LLM output may contain markup. Both are rendered in the client, so there is an XSS risk. Combined with R-04, XSS lets an attacker drive the API.
 - **Recommendation**: Require HTML sanitization (for example DOMPurify with an allow-list), a strict CSP on the SPA, rendering LLM output as plain text or a safe Markdown subset, and delimiting of untrusted content in prompts. Add tests with hostile fixtures.
-- **Resolution**:
+- **Resolution**: Added DOMPurify allow-list sanitization, strict SPA CSP, plain-text/safe-Markdown LLM rendering, XML/fence prompt delimitation with system-prompt rubrics + Pydantic validation, and hostile-fixture tests in [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `requirements.md` `NFR-SEC-03`, `architecture.md` §6.2, `AGENTS.md`, and `development-process.md` §2.4.
 
 ### R-16 — Untrusted PDF/HTML parsing needs resource isolation
 - **Docs**: `architecture.md` §3.2, §5
 - **Problem**: PyMuPDF (MuPDF is C code) and the HTML parsers handle hostile input. A crafted document can cause runaway CPU or memory use (decompression bombs, pathological pages) or worse, and could stall or crash the whole worker.
 - **Recommendation**: Run extraction in a subprocess or a separate low-privilege container with CPU, memory, and wall-clock limits, page-count limits, and a cap on decompressed size. Keep PyMuPDF on a pinned, patched version.
-- **Resolution**:
+- **Resolution**: Required bounded isolated extraction subprocess/container with CPU, RAM, wall-clock, max-page (50), and decompressed-size caps on pinned `pymupdf` in [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), `architecture.md` §2, §3.3 & §6.2, `requirements.md` `NFR-SEC-03`, `AGENTS.md`, and `development-process.md` §2.4.
 
 ### R-17 — Job queue schema is missing operational essentials
 - **Docs**: `data-model.md` §3.10 (line 173), ADR 0003
@@ -209,7 +209,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - No idempotency rule per stage: what happens when `enrich_item` runs twice?
   - No scheduler leader election if more than one worker replica runs.
 - **Recommendation**: Add a partial unique index such as `(job_type, dedupe_key) WHERE status IN ('queued','running')`, a lease expiry and reclaim rule, a retention policy for completed jobs, and per-stage idempotency notes. Alternatively, evaluate an existing Postgres-backed queue library (such as `procrastinate`) rather than building one; if you build your own, record why in ADR 0003.
-- **Resolution**:
+- **Resolution**: Updated [ADR 0003](../decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md) (including build-vs-`procrastinate` rationale) and `data-model.md` §4.9 with `dedupe_key` + partial unique index `uq_jobs_active_dedupe`, `locked_by`, `lease_expires_at`, `heartbeat_at`, `finished_at`, `updated_at`, stale-lease reaper, dead-letter retry/dismiss workflow in System Health, PostgreSQL advisory-lock scheduler leadership, per-stage idempotency, and 30-day `done` job retention.
 
 ### R-18 — Feed lifecycle edge cases
 - **Docs**: `requirements.md` §4.1, `data-model.md` §3.2
@@ -223,13 +223,13 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - **GUID instability**: Some feeds change GUIDs over time, which causes duplicates.
   - **`muted`**: The meaning of muted versus paused versus unsubscribed is not defined.
 - **Recommendation**: Separate user intent (`status`) from health (`health_state`). Define a feed state diagram, the item policy on unsubscribe, the update and re-enrichment policy, and politeness headers.
-- **Resolution**:
+- **Resolution**: Separated `feeds.status` (user intent: `active`/`paused`/`muted`/`unsubscribed`) from `feeds.health_state` (`healthy`/`degraded`/`broken`/`gone`), added a Mermaid Feed Lifecycle diagram and explicit edge-case policies (`301` collision handling, `410`, `429`/`Retry-After`, `Cache-Control`, jitter, per-domain article fetch rate limiting, `content_hash` update handling, unstable-GUID canonical-URL fallback, and unsubscribe/re-subscribe item visibility) in `data-model.md` §3.2, §3.3 & §4.4 and `requirements.md` `FR-FEED-02`, `FR-FEED-03`.
 
 ### R-19 — Expiration edge cases
 - **Docs**: `data-model.md` §5 (lines 189–190)
 - **Problem**: Expiration keys off `published_at`. Missing, bogus, or future dates and backfilled old entries all misbehave: a newly subscribed feed's older entries expire immediately, and a future-dated entry never expires. The `effective_ttl` description in prose also reads ambiguously.
 - **Recommendation**: Use `GREATEST(published_at, fetched_at)` or simply `fetched_at`, and clamp future dates. Restate the TTL resolution as a precise rule or pseudocode. Define the backfill behaviour together with R-12.
-- **Resolution**:
+- **Resolution**: Anchored expiration strictly on `COALESCE(unexpired_at, fetched_at)`, clamped `published_at <= fetched_at` for display, wrote exact `effective_ttl_days` pseudocode in `data-model.md` §6.1, and aligned backfill behavior with `FR-FEED-05` (`N = 10` cap).
 
 ### R-20 — The feedback loop has no way to measure whether it works
 - **Docs**: `requirements.md` §4.3 and §4.4, `architecture.md` §4.3
@@ -245,13 +245,13 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - Define selection rules for feedback examples (count, diversity, recency, matching feed or tag).
   - Add a small offline **evaluation set** built from the user's thumbs up/down history, so prompt changes can be compared (it ties into the `live_llm` suite).
   - Model "fetch PDFs here" as a feed config mutation that *also* records an audit event, with one source of truth.
-- **Resolution**:
+- **Resolution**: Owner selected **5 calibrated tiers (`1..5`)** (`Q-05`)—replaces `0–100` in `requirements.md` `FR-LLM-02` and `data-model.md` §4.6 (`relevance_tier`). Added bounded/diverse feedback-example budget (up to 6 examples / ~700 tokens) in `architecture.md` §5.2, added offline relevance evaluation harness (`FR-FB-03`, `development-process.md` §2.1, Milestone `1g`) using snapshots stored in `feedback_events.payload`, and modeled *"fetch PDFs here"* as one authoritative `feed_config_update` mutation that atomically logs a `config_fetch_pdfs_audit` event (`data-model.md` §4.8).
 
 ### R-21 — Requirements lack user stories, IDs, and acceptance criteria
 - **Docs**: `requirements.md`, `AGENTS.md` (which says the requirements contain user stories)
 - **Problem**: There are no user stories, no requirement IDs, and no acceptance criteria. That makes it hard to trace requirements to tests (the process doc is test-heavy) and to judge whether Phase 1 is done.
 - **Recommendation**: Give each functional and non-functional requirement an ID (`FR-FEED-01`, `NFR-SYNC-02`, ...), add short user stories for the main journeys (morning triage, offline reading on a laptop, tuning the interest profile, "dig deeper"), and add measurable acceptance criteria. Examples: "an item is visible in the client within 2 minutes of the poll that fetched it, whether or not it has been enriched"; "an outbox of 500 mutations flushes in under 5 seconds".
-- **Resolution**:
+- **Resolution**: Added User Stories (`US-01`–`US-05`), traceable requirement IDs (`FR-FEED-*`, `FR-RES-*`, `FR-LLM-*`, `FR-FB-*`, `FR-STATE-*`, `FR-SYNC-*`, `FR-UI-*`, `NFR-SEC-*`, `NFR-SYNC-*`, `NFR-LLM-*`, `NFR-OPS-*`), and measurable acceptance criteria (including the 2-minute visibility and 500-mutation `< 5s` flush targets) in `requirements.md` §3–§6.
 
 ### R-22 — The Phase 1 MVP is too large for one milestone
 - **Docs**: `requirements.md` §6
@@ -264,7 +264,7 @@ When you address an item, fill in its `Resolution:` line with what changed and w
   - **1e**: The feedback loop and evaluation.
   
   Sequence the component designs to match.
-- **Resolution**:
+- **Resolution**: Per owner confirmation (`Q-09`) and further testing-boundary refinement, split Phase 1 into **7 independently testable vertical slices (`1a`–`1g`)** in `requirements.md` §6 and sequenced `docs/design/README.md` to match (`1a` Backend/Auth/Ingestion → `1b` Server Sync & Search → `1c` Local-First Ubuntu Reader UI → `1d` LLM Adapter & Enrichment → `1e` Dedup & Clustering → `1f` Mini-Research & PDFs → `1g` Feedback & Eval).
 
 ---
 
@@ -272,54 +272,54 @@ When you address an item, fill in its `Resolution:` line with what changed and w
 
 ### R-23 — Open questions are stale or inconsistent with the ADRs
 `requirements.md` §7 still lists tech stack, Android form factor, and LLM topology as open, but ADRs 0001 and 0002 propose answers, and all ADRs are `Proposed`. Either close the questions by linking the ADRs (once the owner accepts them), or explicitly mark the ADRs as awaiting the owner's answers. Keep a single, current list of open questions.
-- **Resolution**:
+- **Resolution**: Updated `requirements.md` §7 to close resolved owner questions with links to ADRs `0001`–`0006` (explicitly marked `Proposed` pending owner sign-off) and retain only genuine design-phase choices.
 
 ### R-24 — The architecture diagram contradicts the deployment description
 In `architecture.md` (line 41), the Android client connects directly to `API`, but §6 says `web` reverse-proxies `/api/` on a single LAN port. Make the diagram show all clients going through the single entry point, or document a second exposed port.
-- **Resolution**:
+- **Resolution**: Updated the Mermaid diagram and §3.1 in `architecture.md` so both Ubuntu and Android clients route through the single `Reverse Proxy / Web` LAN entry point.
 
 ### R-25 — Undecided client choices block the client design
 "React or Svelte" and "Dexie.js or idb" are still open, and so is Capacitor versus native Kotlin for Phase 2. The Phase 2 choice affects Phase 1: if Capacitor will wrap the web UI, the Phase 1 SPA should be built to be Capacitor-friendly from the start. Decide in the client design or an ADR, together with R-03.
-- **Resolution**:
+- **Resolution**: Decided **React + TypeScript (`strict: true`) + Vite + Dexie.js + DOMPurify** and required Capacitor-friendly responsive structure in [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md), `architecture.md` §2, and `AGENTS.md`.
 
 ### R-26 — Android plain-HTTP note is incomplete
 ADR 0002 presents plain HTTP as frictionless, but Android 9+ blocks cleartext traffic by default (it needs a `networkSecurityConfig`). Capacitor's default `https` scheme, combined with an `http` API, triggers mixed-content rules. Android background sync (WorkManager with Wi-Fi/SSID constraints) is also non-trivial from Capacitor. Record these trade-offs in the ADR.
-- **Resolution**:
+- **Resolution**: Documented Android 9+ `networkSecurityConfig`, Capacitor mixed-content rules (native HTTP plugin / custom scheme), and `WorkManager` Wi-Fi constraints explicitly in [ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md) and [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md).
 
 ### R-27 — Detached search scope is unspecified
 Full-text search runs on the server, so what does search do while detached? Options: a local search over the cached working set, or disabled with a clear message. Specify it.
-- **Resolution**:
+- **Resolution**: Per owner decision (`Q-08`), specified **local search over the client's cached working set** (with a clear UI note that full archive search requires home LAN) in `requirements.md` `FR-STATE-04`, `architecture.md` §3.4, and `development-process.md` §2.1 & §2.4.
 
 ### R-28 — Offline feed management scope
 Clarify which config mutations work offline. Unsubscribe and mute are listed; "add feed" and "OPML import" presumably need the LAN, so say so. Also define the push-response contract: per-mutation `applied` / `superseded` / `rejected`, how the client learns that a mutation was rejected, and the rollback UX for an optimistic update that failed.
-- **Resolution**:
+- **Resolution**: Explicitly partitioned offline-queued vs. online-only mutations (`requirements.md` `FR-SYNC-03`, `data-model.md` §5.2) and defined the per-mutation push response contract (`applied` | `superseded` | `rejected` with reason + `current_entity`) and client rollback/notification UX (`requirements.md` `FR-SYNC-04`, `architecture.md` §3.2 & §3.4).
 
 ### R-29 — `search_vector` maintenance
 `items.search_vector` combines fields from `item_enrichments` and `item_tags`. Specify how it's kept current: a trigger, or application code on each enrichment and tag change. Specify the text-search language configuration, and the cap on `extracted_text` length (a `tsvector` is limited to about 1 MB).
-- **Resolution**:
+- **Resolution**: Specified application-layer rebuild on item/enrichment/tag updates, configurable text-search language (`english` default), and 64 KB `extracted_text` slice cap (well under Postgres's 1 MB `tsvector` limit) in `data-model.md` §4.5 and `architecture.md` §4.1.
 
 ### R-30 — Storage estimate looks optimistic
 The "well under 1–2 GB" per year estimate leaves out `extracted_text` (often 10–50 KB per item), research excerpts, enrichment history, embeddings plus the HNSW index, `tsvector`/GIN, jobs, and `sync_mutations`. It's fine on this hardware, but re-estimate it, and add retention rules for `jobs` and `sync_mutations` (the latter only needs to cover the longest plausible offline period).
-- **Resolution**:
+- **Resolution**: Revised storage estimate to **~3–6 GB/year** accounting for TOAST-compressed `extracted_text`, research excerpts, embeddings/HNSW, and GIN indexes, and added explicit retention cleanup rules (`jobs` `done` = 30 days; `sync_mutations` & `sync_changes` = 90 days) in `data-model.md` §6.3 and `architecture.md` §3.3.
 
 ### R-31 — User-editable tags are mentioned but not designed
 `item_tags.source = 'user'` implies users can add and remove tags, but there is no requirement, sync mutation, or UI for it. Either add it properly or drop it.
-- **Resolution**:
+- **Resolution**: Per owner decision, **dropped user-editable item tags from Phase 1** (Phase 1 tags are LLM-generated only; feed categories/folders remain user-managed; manual per-item tagging deferred to Phase 3). Removed `source` ambiguity from `data-model.md` §4.8 and updated `requirements.md` `FR-LLM-01` & §6.
 
 ### R-32 — Seeding and versioning of prompts
 Prompt templates live in the database (`prompt_configs`). Define how default prompts are shipped and upgraded: seeded from files in the repo, with the user's edits preserved across releases. Define how the `live_llm` eval suite references prompt versions.
-- **Resolution**:
+- **Resolution**: Added `origin` (`default` | `user`) and `default_revision` seeding/upgrade semantics (repo defaults seeded safely without overwriting active `origin='user'` edits) in `data-model.md` §4.9, `requirements.md` `FR-LLM-04`, and `feedback_events.payload` prompt-version snapshots for the `live_llm` eval suite (`data-model.md` §4.8).
 
 ### R-33 — Development process gaps
 - No CI is defined. State whether checks run in CI (GitHub Actions or similar) or only through `make check`.
 - Specify how integration tests get PostgreSQL (for example `testcontainers` or a compose test profile).
 - Define what "Approved" means for docs and ADRs: who approves and how it's recorded. AGENTS.md gates coding on approval, so this needs a defined mechanism.
 - Add security-invariant tests (R-04, R-05, R-15) to the §2.4 matrix.
-- **Resolution**:
+- **Resolution**: Updated `development-process.md` §1, §2.1, §2.4 & §4.1 and `AGENTS.md`: explicitly documented local-only `make check` verification (no GitHub Actions CI per owner decision), `docker compose --profile test` / `testcontainers` for real `pgvector/pgvector:pg16` integration tests, explicit owner approval mechanism (`Approved` / `Accepted` status committed in git), and all security/sync/isolation invariants in §2.4.
 
 ### R-34 — Backups
 Plan for and test restores, not just backups (a restore drill), and handle the `sync_seq` regression on restore (see R-09). Specify the backup schedule, how many copies to keep, and where they go (ideally off the host).
-- **Resolution**:
+- **Resolution**: Per owner decision (`Q-11`), documented nightly local `pg_dump` with 14-day local rotation, optional simple `rsync`/SSH copy hook to another LAN machine, and a tested `make restore-drill` procedure that rotates `sync_state.instance_epoch` in `architecture.md` §7, `requirements.md` `NFR-OPS-01`, and `development-process.md` §3.
 
 ---
 
@@ -336,30 +336,30 @@ Plan for and test restores, not just backups (a restore drill), and handle the `
 
 ## 5. Open Questions for the Owner
 
-These need the project owner's decision. Propose a default for each, but don't treat it as settled until the owner confirms.
+All owner questions (`Q-01`–`Q-11`) were reviewed one-by-one with the project owner on 2026-11-22 and are recorded below:
 
-| ID | Question | Related |
-| :--- | :--- | :--- |
-| Q-01 | Is the Phase 1 "Ubuntu desktop" a laptop that actually leaves the LAN, or a fixed desktop? If it's fixed, detached mode for Phase 1 matters much less and R-03 could be deferred to Phase 2. | R-03, R-22 |
-| Q-02 | Acceptable client form for Phase 1: a plain browser tab, a local `localhost`-served app, a desktop shell (Tauri/Electron), or LAN HTTPS with a local CA? | R-03, R-25 |
-| Q-03 | How much auth friction is acceptable? (Proposed: one-time device pairing code, then a long-lived per-device token.) | R-04 |
-| Q-04 | Which LLM models (chat and embedding) do you intend to use, and is the LLM host shared with other workloads (quiet hours, priority)? | R-12, R-14 |
-| Q-05 | Relevance as tiers (for example must-read / maybe / skip) or a 0–100 score? How should relevance-sorted views combine relevance and recency? | R-20 |
-| Q-06 | Read-state semantics for duplicates and clusters: should reading one item in a cluster mark the cluster read? Should cross-feed exact duplicates show as one item? | R-07, R-11 |
-| Q-07 | On subscribing to a feed (or OPML import), how much backlog should be ingested and enriched? Should old entries be marked read automatically? | R-12, R-19 |
-| Q-08 | What should search do while detached: a local search over cached items, or unavailable? | R-27 |
-| Q-09 | Is it worth splitting Phase 1 into milestones 1a–1e as proposed, and is that order right for you? | R-22 |
-| Q-10 | Should a later phase include a compatibility path for existing RSS apps (Fever/GReader), or is that a permanent non-goal? This affects how strictly the sync API stays aggregate-shaped. | ADR 0002 |
-| Q-11 | Backup target: is there another host or NAS for off-machine backups? | R-34 |
+| ID | Question | Related | Owner Decision |
+| :--- | :--- | :--- | :--- |
+| Q-01 | Is the Phase 1 "Ubuntu desktop" a laptop that actually leaves the LAN, or a fixed desktop? If it's fixed, detached mode for Phase 1 matters much less and R-03 could be deferred to Phase 2. | R-03, R-22 | **Confirmed**: Phase 1 Ubuntu can be a **laptop that leaves the LAN** (detached mode required in Phase 1). |
+| Q-02 | Acceptable client form for Phase 1: a plain browser tab, a local `localhost`-served app, a desktop shell (Tauri/Electron), or LAN HTTPS with a local CA? | R-03, R-25 | **Confirmed**: **`localhost`-served Web App / lightweight desktop shell** (React + TS + Dexie.js; see ADR 0005). |
+| Q-03 | How much auth friction is acceptable? (Proposed: one-time device pairing code, then a long-lived per-device token.) | R-04 | **Confirmed**: **One-time device pairing code → long-lived per-device revocable bearer token** (once per new device; see ADR 0006). |
+| Q-04 | Which LLM models (chat and embedding) do you intend to use, and is the LLM host shared with other workloads (quiet hours, priority)? | R-12, R-14 | **Confirmed**: Keep **models configurable** with strong preference for **MoE models** benchmarked on Ryzen 395+; concurrency = `1`, priority queueing, optional pause/quiet-hours. |
+| Q-05 | Relevance as tiers (for example must-read / maybe / skip) or a 0–100 score? How should relevance-sorted views combine relevance and recency? | R-20 | **Confirmed**: **5 calibrated tiers** (`1..5`), default sort by tier desc then newest first, plus **interactive sort buttons across table/list headers**. |
+| Q-06 | Read-state semantics for duplicates and clusters: should reading one item in a cluster mark the cluster read? Should cross-feed exact duplicates show as one item? | R-07, R-11 | **Confirmed**: Display as **grouped entries**, track read state **per item**, with 1-click **"Mark cluster read"** (explicit known item IDs). |
+| Q-07 | On subscribing to a feed (or OPML import), how much backlog should be ingested and enriched? Should old entries be marked read automatically? | R-12, R-19 | **Confirmed**: **Configurable backfill cap** (default `N = 10` newest per feed marked `unread` & enriched; older entries logged as `expired`). |
+| Q-08 | What should search do while detached: a local search over cached items, or unavailable? | R-27 | **Confirmed**: **Local search over cached working-set items** when detached (with note that full archive search requires LAN). |
+| Q-09 | Is it worth splitting Phase 1 into milestones 1a–1e as proposed, and is that order right for you? | R-22 | **Confirmed & refined**: Split Phase 1 into **7 testable vertical slices (`1a`–`1g`)** separating backend foundation/ingestion (`1a`), server sync/search (`1b`), and local-first client UI (`1c`). |
+| Q-10 | Should a later phase include a compatibility path for existing RSS apps (Fever/GReader), or is that a permanent non-goal? This affects how strictly the sync API stays aggregate-shaped. | ADR 0002 | **Confirmed**: **Permanent non-goal** (keep Sync API cleanly aggregate-shaped). |
+| Q-11 | Backup target: is there another host or NAS for off-machine backups? | R-34 | **Confirmed**: Other LAN machines are available; start simple with **nightly local `pg_dump` (14-day rotation) + optional simple `rsync`/SSH copy hook to another LAN host** + restore drill. |
 
 ---
 
 ## 6. Suggested Resolution Order
 
-1. Get answers to the owner questions Q-01 to Q-03 and Q-09, which affect the blockers and how the work is split.
-2. Write ADRs for the sync watermark (R-01, R-02, R-09), the client origin and offline shell (R-03), and the LAN security model (R-04, R-05, R-15).
-3. Update `requirements.md`: requirement IDs, user stories, acceptance criteria, security NFRs, the milestone split, and refreshed open questions (R-21, R-22, R-23).
-4. Update `data-model.md`: the sync surface table, per-field timestamps, the item and feed state machines, the job queue fields, and embedding versioning (R-02, R-06, R-07, R-10, R-17, R-18).
-5. Update `architecture.md`: the diagram, LLM networking, the extraction sandbox, and capacity planning (R-12, R-14, R-16, R-24).
-6. Bring ADRs 0001–0003 up to date to match the changes above, then ask the owner to move them from `Proposed` to `Accepted`.
-7. Only then begin the `docs/design/*` component specs, in the order of the Phase 1 milestones.
+1. ~~Get answers to the owner questions Q-01 to Q-03 and Q-09, which affect the blockers and how the work is split.~~ *(Done — all Q-01–Q-11 answered.)*
+2. ~~Write ADRs for the sync watermark (R-01, R-02, R-09), the client origin and offline shell (R-03), and the LAN security model (R-04, R-05, R-15).~~ *(Done — ADRs 0004–0006 added.)*
+3. ~~Update `requirements.md`: requirement IDs, user stories, acceptance criteria, security NFRs, the milestone split, and refreshed open questions (R-21, R-22, R-23).~~ *(Done.)*
+4. ~~Update `data-model.md`: the sync surface table, per-field timestamps, the item and feed state machines, the job queue fields, and embedding versioning (R-02, R-06, R-07, R-10, R-17, R-18).~~ *(Done.)*
+5. ~~Update `architecture.md`: the diagram, LLM networking, the extraction sandbox, and capacity planning (R-12, R-14, R-16, R-24).~~ *(Done.)*
+6. ~~Bring ADRs 0001–0003 up to date to match the changes above~~, then ask the owner to move docs to `Approved` and ADRs `0001`–`0006` from `Proposed` to `Accepted`.
+7. Only then begin the `docs/design/*` component specs, in the order of the Phase 1 milestones (`1a`–`1g`).
