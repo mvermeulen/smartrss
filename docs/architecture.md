@@ -70,16 +70,20 @@ flowchart LR
   - `GET /api/v1/sync/bootstrap`: Returns active working set + `watermark` + `instance_epoch`.
   - `GET /api/v1/sync/pull?since_seq=<N>&limit=<K>`: Returns strictly commit-ordered aggregate upserts & tombstones from `sync_changes`, plus `watermark` and `instance_epoch`.
   - `POST /api/v1/sync/push`: Applies idempotent client mutations (`client_mutation_id`), returning per-mutation `{status: applied|superseded|rejected, reason?, server_state?}`.
-- **Interactive / Management Endpoints**: Feed CRUD (online-only add/OPML), Feed Health, server-side full-archive FTS search, versioned prompt/Interest Profile editor, manual re-process / on-demand mini-research trigger, and System Health / dead-letter queue management.
+- **Interactive / Management Endpoints**: Feed CRUD (online-only add/OPML), Feed Health, server-side full-archive FTS search, versioned prompt/Interest Profile & standing feed-instruction editor, manual re-process / on-demand mini-research / batch pipeline trigger, and System Health + Pipeline Performance Metrics / dead-letter queue management.
 
 ### 3.3 Background Worker (`worker`)
-Uses PostgreSQL advisory locks (`pg_try_advisory_lock`) for singleton scheduler leadership and `SKIP LOCKED` with lease heartbeats for job execution across six idempotent stages:
+Supports **two complementary execution modes** sharing the same PostgreSQL job queue, advisory locks (`pg_try_advisory_lock`), `dedupe_key` uniqueness, and `SKIP LOCKED` lease heartbeats:
+- **Daemon mode (default)**: Runs continuously inside Docker Compose, dispatching due feeds and processing stages automatically (with configurable **enrichment schedule / cron windows** and optional quiet hours so metadata is pre-built ahead of reading time).
+- **Cron-friendly one-shot batch mode (`smartrss worker run-once [--stage all|poll|enrich] [--feed <id>]`)**: Designed for users who prefer driving periodic metadata generation from a host `cron` script or `systemd` timer (or on-demand CLI/API trigger). It dispatches due work, drains queued jobs for the requested stage(s), records a `pipeline_runs` summary + `stage_metrics` timings, prints a concise timing/throughput summary to stdout, and exits cleanly—safe even if overlapping invocations fire (protected by advisory locks and dedupe keys).
+
+The worker executes six idempotent stages, recording per-stage `queue_wait_ms` and `duration_ms` metrics in `stage_metrics` on every job completion:
 1. **Feed Poller (`poll_feed`)**: Uses `SafeHttpClient`, conditional HTTP (`ETag`, `Last-Modified`), `304`/`301`/`410`/`429` (`Retry-After`), jitter, and exponential backoff; enforces backfill cap (`N = 10` default) on newly subscribed feeds; separates `status` (user intent) from `health_state`.
 2. **Isolated Content Extractor (`extract_content`)**: Fetches full linked HTML via `SafeHttpClient` (with per-domain rate limiting) and extracts text (`trafilatura`) inside a resource-bounded subprocess (CPU, RAM, wall-clock caps); falls back cleanly to RSS summary on block/error.
 3. **Pre-Enrichment Dedup & Story Clusterer (`cluster_item`)**: Runs **before** LLM enrichment to avoid redundant LLM calls on exact duplicates. Matches exact `canonical_url` first, then computes a normalized embedding (`title + lead_excerpt`) using the active embedding model and queries active in-window clusters via `pgvector`. Assigns cluster membership (and records a `sync_changes` event).
 4. **Mini-Research Fetcher (`mini_research`)**: Triggered by per-feed `research_policy`, primary-source link heuristics (PDF/arXiv/report links), or explicit user request ("dig deeper"). Fetches primary sources via `SafeHttpClient` within strict guardrails (default 1 hop, 20 MB PDF / 5 MB HTML, max 50 pages, timeout) and extracts text (`pymupdf` / `trafilatura`) inside the isolated extraction subprocess.
-5. **Cluster-Aware LLM Enricher (`enrich_item`)**: Acquires the global LLM concurrency slot (`concurrency = 1`), builds a token-budgeted, prompt-injection-delimited prompt (system rubric + active Interest Profile + bounded diverse feedback examples + per-feed hint + article text + mini-research excerpts), calls `LLMAdapter`, validates structured JSON output via Pydantic (5 calibrated relevance tiers, rationale, TL;DR, takeaways, tags, depth, research context), updates `search_vector`, and emits an aggregate `item` upsert in `sync_changes`.
-6. **Maintenance Schedulers**: `expire_items` (marks unread unstarred items past effective TTL based on `fetched_at` as `expired`), stale-lease job reaper, and retention cleanup (`jobs` > 30 days, `sync_mutations` & `sync_changes` > 90 days).
+5. **Cluster-Aware LLM Enricher (`enrich_item`)**: Acquires the global LLM concurrency slot (`concurrency = 1`), builds a token-budgeted, prompt-injection-delimited prompt (system rubric + **per-feed `curation_instructions` & active written feed feedback notes** + global Interest Profile + bounded diverse feedback examples prioritizing the same feed + item metadata + article text + mini-research excerpts), calls `LLMAdapter`, validates structured JSON output via Pydantic (5 calibrated relevance tiers, rationale, TL;DR, takeaways, tags, depth, research context), captures phase timings (`prompt_eval_ms`, `generation_ms`, tokens), updates `search_vector`, and emits an aggregate `item` upsert in `sync_changes`.
+6. **Maintenance Schedulers**: `expire_items` (marks unread unstarred items past effective TTL based on `fetched_at` as `expired`), stale-lease job reaper, and retention cleanup (`jobs` > 30 days, `sync_mutations` & `sync_changes` > 90 days, `stage_metrics` & `pipeline_runs` > 180 days).
 
 ### 3.4 Local-First Client (`localhost` Ubuntu Phase 1 & Phase 2 Android)
 - Runs from a stable `localhost` secure origin (Phase 1) with `navigator.storage.persist()` requested on startup and a Service Worker caching the app shell for offline launch.
@@ -112,25 +116,37 @@ Uses PostgreSQL advisory locks (`pg_try_advisory_lock`) for singleton scheduler 
 - **Estimated Per-Item Cost**: ~2,500–6,000 prompt tokens + ~350–500 structured output tokens → **~10–25 seconds/item** on a fast MoE model → ~200 items/day takes **~35–85 minutes of total GPU time per day** (< 6% daily utilization).
 - **Backfill Drain**: With the `N = 10` per-feed backfill cap across 25 feeds (~250 items max), an initial OPML import drains in **~45–90 minutes** instead of days.
 
-### 5.2 Per-Stage Token Budgets & Truncation Policy
+### 5.2 Per-Stage Token Budgets, Prompt Precedence & Truncation Policy
 - **Embedding input**: Canonical `title + first 1,500 chars of extracted_text (or raw_summary)` (~400 tokens).
 - **Standard enrichment prompt budget** (target <= 8k tokens default, configurable per model):
-  - System rubric + JSON schema: ~600 tokens
-  - Active Interest Profile: capped at ~800 tokens
-  - Calibration feedback examples (up to 6 diverse examples): capped at ~700 tokens
-  - Feed hint + item metadata: ~200 tokens
-  - Article text: capped at ~4,500 tokens (head + tail truncation preserving intro and conclusion).
+  - System rubric + JSON schema + untrusted-content rules: ~600 tokens
+  - **Per-feed curation instructions & active written feedback notes** (`feeds.curation_instructions` + active `feed_instruction` events): capped at ~450 tokens
+  - Global Interest Profile: capped at ~800 tokens
+  - Calibration feedback examples (up to 6 diverse examples, prioritizing same-feed examples): capped at ~700 tokens
+  - Item metadata (feed title, author, URL, date): ~150 tokens
+  - Article text: capped at ~4,200 tokens (head + tail truncation preserving intro and conclusion).
 - **Mini-research excerpt budget**: Up to ~4,000 additional tokens extracted from primary source(s) (for PDFs: title/abstract + introduction + key findings/conclusion prioritized, capped at 50 parsed pages before section truncation).
+- **Prompt Instruction Precedence** (explicitly stated in the system prompt):
+  1. System rubric, output JSON schema, and prompt-injection safety rules *(immutable; untrusted article/PDF text can never override)*.
+  2. **Per-feed curation instructions & active feed written feedback** *(authoritative feed-scoped directives such as "look for topic X" or "skip sponsor recaps"; refine or override generic preferences for this feed)*.
+  3. **Global Interest Profile** *(baseline user priorities across all feeds)*.
+  4. **Historical thumbs-up/down examples** *(few-shot calibration of edge cases, favoring same-feed examples first)*.
+  5. **Untrusted article & primary-source content** *(strictly fenced/XML-delimited data only)*.
+  *(Note: `research_policy.guidance` complements `curation_instructions` by steering when/what primary sources to fetch and emphasize during `mini_research`.)*
 
-### 5.3 Concurrency, Priority & Shared-Host Controls
+### 5.3 Concurrency, Scheduling Modes & Shared-Host Controls
 - **Global LLM concurrency = `1`** (prevents thrashing unified memory/GPU).
-- **Job priorities**: `10` (user-triggered "Dig Deeper" / manual re-enrich) > `50` (steady-state new items) > `90` (initial backfill / bulk re-enrich / re-embed).
-- **Shared-host friendliness**: UI pause toggle + optional configurable quiet hours (e.g., pause background priority `>= 50` during active interactive sessions on the host).
+- **Job priorities**: `10` (user-triggered "Dig Deeper" / manual re-enrich) > `50` (steady-state new items / scheduled batch runs) > `90` (initial backfill / bulk re-enrich / re-embed).
+- **Flexible scheduling & shared-host friendliness**:
+  - **Continuous mode** (default): Enriches items as they arrive, with a UI pause toggle and optional **quiet hours** (pausing priority `>= 50` during active desktop/host sessions).
+  - **Built-in cron window mode**: Polls feeds lightly on interval (or on schedule) and runs LLM enrichment only during configured cron schedule/windows (e.g., every 2 hours or 05:00 before morning triage).
+  - **External cron mode**: Host `cron` / `systemd` timer invokes `smartrss worker run-once` on whatever schedule the user prefers (with optional `--stage poll|enrich|all`), draining work deterministically and printing a timing report for cron logs.
 
 ### 5.4 `LLMAdapter` Runtime Contract (`Ollama` & `llama.cpp`)
-Because Ollama and `llama.cpp` diverge on structured-output parameters, reasoning tags, and embeddings:
+Because Ollama and `llama.cpp` diverge on structured-output parameters, reasoning tags, embeddings, and timing fields:
 - Define an internal `LLMAdapter` abstraction with explicit runtime profiles (`ollama`, `llamacpp`) and capability flags (`structured_output_mode`, `disable_thinking_param`, `strip_think_tags`, `max_embed_batch`, `normalize_embeddings`).
-- Both runtimes are covered by recorded contract-test fixtures (valid JSON, malformed JSON recovery, `<think>` stripping, embedding L2 normalization, timeouts, HTTP 503).
+- Normalize runtime telemetry into a uniform `LLMCallMetrics` struct (`prompt_tokens`, `completion_tokens`, `prompt_eval_ms`, `generation_ms`, `total_latency_ms`, derived `tokens_per_sec`), parsing Ollama's `prompt_eval_duration`/`eval_duration` and `llama.cpp`'s `timings.prompt_ms`/`timings.predicted_ms` with wall-clock fallback.
+- Both runtimes are covered by recorded contract-test fixtures (valid JSON, malformed JSON recovery, `<think>` stripping, timing telemetry parsing, embedding L2 normalization, timeouts, HTTP 503).
 
 ## 6. Security, Networking & Failure Modes
 
@@ -163,4 +179,12 @@ Because Ollama and `llama.cpp` diverge on structured-output parameters, reasonin
   - Simple scheduled nightly `pg_dump` (compressed custom format) written to a host backup directory with **14-day local rotation**.
   - Optional simple `rsync`/SSH copy hook to another machine on the home LAN (configured via env/script; more elaborate backup tooling deferred to a later phase).
   - Documented & tested **restore drill** script: restores dump into a fresh DB, rotates `sync_state.instance_epoch`, verifies health, and confirms paired clients cleanly resync without losing pending outbox mutations.
-- **Observability**: Structured JSON logs (`stdout`) + System Health UI tab (LLM connectivity, job queue depth/dead-letters with manual retry, feed health, token/latency metrics).
+- **Observability & Pipeline Tuning Metrics**:
+  - Structured JSON logs (`stdout`) + clean human/JSON run summary output on `smartrss worker run-once` (ideal for cron email/journald logs).
+  - System Health & Performance Metrics UI tab backed by `stage_metrics`, `pipeline_runs`, and `item_enrichments`:
+    - **Per-stage latency (`p50`, `p95`, `avg`, `max`) & failure rates** across `poll_feed`, `extract_content`, `cluster_item`, `mini_research`, and `enrich_item` (including queue wait vs. execution time) over 24h / 7d / 30d windows.
+    - **End-to-end item readiness lag** (`items.fetched_at` → `item_enrichments.created_at`) to verify metadata is ready within desired windows.
+    - **LLM throughput breakdown** by `model_name` & `prompt_config_id` (`prompt_tokens`, `completion_tokens`, `prompt_eval_ms`, `generation_ms`, tok/s, parse-retry rate, standard vs. mini-research cost).
+    - **Per-feed processing cost attribution** (items/day, avg extract/research/enrich duration, total daily GPU seconds) to spot feeds consuming disproportionate cron/GPU time.
+    - **Batch / Cron Run History** (`pipeline_runs`): elapsed wall time, stage counts, failures, and total LLM time per scheduled/cron run.
+    - LLM connectivity status, job queue depth, and dead-letter queue with manual retry/dismiss.

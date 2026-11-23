@@ -15,11 +15,11 @@ SmartRSS persists a complete historical log in PostgreSQL 16+ (`pgvector` enable
 8. **`research_sources`**: Primary referenced documents (PDFs, arXiv papers, reports) fetched during mini-research.
 9. **`tags` & `item_tags`**: LLM-generated topic tags (Phase 1 is LLM-only; manual per-item tagging deferred).
 10. **`clusters`**: Cross-feed story groups with representative item, activity window, and merge/split tracking.
-11. **`feedback_events`**: Explicit user feedback on items, clusters, and feed audit events.
+11. **`feedback_events`**: Explicit user feedback on items (`thumbs_up`/`thumbs_down`), **per-feed written instructions/feedback** (`feed_instruction`), cluster splits, and feed config audit events.
 12. **`prompt_configs` & `interest_profiles`**: Versioned, seeded-default + user-edited LLM prompt templates and editable Interest Profile.
 13. **`sync_mutations`**: Idempotency log of applied/superseded/rejected client mutations.
-14. **`jobs`**: Operational PostgreSQL job queue with dedupe keys, leases/heartbeats, priorities, and dead-letter state.
-15. **`app_settings`**: Global defaults (default expiration days, backfill cap, LLM runtime/model settings, per-model similarity thresholds, mini-research guardrails).
+14. **`jobs`, `pipeline_runs` & `stage_metrics`**: Operational PostgreSQL job queue (dedupe keys, leases/heartbeats, priorities, dead-letter state), batch/cron run summaries, and per-stage execution timing/token telemetry for pipeline fine-tuning.
+15. **`app_settings`**: Global defaults (default expiration days, backfill cap, scheduling mode / cron windows / quiet hours, LLM runtime/model settings, per-model similarity thresholds, mini-research guardrails).
 
 ## 2. Entity Relationships
 
@@ -148,7 +148,7 @@ stateDiagram-v2
 | `expiration_days_override` | `INT` (NULL) | `NULL` = global default; `0` = never expire |
 | `fetch_full_text` | `BOOLEAN` (DEFAULT TRUE) | |
 | `research_policy` | `JSONB` | `{enabled, fetch_pdfs, guidance, max_hops}` |
-| `custom_prompt_hint` | `TEXT` | Online-only free-text edit (optimistic versioned) |
+| `curation_instructions` | `TEXT` | Standing per-feed natural-language LLM directives (e.g., *"look for topic X"*, *"skip weekly roundups"*); online-only optimistic-versioned edit (`config_version`) |
 | `field_updated_at` | `JSONB` (NOT NULL DEFAULT `'{}'`) | Per-field LWW timestamps (`status`, `category_id`, `expiration_days_override`, `research_policy.fetch_pdfs`, etc.) |
 | `config_version` | `INT` (DEFAULT 1) | Optimistic concurrency token for free-text fields |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | |
@@ -193,7 +193,10 @@ stateDiagram-v2
 | `relevance_tier` | `SMALLINT` (`CHECK (relevance_tier BETWEEN 1 AND 5)`) | `1=Skip`, `2=Low`, `3=Worth a Look`, `4=High`, `5=Must Read` |
 | `relevance_rationale` | `TEXT` | Concise "why" explanation |
 | `research_context` | `TEXT` (NULL) | Synthesized primary-source context |
-| `latency_ms` / `prompt_tokens` / `completion_tokens` | `INT` | Observability |
+| `feed_instructions_hash` | `TEXT` (NULL) | SHA-256 of effective `curation_instructions` + active `feed_instruction` notes used during enrichment (for UI transparency & offline eval) |
+| `prompt_eval_ms` / `generation_ms` | `INT` (NULL) | Runtime-reported prompt evaluation & token generation durations (when provided by Ollama/`llama.cpp`) |
+| `latency_ms` / `prompt_tokens` / `completion_tokens` | `INT` | Total LLM call wall-clock latency and token counts |
+| `parse_retries` | `SMALLINT` (DEFAULT 0) | Number of JSON schema recovery retries required |
 | `error_message` | `TEXT` (NULL) | |
 | `created_at` | `TIMESTAMPTZ` | |
 
@@ -211,19 +214,26 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 - **`clusters`**: `id`, `representative_item_id`, `title`, `max_relevance_tier (SMALLINT)`, `first_seen_at`, `last_seen_at`, `item_count`, `deleted_at (TIMESTAMPTZ NULL)`.
   - **Representative & display tier**: Representative is the highest `relevance_tier` item (tie-broken by earliest `fetched_at`, preferring items with full-text/research context). Cluster list row displays `max_relevance_tier` and `item_count`.
   - **Merge/Split rules**: Merging cluster B into A reassigns B's items to A (emitting `item` upserts) and soft-deletes B (emitting `cluster` `delete` tombstone). User **"Split from cluster"** moves the chosen item into its own new single-item cluster, records a `cluster_exclusions(item_id, excluded_cluster_id)` row so it won't be re-merged, and emits `item` + `cluster` events in `sync_changes`.
-- **`feedback_events`**: `id`, `client_mutation_id (UUID UNIQUE NULL)`, `target_type` (`item`, `feed`, `cluster`), `target_id`, `feedback_type` (`thumbs_up`, `thumbs_down`, `split_cluster`, `config_fetch_pdfs_audit`, `note`), `reason_text`, `payload (JSONB)` (includes snapshot of `relevance_tier`, `prompt_config_id`, `model_name` at feedback time for offline evaluation), `created_at`.
+- **`feedback_events`**: `id`, `client_mutation_id (UUID UNIQUE NULL)`, `target_type` (`item`, `feed`, `cluster`), `target_id`, `feedback_type` (`thumbs_up`, `thumbs_down`, `feed_instruction`, `split_cluster`, `config_fetch_pdfs_audit`, `note`), `reason_text`, `payload (JSONB)` (includes snapshot of `relevance_tier`, `prompt_config_id`, `model_name`, `feed_instructions_hash` at feedback time for offline evaluation), `archived_at (TIMESTAMPTZ NULL)`, `created_at`.
+  - **Per-feed written instructions (`target_type = 'feed'`, `feedback_type = 'feed_instruction'`)**: Append-only natural-language directives (e.g., *"look for topic X"*, *"ignore job posts"*) that can be captured inline even while offline. All active (`archived_at IS NULL`) `feed_instruction` rows for a feed are injected into the LLM prompt alongside `feeds.curation_instructions`. Users can archive/retire a note (setting `archived_at`) or promote/consolidate notes into `feeds.curation_instructions` without deleting historical audit records; adding or archiving a `feed_instruction` emits a parent `feed` `upsert` in `sync_changes`.
   - Note: Clicking *"Fetch PDFs for this feed"* executes a single authoritative `feed_config_update` mutation (`research_policy.fetch_pdfs = true`) that **atomically** logs a `config_fetch_pdfs_audit` feedback event—never two competing writes.
 
-### 4.9 `prompt_configs`, `interest_profiles`, `sync_mutations`, `jobs`, `app_settings`
+### 4.9 `prompt_configs`, `interest_profiles`, `sync_mutations`, `jobs`, `pipeline_runs`, `stage_metrics`, `app_settings`
 - **`prompt_configs`**: `id`, `name` (`enrichment_system`, `enrichment_user`, `mini_research`, etc.), `version (INT)`, `origin` (`default` | `user`), `default_revision (TEXT NULL)`, `template_text`, `model_override`, `is_active`, `notes`, `created_at`.
   - **Seeding & Upgrades**: Shipped prompt templates live in repo files and are seeded on startup with `origin = 'default'`. User edits create a new active row with `origin = 'user'`; future app upgrades add new `origin = 'default'` revisions without overwriting an active `origin = 'user'` prompt (surfacing an optional "View updated default" diff in the UI).
 - **`interest_profiles`**: `id`, `version (INT)`, `profile_markdown`, `is_active`, `created_at`. Online-only edit with optimistic `version` check.
 - **`sync_mutations`**: `client_mutation_id (UUID PK)`, `device_id (UUID FK → devices.id)`, `mutation_type`, `entity_type`, `entity_id`, `client_timestamp`, `effective_timestamp`, `server_applied_at`, `outcome` (`applied`, `superseded`, `rejected`), `rejection_reason (TEXT NULL)`. Pruned after 90 days.
 - **`jobs`**:
-  - `id (BIGSERIAL PK)`, `job_type`, `dedupe_key (TEXT NOT NULL)`, `payload (JSONB)`, `priority (SMALLINT DEFAULT 50)`, `status` (`queued`, `running`, `done`, `failed`), `attempts (INT DEFAULT 0)`, `max_attempts (INT DEFAULT 5)`, `run_after (TIMESTAMPTZ DEFAULT now())`, `locked_by (TEXT NULL)`, `locked_at (TIMESTAMPTZ NULL)`, `lease_expires_at (TIMESTAMPTZ NULL)`, `heartbeat_at (TIMESTAMPTZ NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `last_error (TEXT NULL)`, `created_at`, `updated_at`.
+  - `id (BIGSERIAL PK)`, `job_type`, `dedupe_key (TEXT NOT NULL)`, `payload (JSONB)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `run_id (UUID NULL FK → pipeline_runs.id)`, `priority (SMALLINT DEFAULT 50)`, `status` (`queued`, `running`, `done`, `failed`), `attempts (INT DEFAULT 0)`, `max_attempts (INT DEFAULT 5)`, `run_after (TIMESTAMPTZ DEFAULT now())`, `locked_by (TEXT NULL)`, `locked_at (TIMESTAMPTZ NULL)`, `started_at (TIMESTAMPTZ NULL)`, `lease_expires_at (TIMESTAMPTZ NULL)`, `heartbeat_at (TIMESTAMPTZ NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `queue_wait_ms (INT NULL)`, `duration_ms (INT NULL)`, `last_error (TEXT NULL)`, `created_at`, `updated_at`.
   - **Dedupe index**: `CREATE UNIQUE INDEX uq_jobs_active_dedupe ON jobs (job_type, dedupe_key) WHERE status IN ('queued', 'running')`.
   - **Reclaim & Retention**: Reaper resets `running` jobs where `lease_expires_at < now()` back to `queued` (or `failed` dead-letter if `attempts >= max_attempts`); dead-lettered jobs can be retried/dismissed in System Health UI; `done` jobs pruned after 30 days.
   - **Stage Idempotency**: Every stage (`poll_feed`, `extract_content`, `cluster_item`, `mini_research`, `enrich_item`, `expire_items`) uses upserts/natural keys so re-execution after a crash never duplicates records.
+- **`pipeline_runs`**:
+  - `id (UUID PK)`, `trigger (TEXT)` (`scheduler_window` | `cron_cli` | `manual`), `stages (TEXT[])`, `status (TEXT)` (`running` | `completed` | `partial` | `failed`), `started_at (TIMESTAMPTZ NOT NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `duration_ms (INT NULL)`, `items_polled (INT DEFAULT 0)`, `items_extracted (INT DEFAULT 0)`, `items_clustered (INT DEFAULT 0)`, `items_researched (INT DEFAULT 0)`, `items_enriched (INT DEFAULT 0)`, `jobs_failed (INT DEFAULT 0)`, `total_llm_ms (BIGINT DEFAULT 0)`, `notes (TEXT NULL)`.
+  - Tracks scheduled cron windows and `worker run-once` batch executions so users can inspect end-to-end batch duration and tune schedules. Pruned after 180 days.
+- **`stage_metrics`**:
+  - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on `enrich_item`: `enriched_at - items.fetched_at`), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
+  - Indexed on `(job_type, created_at)` and `(feed_id, created_at)`. Enables fast exact SQL `p50`/`p95`/`avg` latency, tok/s, readiness lag, and per-feed GPU cost queries even after `jobs` rows are pruned at 30 days. Pruned after 180 days (~15–20 MB total at ~200 items/day).
 
 ## 5. Sync Surface, Conflict Resolution & Bulk Semantics
 
@@ -231,13 +241,13 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 | Entity (`sync_changes.entity_type`) | Synced Representation | Change Signal (`upsert`) | Removal Signal (`delete`) |
 | :--- | :--- | :--- | :--- |
 | `category` | Category row (`id`, `name`, `sort_order`) | Insert/update emits `category` `upsert` | Soft-delete (`deleted_at`) emits `category` `delete` |
-| `feed` | Feed row + `status`, `health_state`, `expiration_days_override`, `research_policy`, `custom_prompt_hint`, `config_version`, `field_updated_at` | Poll health change or config edit emits `feed` `upsert` | Never hard-deleted (unsubscribe emits `feed` `upsert` with `status='unsubscribed'`) |
+| `feed` | Feed row + `status`, `health_state`, `expiration_days_override`, `research_policy`, `curation_instructions`, **embedded `active_feed_instructions[]`** (active non-archived `feed_instruction` notes), `config_version`, `field_updated_at` | Poll health change, config edit, or feed instruction add/archive emits `feed` `upsert` | Never hard-deleted (unsubscribe emits `feed` `upsert` with `status='unsubscribed'`) |
 | `cluster` | Cluster row (`id`, `representative_item_id`, `title`, `max_relevance_tier`, `item_count`, `last_seen_at`) | Cluster creation/member/title/tier update emits `cluster` `upsert` | Emptied or merged cluster emits `cluster` `delete` |
 | `item` *(Aggregate)* | Item core fields + `state`, `is_starred`, `cluster_id` + **embedded** current `item_enrichment`, LLM `tags[]`, `research_sources[]` summaries (url/title/type/status), and current user item vote (`thumbs_up`/`thumbs_down`/reason) | Item ingest, state/star change, extraction, enrichment, tag replacement, research update, cluster reassignment, or item feedback emits parent `item` `upsert` | Items are permanent history (evicted locally by client window, never deleted on server) |
 | `interest_profile` | Active `interest_profiles` row (`version`, `profile_markdown`) | New active version emits `interest_profile` `upsert` | N/A (always one active profile) |
 | `app_settings` | Public client-relevant settings (`default_expiration_days`, `backfill_cap`, etc.) | Update emits `app_settings` `upsert` | N/A |
 
-*(Internal tables `jobs`, `sync_mutations`, `item_embeddings`, `devices`, `pairing_codes`, and `prompt_configs` are **not** pushed down via `sync_changes`; `prompt_configs` is fetched/edited online-only via its dedicated management endpoint.)*
+*(Internal tables `jobs`, `pipeline_runs`, `stage_metrics`, `sync_mutations`, `item_embeddings`, `devices`, `pairing_codes`, and `prompt_configs` are **not** pushed down via `sync_changes`; `prompt_configs` and pipeline metrics are accessed online-only via dedicated management endpoints.)*
 
 ### 5.2 Per-Field Conflict Resolution & Merge Table (Upstream `sync/push`)
 - **Clock-Skew Clamping**: For every client mutation, the server computes `effective_ts = LEAST(client_timestamp, server_now + INTERVAL '5 minutes')` so a misconfigured phone clock far in the future cannot permanently win LWW.
@@ -251,8 +261,9 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 | `mark_bulk_read` (feed/category/all/older-than-X) | Yes | Bounded by `{scope, up_to_sync_seq, older_than_ts?}` (or explicit `item_ids[]`); server applies `state='read'` only to matching items whose ingest `sync_seq <= up_to_sync_seq`. | Never marks unseen items that arrived after the client's last pull. |
 | `feeds.status`, `category_id`, `expiration_days_override`, `research_policy.fetch_pdfs`, `research_policy.enabled` | Yes | Per-field LWW via `feeds.field_updated_at[field_name]`. | N/A |
 | Item feedback (`thumbs_up` / `thumbs_down` / `reason`) | Yes | Append-only in `feedback_events` (deduped by `client_mutation_id`); latest event per item defines displayed vote state. | Allowed on expired items. |
+| Feed written instruction (`feed_instruction` add / archive) | Yes | Append-only creation in `feedback_events` (deduped by `client_mutation_id`); archiving sets `archived_at` idempotently by `feedback_event_id`. Emits parent `feed` `upsert`. | N/A |
 | `split_cluster` | Yes | Idempotent per `(item_id, source_cluster_id)`; ignored (`superseded`) if item already left that cluster. | Allowed. |
-| Feed add / OPML import / `custom_prompt_hint` / `interest_profiles` / `prompt_configs` | **No (Online-only)** | Optimistic version check (`expected_version`); returns `409 Conflict` with server version so edits are never silently overwritten. | N/A |
+| Feed add / OPML import / standing `feeds.curation_instructions` / `interest_profiles` / `prompt_configs` | **No (Online-only)** | Optimistic version check (`expected_version`); returns `409 Conflict` with server version so full free-text block edits are never silently overwritten. | N/A |
 
 ## 6. Expiration, Backfill, Bootstrap & Storage Lifecycle
 
@@ -285,4 +296,5 @@ effective_ttl_days(item, feed, settings):
 - **Operational Retention Cleanup**:
   - `jobs` (`status = 'done'`): pruned after **30 days**.
   - `sync_mutations` & `sync_changes`: pruned after **90 days** (clients detached > 90 days receive `resync_required` and seamlessly run `bootstrap`).
+  - `stage_metrics` & `pipeline_runs`: pruned after **180 days** (~15–20 MB total footprint; retains 6 months of per-stage/per-feed/per-model timing history for schedule and model tuning).
   - Historical domain tables (`items`, `item_enrichments`, `research_sources`, `clusters`, `feedback_events`): retained permanently.
