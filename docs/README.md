@@ -15,3 +15,4 @@ This directory holds the requirements, architecture, design specifications, ADRs
 | [Claude Design Review (2026-11-22)](reviews/2026-11-22-initial-design-review.md) | Initial design review (`R-01`–`R-34`, `Q-01`–`Q-11`) with recorded resolutions | Addressed |
 | [Copilot Design Review (2026-11-22)](reviews/2026-11-22-high-level-design-review.md) | High-level design review (`B-01`–`B-05`, `M-01`–`M-14`, minors) with recorded resolutions | Addressed |
 | [Second-Pass Design Review (2026-11-23)](reviews/2026-11-23-second-pass-design-review.md) | Verification pass on prior resolutions; `S-01`/`S-02` addressed in ADRs 0004/0006, `S-03`–`S-07` carried into milestone component designs | Addressed |
+| [`1a` Component Design Review (2026-11-24)](reviews/2026-11-24-1a-component-design-review.md) | Review of the `1a` component design (`A-01`–`A-33`): 6 blockers, 12 major, 15 minor | Open |
