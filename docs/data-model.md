@@ -19,7 +19,7 @@ SmartRSS persists a complete historical log in PostgreSQL 16+ (`pgvector` enable
 12. **`prompt_configs` & `interest_profiles`**: Versioned, seeded-default + user-edited LLM prompt templates and editable Interest Profile.
 13. **`sync_mutations`**: Idempotency log of applied/superseded/rejected client mutations.
 14. **`jobs`, `pipeline_runs` & `stage_metrics`**: Operational PostgreSQL job queue (dedupe keys, leases/heartbeats, priorities, dead-letter state), batch/cron run summaries, and per-stage execution timing/token telemetry for pipeline fine-tuning.
-15. **`app_settings`**: Global defaults (default expiration days, backfill cap, scheduling mode / cron windows / quiet hours, LLM runtime/model settings, per-model similarity thresholds, mini-research guardrails).
+15. **`app_settings`**: Global defaults (default expiration days, backfill cap, default poll interval, built-in cron windows / quiet hours, LLM runtime/model settings, per-model similarity thresholds, mini-research guardrails) plus internal operational timestamps (e.g., `last_retention_cleanup_at`). *(Worker process mode — continuous daemon vs. external cron — is deployment configuration (`WORKER_MODE` env var), not a DB setting.)*
 
 ## 2. Entity Relationships
 
@@ -104,7 +104,7 @@ stateDiagram-v2
 - **HTTP `429 Too Many Requests` & `Cache-Control`**: Respect `Retry-After` headers and `Cache-Control: max-age` lower bounds, adding small random jitter (e.g., ±10%) to avoid thundering herds.
 - **Per-Domain Article Fetch Politeness**: Enforce per-domain concurrency (`1`) and minimum delay (e.g., 1–2s) across `extract_content` and `mini_research` fetches.
 - **Updated Entries (`entry_hash` change)**: If an already-ingested `(feed_id, guid)` returns a materially changed feed-entry `entry_hash` (SHA-256 of normalized feed `title + raw_summary`, never overwritten by extraction) while still `unread` (and within 7 days), update text, re-extract, and enqueue one re-enrichment; never flip a `read` or `expired` item back to `unread`.
-- **Unstable GUIDs**: Match `(feed_id, guid)` first; if missing or mutated, fall back to matching `(feed_id, canonical_url)` within the feed before creating a new item.
+- **Unstable GUIDs**: Match `(feed_id, guid)` first; if missing or mutated, fall back to matching `(feed_id, canonical_url)` within the feed before creating a new item — **only** when the fallback is unambiguous: exactly one existing item and exactly one incoming entry share that `canonical_url`, and the matched item's `guid` is absent from the current fetch (i.e., the GUID genuinely changed). Feeds whose entries share a link (comics, podcasts, "latest" pages) therefore never have new entries swallowed or older items overwritten.
 
 ## 4. Schema Details
 
@@ -240,6 +240,10 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 - **`stage_metrics`**:
   - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on `enrich_item`: `enriched_at - items.fetched_at`), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
   - Indexed on `(job_type, created_at)` and `(feed_id, created_at)`. Enables fast exact SQL `p50`/`p95`/`avg` latency, tok/s, readiness lag, and per-feed GPU cost queries even after `jobs` rows are pruned at 30 days. Pruned after 180 days (~15–20 MB total at ~200 items/day).
+- **`app_settings`** (single row, `id SMALLINT PK CHECK (id = 1)`):
+  - `1a` columns: `default_expiration_days (INT NOT NULL DEFAULT 30)`, `backfill_cap (INT NOT NULL DEFAULT 10)`, `default_poll_interval_minutes (INT NOT NULL DEFAULT 60)`, `last_retention_cleanup_at (TIMESTAMPTZ NULL)`, `updated_at`.
+  - Env vars (`DEFAULT_*`) seed the row only in the initial migration; the DB is authoritative thereafter (changed via `smartrss settings set` in `1a`, and via the sync/settings API from `1b`/`1c`).
+  - `last_retention_cleanup_at` is an **internal operational** column: it is never client-synced and writing it does not emit an `app_settings` sync change. LLM/clustering/research columns are added in `1d`–`1f`.
 
 ## 5. Sync Surface, Conflict Resolution & Bulk Semantics
 

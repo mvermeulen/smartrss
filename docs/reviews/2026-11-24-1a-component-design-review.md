@@ -3,7 +3,7 @@
 - **Date**: 2026-11-24
 - **Scope**: [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) (Draft, as of commit `aa3e6da`), checked against `requirements.md`, `data-model.md`, `architecture.md`, and ADRs `0003`, `0004`, `0006`
 - **Reviewer**: Claude Code (at the project owner's request)
-- **Status**: Addressed — all 6 Blockers (`A-01`–`A-06`), 12 Major (`A-07`–`A-18`), 15 Minor (`A-19`–`A-33`), and trade-off alignments (`T-01`/`T-02`) resolved in [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) and [`docs/data-model.md`](../data-model.md). Three residual-risk / operational trade-offs (`A-14`, `A-15` revocation replay, `A-33` hairpin NAT) are documented in `1a` §13 for explicit owner sign-off prior to marking `1a` **`Approved`**.
+- **Status**: Addressed & verified — all 33 findings (`A-01`–`A-33`) and `T-01`–`T-08` resolved; the verification pass (§7) found and fixed `N-01`–`N-11`; owner decisions on `A-14`, `A-15` and `A-33` recorded (§6). `1a` marked **`Approved`** on 2026-11-24.
 
 ## Review outcome
 
@@ -247,10 +247,31 @@ All 33 findings (`A-01`–`A-33`) and trade-off alignments (`T-01`–`T-08`) hav
 | **A-32** | Fixed | Exempted `GET /api/v1/health` from `HostAllowListMiddleware` for internal compose healthchecks; moved `http://localhost:5173` CORS origin to `.env.dev.example`; removed `'cli'` from `devices.platform` to match `ubuntu\|android\|web`. | `1a` §3, §4.3, §5.1, §6.1, §10.1, §12.1 |
 | **A-33** | Fixed + **owner decision** | Added NAT64 (`64:ff9b::/96` unwrapped + `64:ff9b:1::/48` blocked) and 6to4 (`2002::/16` unwrapped via `ip.sixtofour`) to SSRF denylist + unit tests; documented hairpin NAT / host own global IP as accepted residual risk in §13 for owner decision. | `1a` §7.2, §12.1, §13 |
 
-### Deferred & Residual-Risk Items for Owner Decision
-| ID | Category | Proposed Disposition | Decision Needed from Owner |
+### Deferred & Residual-Risk Items — Owner Decisions (2026-11-24: all accepted as proposed)
+| ID | Category | Proposed Disposition | Owner Decision |
 | :--- | :--- | :--- | :--- |
-| **A-14** | Accepted residual risk (`1a`) / Deferred (`1f`) | Accept shared `worker` network namespace for `trafilatura`/`lxml` HTML extraction in `1a`; require network isolation (`network_mode: none` container or `unshare --net`/seccomp) in **`1f`** before adding `pymupdf`. | Confirm `1a` acceptance + `1f` isolation gate. |
-| **A-15** *(revocations)* | Operational trade-off | Manual post-restore `smartrss devices list` + `revoke` checklist before starting `api` (§11.2 step 4). | Confirm manual checklist vs. adding an out-of-DB revocation file replayed automatically on restore. |
-| **A-15** *(client resync)* | Deferred (`1b`/`1c`) | Defer the paired-client resync + pending-outbox preservation drill step to **`1b`/`1c`** when sync endpoints and client outbox exist. | Confirm milestone split. |
-| **A-33** *(hairpin / own IP)* | Accepted residual risk | Accept hairpin NAT / host own global IPv6 as residual risk (no router port-forwarding in SmartRSS architecture; static `SSRF_BLOCKED_CIDRS` available). | Confirm residual risk acceptance vs. adding an optional startup self-IP discovery probe (`SSRF_BLOCKED_HOSTS_SELF`). |
+| **A-14** | Accepted residual risk (`1a`) / Deferred (`1f`) | Accept shared `worker` network namespace for `trafilatura`/`lxml` HTML extraction in `1a`; require network isolation (`network_mode: none` container or `unshare --net`/seccomp) in **`1f`** before adding `pymupdf`. | **Accepted** — `1f` isolation is a hard design gate. |
+| **A-15** *(revocations)* | Operational trade-off | Manual post-restore `smartrss devices list` + `revoke` checklist before starting `api` (§11.2 step 4). | **Accepted** — manual checklist; no out-of-DB revocation log. |
+| **A-15** *(client resync)* | Deferred (`1b`/`1c`) | Defer the paired-client resync + pending-outbox preservation drill step to **`1b`/`1c`** when sync endpoints and client outbox exist. | **Accepted** — deferred to `1b`/`1c`. |
+| **A-33** *(hairpin / own IP)* | Accepted residual risk | Accept hairpin NAT / host own global IPv6 as residual risk (no router port-forwarding in SmartRSS architecture; static `SSRF_BLOCKED_CIDRS` available). | **Accepted** — residual risk; README documents adding WAN/IPv6 prefixes to `SSRF_BLOCKED_CIDRS`. |
+
+---
+
+## 7. Verification Pass (2026-11-24)
+
+The resolutions were checked against the revised design (commit `c1d01d2`). All `A-*` fixes were confirmed correct. The pass found two new issues introduced or exposed by the fixes, plus nine smaller gaps. All are fixed in the same commit that marks `1a` **`Approved`**.
+
+| ID | Severity | Finding | Resolution | Where Recorded |
+| :--- | :--- | :--- | :--- | :--- |
+| **N-01** | Major | The `(feed_id, canonical_url)` fallback in the dedup lookup (exposed by `A-03`) matched any new entry sharing an existing item's link. In comic, podcast or "latest page" feeds, new entries were never inserted, and an unread item younger than 7 days had its `title`/`raw_summary` overwritten. The `A-03` test only covered a single fetch. | The fallback now applies only when it is unambiguous: one existing item and one batch entry share the URL, and the matched item's `guid` is absent from the batch. Added a two-poll regression test. | `1a` §9.1, §12.1; `data-model.md` §3.3 |
+| **N-02** | Major | The `A-31` fix used `rsync --delete`, so an emptied or wrong local `BACKUP_DIR` would wipe the off-host copy. | No `--delete`. The copy is skipped when no valid local dump exists, and remote retention is pruned independently (`BACKUP_REMOTE_RETENTION_DAYS=30`). Added a manual exit check. | `1a` §4.3, §11.1, §12.2 |
+| **N-03** | Minor | The `A-11` `before_commit` guard only sees ORM dirty state, but `poll_feed`, `expire_items` and the failure hooks write through Core SQL. | Core writes to synced tables go through the `sync_log.execute_synced()` helpers. A test-only `before_cursor_execute` hook flags any other writes. | `1a` §5.1, §12.1 |
+| **N-04** | Minor | Diff-gating on the non-200 paths needs the prior column values, and PG16 has no `OLD` in `RETURNING`. | Added a short-transaction `SELECT … FOR UPDATE` re-read before the column-scoped update. | `1a` §9.1 |
+| **N-05** | Minor | The `A-05` failure hook could run inside the stage's aborted transaction. | The hook runs in a fresh session/transaction after rollback. | `1a` §8.1 |
+| **N-06** | Minor | The shutdown release was fenced on `locked_by` only, contradicting the `A-08` full fence. | The shutdown release now uses the full fence. | `1a` §8.3 |
+| **N-07** | Minor | With `WORKER_MODE=cron`, the compose `worker` service would still start, refuse to run, and crash-loop. | `worker` sits behind the `daemon` compose profile (`COMPOSE_PROFILES`), with `init: true`. The refusal exits `78` as a safety net. | `1a` §4.1, §4.3, §8.3 |
+| **N-08** | Minor | After `A-29`, nothing in `1a` could change `app_settings`, although `FR-FEED-05` requires a configurable cap. | Added `smartrss settings get\|set`, which emits an `app_settings` upsert. | `1a` §10.2, §12.1; `data-model.md` §4.9 |
+| **N-09** | Minor | User-supplied subscribe titles and OPML titles were not stamped in `field_updated_at['title']`, so the poller would overwrite them. | Both are stamped. Titles derived from the URL stay unstamped. | `1a` §10.1, §12.1 |
+| **N-10** | Minor | The restore runbook started the apps before migrating, and `pg_restore --clean` leaves behind objects created after the backup. | Restore now goes into a dropped and recreated DB, then rotates the epoch, re-revokes devices, and migrates before starting. | `1a` §11.2 |
+| **N-11** | Minor / doc sync | `data-model.md` didn't document the `app_settings` columns or `last_retention_cleanup_at`, and it listed "scheduling mode" as a DB setting. Nits: the `deflate` variant and multi-member gzip were unspecified, and deterministic extractor kills were retried 5× (re-fetching a hostile doc each time). | Added an `app_settings` entry to data-model §4.9 and clarified that `WORKER_MODE` is env config. Specified the zlib/raw `deflate` fallback and multi-member gzip handling. Extractor timeouts and rlimit kills are now permanent (`fallback_rss`). | `data-model.md` §1, §4.9; `1a` §7.2, §9.2, §12.1 |
+
