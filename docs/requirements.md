@@ -129,7 +129,7 @@ Standard RSS readers fetch raw feeds chronologically and leave all triage, organ
 - Automated feedback-driven Interest Profile update suggestions, manual per-item tag editing (if needed based on usage), richer multi-hop mini-research, semantic archive search, and optional implicit feedback signals.
 
 ## 7. Open Questions
-All initial architectural questions (`Q-01`–`Q-11`) have been answered by the owner and recorded in [ADR 0001](decisions/0001-tech-stack-and-container-topology.md)–[ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md) (currently `Proposed`, awaiting final owner sign-off to move to `Accepted`).
+All initial architectural questions (`Q-01`–`Q-11`) have been answered by the owner and recorded in [ADR 0001](decisions/0001-tech-stack-and-container-topology.md)–[ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md) (all `Accepted`).
 
 Remaining design-level choices to finalize inside the milestone component specs (`docs/design/`):
 1. **Phase 1 Localhost Launcher**: Exact packaging for the Ubuntu `localhost` runner (lightweight local static HTTP server via systemd user unit vs. Tauri desktop wrapper) — to finalize in `1c` client design.

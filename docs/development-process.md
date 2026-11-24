@@ -89,7 +89,7 @@ Documentation is a **first-class deliverable**, kept continuously synchronized w
 
 ### 4.2 Docs-in-the-Same-Change Rule
 Whenever a code change alters any of the following, update the corresponding docs in the **same commit**:
-- API endpoints, sync protocol, or push/pull schemas → `docs/design/sync-protocol-and-offline-client.md` (and OpenAPI).
+- API endpoints, sync protocol, or push/pull schemas → `docs/design/1b-sync-protocol-and-search.md` (and OpenAPI).
 - Database tables, columns, indexes, state machines, or retention rules → `docs/data-model.md`.
 - Service topology, networking, security boundaries, or pipeline stages → `docs/architecture.md`.
 - LLM prompts, adapter contracts, clustering, or mini-research rules → `docs/design/` specs.
