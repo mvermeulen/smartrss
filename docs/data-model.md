@@ -45,12 +45,14 @@ erDiagram
 - `is_starred` is orthogonal to `state`: starring an item never alters `state`, **except** starring an `expired` item leaves it visible in the Starred/Saved view and prevents future expiration.
 - Un-starring an old `unread` item does **not** immediately expire it on the client; the next server `expire_items` sweep will transition it to `expired` if its age exceeds `effective_ttl`.
 - Opening/viewing an `expired` item in the History/Archive view marks it `read` (if the user reads/opens it) or lets the user explicitly mark it `unread` (which resets its expiration grace clock via `unexpired_at` / `read_state_updated_at`).
+- Items ingested from a `muted` feed (within backfill cap `N`) enter directly as `state = 'read'` with `read_at = fetched_at` and `read_state_updated_at = fetched_at` (still extracted for archive/search/dedup; LLM enrichment skipped by default in `1d` to conserve GPU time).
 - Read state is tracked **per item**; exact duplicates and clustered stories render grouped in the UI, and **"Mark cluster read"** expands on the client into an explicit list of known `item_ids`.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> unread : Ingested (within backfill cap N)
-    [*] --> expired : Backfilled beyond cap N on subscribe/OPML
+    [*] --> unread : Ingested from active feed (within backfill cap N)
+    [*] --> read : Ingested from muted feed (within backfill cap N; read_state_updated_at = fetched_at)
+    [*] --> expired : Backfilled beyond cap N on subscribe/OPML (expired_at = read_state_updated_at = fetched_at)
     unread --> read : User marks read / opens / bulk mark-read
     read --> unread : User marks unread
     unread --> expired : Server expire_items sweep (not is_starred & age > effective_ttl)
@@ -64,8 +66,8 @@ Separating user intent from server health ensures a broken feed never overwrites
 - **User intent (`feeds.status`)**:
   - `active`: Polled normally; items appear in unread/relevance views.
   - `paused`: Polling suspended by user; existing items remain visible in views/history.
-  - `muted`: Still polled and archived into history (so deduplication/search stay complete), but new items are auto-marked `read` (or hidden from active unread inbox) until unmuted.
-  - `unsubscribed`: Polling stopped; **existing unread non-starred items are hidden from active inbox views** (still retained in historical log and Starred view). Re-subscribing to the same `feed_url` reactivates the existing feed row (`status = 'active'`) applying the standard backfill cap (`N`) to newly fetched entries.
+  - `muted`: Still polled, extracted, and archived into history (so deduplication/search stay complete), with new items auto-marked `read` at ingest time (`state = 'read'`, `read_at = fetched_at`, `read_state_updated_at = fetched_at`; LLM enrichment skipped by default in `1d`) until unmuted.
+  - `unsubscribed`: Polling stopped; **existing unread non-starred items are hidden from active inbox views** (still retained in historical log and Starred view). Re-subscribing to the same `feed_url` reactivates the existing feed row (`status = 'active'`), clears conditional HTTP headers (`etag`, `last_modified`), deduplicates against existing items, and applies the standard backfill cap (`N`) only to newly fetched entries.
 - **Server health (`feeds.health_state`)**:
   - `healthy`: Last poll succeeded (`consecutive_errors = 0`).
   - `degraded`: Transient errors (`1 <= consecutive_errors < 5`); exponential backoff applied.
@@ -101,7 +103,7 @@ stateDiagram-v2
 - **HTTP `301 Permanent Redirect`**: Update `feed_url` to the new canonical URL **unless** another row already owns that `feed_url`—in which case flag the feed as `health_state = 'broken'` with a clear duplicate-redirect diagnostic rather than crashing on the `UNIQUE` constraint.
 - **HTTP `429 Too Many Requests` & `Cache-Control`**: Respect `Retry-After` headers and `Cache-Control: max-age` lower bounds, adding small random jitter (e.g., ±10%) to avoid thundering herds.
 - **Per-Domain Article Fetch Politeness**: Enforce per-domain concurrency (`1`) and minimum delay (e.g., 1–2s) across `extract_content` and `mini_research` fetches.
-- **Updated Entries (`content_hash` change)**: If an already-ingested `(feed_id, guid)` returns a materially changed `content_hash` while still `unread` (and within 7 days), update text and enqueue one re-enrichment; never flip a `read` item back to `unread`.
+- **Updated Entries (`entry_hash` change)**: If an already-ingested `(feed_id, guid)` returns a materially changed feed-entry `entry_hash` (SHA-256 of normalized feed `title + raw_summary`, never overwritten by extraction) while still `unread` (and within 7 days), update text, re-extract, and enqueue one re-enrichment; never flip a `read` or `expired` item back to `unread`.
 - **Unstable GUIDs**: Match `(feed_id, guid)` first; if missing or mutated, fall back to matching `(feed_id, canonical_url)` within the feed before creating a new item.
 
 ## 4. Schema Details
@@ -118,6 +120,9 @@ stateDiagram-v2
   - `entity_id UUID NOT NULL`
   - `op TEXT NOT NULL` (`upsert`, `delete`)
   - `changed_at TIMESTAMPTZ NOT NULL DEFAULT now()`
+  - **Singleton entity sentinel UUIDs**: Because `app_settings` uses a `SMALLINT = 1` PK and `interest_profile` syncs as a single logical active document, `sync_changes.entity_id` uses fixed deterministic UUID constants for singleton entity types:
+    - `app_settings`: `00000000-0000-0000-0000-000000000001` (`APP_SETTINGS_ENTITY_ID`)
+    - `interest_profile`: `00000000-0000-0000-0000-000000000002` (`INTEREST_PROFILE_ENTITY_ID`)
   - Index on `(entity_type, entity_id)` for optional compaction/lookup; retention pruned after 90 days.
 
 ### 4.3 `categories`
@@ -149,8 +154,8 @@ stateDiagram-v2
 | `fetch_full_text` | `BOOLEAN` (DEFAULT TRUE) | |
 | `research_policy` | `JSONB` | `{enabled, fetch_pdfs, guidance, max_hops}` |
 | `curation_instructions` | `TEXT` | Standing per-feed natural-language LLM directives (e.g., *"look for topic X"*, *"skip weekly roundups"*); online-only optimistic-versioned edit (`config_version`) |
-| `field_updated_at` | `JSONB` (NOT NULL DEFAULT `'{}'`) | Per-field LWW timestamps (`status`, `category_id`, `expiration_days_override`, `research_policy.fetch_pdfs`, etc.) |
-| `config_version` | `INT` (DEFAULT 1) | Optimistic concurrency token for free-text fields |
+| `field_updated_at` | `JSONB` (NOT NULL DEFAULT `'{}'`) | Per-field LWW timestamps (`status`, `category_id`, `title`, `expiration_days_override`, `research_policy.fetch_pdfs`, etc.) |
+| `config_version` | `INT` (DEFAULT 1) | Optimistic concurrency token; increments **only** on `curation_instructions` writes (independent of `field_updated_at` LWW fields) |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | |
 
 ### 4.5 `items`
@@ -169,12 +174,13 @@ stateDiagram-v2
 | `raw_summary` | `TEXT` | Untrusted RSS HTML (sanitized on client) |
 | `extracted_text` | `TEXT` | Server-extracted plain text |
 | `extraction_status` | `TEXT` (`pending`, `ok`, `fallback_rss`, `failed`) | |
-| `content_hash` | `TEXT` | SHA-256 of normalized text |
+| `entry_hash` | `TEXT` | SHA-256 of normalized feed-entry `title + "\n" + raw_summary`; owned by `poll_feed` for update detection (never overwritten by extraction) |
+| `content_hash` | `TEXT` | SHA-256 of normalized `title + "\n" + (extracted_text or raw_summary)`; updated by `extract_content` on `ok` and used for `1e` content dedup |
 | `state` | `TEXT` (`unread`, `read`, `expired`) | |
 | `is_starred` | `BOOLEAN` (DEFAULT FALSE) | Orthogonal to `state`; never expires |
 | `read_at` / `starred_at` / `expired_at` | `TIMESTAMPTZ` (NULL) | |
-| `read_state_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `state` |
-| `starred_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `is_starred` |
+| `read_state_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `state` (initialized to `fetched_at` on insert) |
+| `starred_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `is_starred` (initialized to `fetched_at` on insert) |
 | `unexpired_at` | `TIMESTAMPTZ` (NULL) | Set if user restores an `expired` item to `unread` |
 | `search_vector` | `TSVECTOR` (GIN indexed) | Rebuilt in application code on item/enrichment/tag update; configurable language (`english`); `extracted_text` sliced to first 64 KB (well under Postgres 1 MB limit) |
 
@@ -224,7 +230,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 - **`interest_profiles`**: `id`, `version (INT)`, `profile_markdown`, `is_active`, `created_at`. Online-only edit with optimistic `version` check.
 - **`sync_mutations`**: `client_mutation_id (UUID PK)`, `device_id (UUID FK → devices.id)`, `mutation_type`, `entity_type`, `entity_id`, `client_timestamp`, `effective_timestamp`, `server_applied_at`, `outcome` (`applied`, `superseded`, `rejected`), `rejection_reason (TEXT NULL)`. Pruned after 90 days.
 - **`jobs`**:
-  - `id (BIGSERIAL PK)`, `job_type`, `dedupe_key (TEXT NOT NULL)`, `payload (JSONB)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `run_id (UUID NULL FK → pipeline_runs.id)`, `priority (SMALLINT DEFAULT 50)`, `status` (`queued`, `running`, `done`, `failed`), `attempts (INT DEFAULT 0)`, `max_attempts (INT DEFAULT 5)`, `run_after (TIMESTAMPTZ DEFAULT now())`, `locked_by (TEXT NULL)`, `locked_at (TIMESTAMPTZ NULL)`, `started_at (TIMESTAMPTZ NULL)`, `lease_expires_at (TIMESTAMPTZ NULL)`, `heartbeat_at (TIMESTAMPTZ NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `queue_wait_ms (INT NULL)`, `duration_ms (INT NULL)`, `last_error (TEXT NULL)`, `created_at`, `updated_at`.
+  - `id (BIGSERIAL PK)`, `job_type`, `dedupe_key (TEXT NOT NULL)`, `payload (JSONB)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `priority (SMALLINT DEFAULT 50)`, `status` (`queued`, `running`, `done`, `failed`), `attempts (INT DEFAULT 0)`, `max_attempts (INT DEFAULT 5)`, `run_after (TIMESTAMPTZ DEFAULT now())`, `locked_by (TEXT NULL)`, `locked_at (TIMESTAMPTZ NULL)`, `started_at (TIMESTAMPTZ NULL)`, `lease_expires_at (TIMESTAMPTZ NULL)`, `heartbeat_at (TIMESTAMPTZ NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `queue_wait_ms (INT NULL)`, `duration_ms (INT NULL)`, `last_error (TEXT NULL)`, `created_at`, `updated_at`.
   - **Dedupe index**: `CREATE UNIQUE INDEX uq_jobs_active_dedupe ON jobs (job_type, dedupe_key) WHERE status IN ('queued', 'running')`.
   - **Reclaim & Retention**: Reaper resets `running` jobs where `lease_expires_at < now()` back to `queued` (or `failed` dead-letter if `attempts >= max_attempts`); dead-lettered jobs can be retried/dismissed in System Health UI; `done` jobs pruned after 30 days.
   - **Stage Idempotency**: Every stage (`poll_feed`, `extract_content`, `cluster_item`, `mini_research`, `enrich_item`, `expire_items`) uses upserts/natural keys so re-execution after a crash never duplicates records.
@@ -232,7 +238,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
   - `id (UUID PK)`, `trigger (TEXT)` (`scheduler_window` | `cron_cli` | `manual`), `stages (TEXT[])`, `status (TEXT)` (`running` | `completed` | `partial` | `failed`), `started_at (TIMESTAMPTZ NOT NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `duration_ms (INT NULL)`, `items_polled (INT DEFAULT 0)`, `items_extracted (INT DEFAULT 0)`, `items_clustered (INT DEFAULT 0)`, `items_researched (INT DEFAULT 0)`, `items_enriched (INT DEFAULT 0)`, `jobs_failed (INT DEFAULT 0)`, `total_llm_ms (BIGINT DEFAULT 0)`, `notes (TEXT NULL)`.
   - Tracks scheduled cron windows and `worker run-once` batch executions so users can inspect end-to-end batch duration and tune schedules. Pruned after 180 days.
 - **`stage_metrics`**:
-  - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on `enrich_item`: `enriched_at - items.fetched_at`), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
+  - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on `enrich_item`: `enriched_at - items.fetched_at`), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
   - Indexed on `(job_type, created_at)` and `(feed_id, created_at)`. Enables fast exact SQL `p50`/`p95`/`avg` latency, tok/s, readiness lag, and per-feed GPU cost queries even after `jobs` rows are pruned at 30 days. Pruned after 180 days (~15–20 MB total at ~200 items/day).
 
 ## 5. Sync Surface, Conflict Resolution & Bulk Semantics

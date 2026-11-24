@@ -3,7 +3,7 @@
 - **Date**: 2026-11-24
 - **Scope**: [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) (Draft, as of commit `aa3e6da`), checked against `requirements.md`, `data-model.md`, `architecture.md`, and ADRs `0003`, `0004`, `0006`
 - **Reviewer**: Claude Code (at the project owner's request)
-- **Status**: Open. 6 Blockers (`A-01`–`A-06`), 12 Major, 15 Minor. The overall structure is sound, but the Blockers are correctness bugs that would show up within the first day of running against real feeds. Each one is a small spec change.
+- **Status**: Addressed — all 6 Blockers (`A-01`–`A-06`), 12 Major (`A-07`–`A-18`), 15 Minor (`A-19`–`A-33`), and trade-off alignments (`T-01`/`T-02`) resolved in [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) and [`docs/data-model.md`](../data-model.md). Three residual-risk / operational trade-offs (`A-14`, `A-15` revocation replay, `A-33` hairpin NAT) are documented in `1a` §13 for explicit owner sign-off prior to marking `1a` **`Approved`**.
 
 ## Review outcome
 
@@ -188,3 +188,69 @@ Decide whether the backfill cap applies again; the recommendation is yes.
 1. Fold `A-01`–`A-06` into the design. Each is a paragraph-level change.
 2. Fix the Major items, or record an explicit "accepted / deferred to `1b`/`1f`" note for each. At minimum, `A-14`, `A-15` (revocations), and `A-33` need an owner decision.
 3. Land the T-01 transition and `A-16` sentinel UUID in `data-model.md` in the same commit that marks `1a` `Approved`.
+
+---
+
+## 6. Resolution Tracker (2026-11-24)
+
+All 33 findings (`A-01`–`A-33`) and trade-off alignments (`T-01`–`T-08`) have been addressed across [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) and [`docs/data-model.md`](../data-model.md).
+
+### Trade-offs (`T-01`–`T-08`)
+| ID | Disposition | Resolution | Where Recorded |
+| :--- | :--- | :--- | :--- |
+| **T-01** | Resolved | Added muted-feed `[*] --> read` transition (`read_at = read_state_updated_at = fetched_at`) to `data-model.md` §3.1–§3.2 and documented `1d` default ("extract yes, enrich no" unless explicitly requested). | `1a` §2, §9.1; `data-model.md` §3.1–§3.2 |
+| **T-02** | Resolved | Confirmed milestone-scoped schema + early `sync_state`/`sync_changes`, with singleton sentinel UUIDs fixed per `A-16`. | `1a` §2, §5.1; `data-model.md` §4.2 |
+| **T-03–T-08** | Confirmed | Retained as designed; `T-05` cross-references `A-14` network-namespace residual risk and `1f` isolation requirement. | `1a` §2, §13 |
+
+### Blockers (`A-01`–`A-06`)
+| ID | Disposition | Resolution | Where Recorded |
+| :--- | :--- | :--- | :--- |
+| **A-01** | Fixed | Split hashes into `entry_hash` (SHA-256 of feed `title + raw_summary`, owned by `poll_feed` for update detection, never touched by extraction) and `content_hash` (SHA-256 of `title + (extracted_text or raw_summary)`, updated by `extract_content` on `ok` for `1e` dedup). Added integration test. | `1a` §5.1, §9.1, §9.2, §12.1; `data-model.md` §3.3, §4.5 |
+| **A-02** | Fixed | Backfill path now always runs `(feed_id, guid)` / `(feed_id, canonical_url)` dedup lookup first, applying cap `N` only to genuinely new entries (preserving existing `read`/`expired` items). Reactivation (`POST /feeds`, `import-opml`) clears `etag`/`last_modified` and resets health/schedule. Added integration test. | `1a` §9.1, §10.1, §12.1; `data-model.md` §3.2 |
+| **A-03** | Fixed | Added intra-batch dedup by `guid` (first occurrence wins), changed fallback `guid` to `"fallback:" + sha256(raw_url + "\n" + title.strip())`, and added `INSERT ... ON CONFLICT (feed_id, guid) DO NOTHING RETURNING id` backstop. Added integration test. | `1a` §9.1, §12.1 |
+| **A-04** | Fixed | `worker run-once` drain loop counts only `running` or ready (`queued AND run_after <= now()`) jobs, sets default `--max-duration 1800` (30m), and reports backed-off jobs as `jobs_deferred` in summary/JSON and `pipeline_runs.notes`. Added integration test. | `1a` §8.3, §10.2, §12.1 |
+| **A-05** | Fixed | Added `poll_feed` job-failure/dead-letter hook (including reaper dead-lettering) that performs a column-scoped `UPDATE feeds` incrementing `consecutive_errors`, degrading `health_state`, recording `last_error`, and advancing `next_fetch_at` with exponential backoff + jitter (emitting diff-gated `feed` `upsert`). Added integration test. | `1a` §8.1, §12.1 |
+| **A-06** | Fixed | Switched `SafeHttpClient` to `Accept-Encoding: gzip, deflate` only (rejecting other/chained encodings with `UnsupportedEncodingError`), streaming raw wire bytes via `response.aiter_raw()` and manually decompressing incrementally with `zlib.decompressobj().decompress(chunk, max_length=remaining + 1)`. Added single-chunk gzip-bomb boundary test. | `1a` §7.2, §12.1 |
+
+### Major Findings (`A-07`–`A-18`)
+| ID | Disposition | Resolution | Where Recorded |
+| :--- | :--- | :--- | :--- |
+| **A-07** | Fixed | Mandated explicit column-scoped `UPDATE feeds` touching only poll-owned columns (never persisting pre-I/O ORM state) and re-reading `status`/config via `SELECT ... FOR UPDATE` inside the short persist transaction. Added concurrent-`PATCH` integration test. | `1a` §9.1, §12.1 |
+| **A-08** | Fixed | Fenced heartbeat, complete, retry, dead-letter, and shutdown-release updates with `WHERE id = :id AND status = 'running' AND locked_by = :worker_id AND attempts = :claimed_attempt`; 0-row updates log `job_lease_lost` and abort without clobbering the new owner. Added integration test. | `1a` §8.1, §12.1 |
+| **A-09** | Fixed | Switched per-tick `LOCK_SCHEDULER` and `LOCK_REAPER` to `pg_try_advisory_xact_lock`, and bound session-level `LOCK_RUN_ONCE` to a dedicated checked-out `AsyncConnection` for its entire lifetime. Added pool-safety integration test. | `1a` §8.2, §12.1 |
+| **A-10** | Fixed | `run-once` now always runs `reap_stale_leases` first; persisted `app_settings.last_retention_cleanup_at` (internal operational column, not client-synced) so daily `retention_cleanup` runs in both daemon and `run-once --stage all`; added `--stage maintenance` and `WORKER_MODE=daemon\|cron` (explicitly unsupported to run both concurrently). | `1a` §4.3, §5.1, §8.3, §9.3, §10.2, §12.1 |
+| **A-11** | Fixed | Made `feed` `upsert` emission diff-gated across all poll paths (no-op polls emit 0 `feed` upserts; any `304`/`429`/`410`/error health change emits `feed` `upsert`); stamped `field_updated_at` on all server LWW writes (including `DELETE /categories/{id}` clearing `category_id` and reactivation setting `status`); added a SQLAlchemy `before_commit` structural test guard (`MissingSyncEventError`). | `1a` §5.1, §9.1, §10.1, §12.1 |
+| **A-12** | Fixed | On final `extract_content` retry exhaustion (`attempts >= max_attempts`), transition `items.extraction_status = 'failed'`, emit `item` `upsert` via `SyncLogWriter`, and dead-letter the job so items never remain stuck in `pending`. Added integration test. | `1a` §8.1, §9.2, §12.1 |
+| **A-13** | Fixed | Spawn extractor with `start_new_session=True`, `stderr=DEVNULL` (suppressing noisy third-party stderr loggers in `runner.py`), bounded incremental `stdout` read (1 MB) inside `asyncio.timeout(20.0)`, and `os.killpg(proc.pid, SIGKILL)` on timeout/cap breach. Added 1 MB stderr and process-group kill boundary tests. | `1a` §9.2, §12.1 |
+| **A-14** | **Accepted residual risk (owner decision)** | Documented shared `worker` network namespace in `1a` (`trafilatura`/`lxml` HTML only) as an accepted residual risk; required network isolation (`network_mode: none` extractor service or `unshare --net`/seccomp) in **`1f`** prior to adding `pymupdf`. | `1a` §2 (T-05), §13 |
+| **A-15** | Fixed + **owner decision** + **1b/1c deferral** | Required explicit `--database-url` / `--dbname` on `smartrss db rotate-epoch`; added full Production Restore Runbook (stop → restore → rotate epoch → review/re-revoke devices → start); documented manual revocation checklist in §11.2 & §13 (owner decision vs. out-of-DB revocation file); explicitly deferred client-resync verification of the drill to **`1b`/`1c`**. | `1a` §10.2, §11.2, §11.3, §13 |
+| **A-16** | Fixed | Defined fixed deterministic sentinel UUID constants for singleton synced entities: `APP_SETTINGS_ENTITY_ID = 00000000-0000-0000-0000-000000000001` and `INTEREST_PROFILE_ENTITY_ID = 00000000-0000-0000-0000-000000000002`. | `data-model.md` §4.2; `1a` §5.1 |
+| **A-17** | Fixed | Explicitly specified initial insert timestamps: `read_state_updated_at = fetched_at`, `starred_updated_at = fetched_at`, `read_at = fetched_at` (muted), and `expired_at = fetched_at` (backfill beyond cap `N`). | `1a` §5.1, §9.1; `data-model.md` §3.1, §4.5 |
+| **A-18** | Fixed | Added `feed_url` to `PATCH /api/v1/feeds/{id}` with SSRF validation (`422`), uniqueness check (`409`), clearing `etag`/`last_modified`, resetting health/errors/`next_fetch_at`/`initial_backfill_done=FALSE` (backfill cap applies to newly fetched entries while existing items dedup), and enqueueing immediate poll. Added integration test. | `1a` §10.1, §12.1 |
+
+### Minor Findings (`A-19`–`A-33`)
+| ID | Disposition | Resolution | Where Recorded |
+| :--- | :--- | :--- | :--- |
+| **A-19** | Fixed | Added `bump_existing=True` enqueue path (`ON CONFLICT ... DO UPDATE SET priority = LEAST(...), run_after = LEAST(...) WHERE jobs.status = 'queued'`) for manual `POST /feeds/{id}/poll` and subscribe/URL-edit triggers. | `1a` §8.1, §10.1, §12.1 |
+| **A-20** | Fixed | `POST /api/v1/system/jobs/{id}/retry` catches `uq_jobs_active_dedupe` conflicts and returns `409 Conflict` with `active_job_id`. | `1a` §10.1, §12.1 |
+| **A-21** | Fixed | Declared `jobs.run_id` and `stage_metrics.run_id` FKs `ON DELETE SET NULL` and ordered `retention_cleanup` to delete `stage_metrics` before `pipeline_runs`. Added integration test. | `1a` §5.1, §9.3, §12.1; `data-model.md` §4.9 |
+| **A-22** | Fixed | Set `stop_grace_period: 40s` on `worker`; graceful shutdown waits up to 30s then cancels and releases unfinished jobs back to `queued` (`run_after = now()`, `attempts = GREATEST(attempts - 1, 0)`) fenced by `locked_by`. | `1a` §4.1, §8.3 |
+| **A-23** | Fixed | Wrapped each full `SafeHttpClient` fetch (redirects + body streaming) in `asyncio.timeout(total)` (default `30s`) alongside per-op `httpx.Timeout`. Added boundary test. | `1a` §7.2, §12.1 |
+| **A-24** | Fixed | Specified `defusedxml` for OPML parsing in `api` and recorded `feedparser` in-process parsing (capped at 5 MB, relying on Expat's entity-expansion protections) as an explicit design decision. | `1a` §3, §9.1, §10.1, §12.1 |
+| **A-25** | Fixed | Switched `/api/v1/auth/pair` rate limiter to a single global sliding-window bucket (5 attempts / 5m), avoiding `X-Forwarded-For` proxy-trust complexity behind Nginx at 80-bit code entropy. | `1a` §6.1, §10.1 |
+| **A-26** | Fixed | Fallback `guid` now hashes `raw_url + "\n" + title.strip()` (decoupled from `url_canon`); `canonical_url` is used strictly for fallback matching and `1e` dedup. | `1a` §9.1 |
+| **A-27** | Fixed | Defined `feeds.title`/`site_url` ownership: `title` initializes from user/OPML input or feed URL; `PATCH` stamps `field_updated_at['title']`; `poll_feed` updates `title` only while `'title'` is absent from `field_updated_at` and updates `site_url` when present. | `1a` §9.1, §10.1, §12.1 |
+| **A-28** | Fixed | Stated `feeds.config_version` scope (`S-04`) now: increments **only** on `curation_instructions` writes, independent of `field_updated_at` LWW fields. | `1a` §5.1, §10.1; `data-model.md` §4.4 |
+| **A-29** | Fixed | Clarified env vars (`DEFAULT_POLL_INTERVAL_MINUTES`, `DEFAULT_BACKFILL_CAP`, `DEFAULT_EXPIRATION_DAYS`) seed `app_settings` only on initial migration `0001`; DB is authoritative thereafter and feed inserts read default poll interval from `app_settings`. | `1a` §4.3, §5.1, §10.1 |
+| **A-30** | Fixed | Added `db/sync_log.py`, `extract/client.py`, and `jobs/locks.py` to the ≥90% critical-coverage list and added a real-Postgres concurrent-writers test proving `sync_changes.seq` is gap-free in commit order. | `1a` §12, §12.1 |
+| **A-31** | Fixed | Replaced invalid `--remove-source-files=false` with `rsync -az --delete` (matching 14-day local retention on remote mirror), added `umask 077` for `0600` dump files, and added `deploy/systemd/smartrss-backup.{service,timer}` + cron example. | `1a` §3, §11.1 |
+| **A-32** | Fixed | Exempted `GET /api/v1/health` from `HostAllowListMiddleware` for internal compose healthchecks; moved `http://localhost:5173` CORS origin to `.env.dev.example`; removed `'cli'` from `devices.platform` to match `ubuntu\|android\|web`. | `1a` §3, §4.3, §5.1, §6.1, §10.1, §12.1 |
+| **A-33** | Fixed + **owner decision** | Added NAT64 (`64:ff9b::/96` unwrapped + `64:ff9b:1::/48` blocked) and 6to4 (`2002::/16` unwrapped via `ip.sixtofour`) to SSRF denylist + unit tests; documented hairpin NAT / host own global IP as accepted residual risk in §13 for owner decision. | `1a` §7.2, §12.1, §13 |
+
+### Deferred & Residual-Risk Items for Owner Decision
+| ID | Category | Proposed Disposition | Decision Needed from Owner |
+| :--- | :--- | :--- | :--- |
+| **A-14** | Accepted residual risk (`1a`) / Deferred (`1f`) | Accept shared `worker` network namespace for `trafilatura`/`lxml` HTML extraction in `1a`; require network isolation (`network_mode: none` container or `unshare --net`/seccomp) in **`1f`** before adding `pymupdf`. | Confirm `1a` acceptance + `1f` isolation gate. |
+| **A-15** *(revocations)* | Operational trade-off | Manual post-restore `smartrss devices list` + `revoke` checklist before starting `api` (§11.2 step 4). | Confirm manual checklist vs. adding an out-of-DB revocation file replayed automatically on restore. |
+| **A-15** *(client resync)* | Deferred (`1b`/`1c`) | Defer the paired-client resync + pending-outbox preservation drill step to **`1b`/`1c`** when sync endpoints and client outbox exist. | Confirm milestone split. |
+| **A-33** *(hairpin / own IP)* | Accepted residual risk | Accept hairpin NAT / host own global IPv6 as residual risk (no router port-forwarding in SmartRSS architecture; static `SSRF_BLOCKED_CIDRS` available). | Confirm residual risk acceptance vs. adding an optional startup self-IP discovery probe (`SSRF_BLOCKED_HOSTS_SELF`). |
