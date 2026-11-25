@@ -22,6 +22,12 @@ Process: [`docs/development-process.md` §7](../../../docs/development-process.m
    - every "is anything still running?" query (C2);
    - every bulk SQL statement (D1);
    - every shell script that handles credentials (S3).
+
+   In `1b` the yield came from:
+   - every write that sets a reference to a soft-deletable parent, on every entry path (C8);
+   - every lock-ordered pre-select followed by an `UPDATE` (C9);
+   - per-request worst-case CPU on the event loop (L3);
+   - concurrency tests that cannot fail (T6).
 6. **Test quality**:
    - Map each row of the design's test-matrix section to a test. Missing rows are findings.
    - Read the coverage `Missing` column for error, shutdown, and fallback paths in the worker and stage modules. Uncovered error handling is where bugs hide (`I-02`).

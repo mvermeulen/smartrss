@@ -41,7 +41,8 @@ Follow [docs/development-process.md](docs/development-process.md) on every chang
   - Use deterministic recorded fixtures for HTTP/RSS/PDF/`Ollama`/`llama.cpp` boundaries in the default suite; run `pytest -m live_llm` opt-in for model/prompt evaluation.
 - **Keep docs synchronized**: Update affected docs (`docs/design/*`, `docs/data-model.md`, `docs/architecture.md`, `docs/README.md`) in the **same commit** as code changes; add an ADR in `docs/decisions/` for significant architectural or trade-off decisions.
 - **Verify locally before finishing**: Run `make check` (linters, type checks, unit/integration tests, coverage gates) before reporting any task complete.
-- **Prove regression tests**: A fix is not done until its regression test is shown to **fail with the fix reverted** and the fixed lines appear covered in the coverage report; record that evidence in the review resolution or commit message.
+- **Prove regression tests**: A fix is not done until its regression test is shown to **fail with the fix reverted** (separately for **each** fixed path) and the fixed lines appear covered in the coverage report; record that evidence in the review resolution or commit message.
+- **Merging milestones**: One PR per milestone branch; merge with a **merge commit** (never squash or rebase, because review docs cite commit hashes), then delete the branch ([development-process.md §1](docs/development-process.md#1-core-development-workflow)).
 
 ## Roles & Review Gates
 Details, templates, and severity scale: [development-process.md §7](docs/development-process.md#7-review-gates); shared checklist: [docs/review-checklist.md](docs/review-checklist.md).

@@ -28,6 +28,8 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | C5 | **One clock.** Are times compared or computed with both the DB `now()` and the Python clock? | `I-21` | Use `sa.func.now() + make_interval(...)` for DB-side scheduling. |
 | C6 | **Request-scoped side effects.** Does a dependency or helper `commit()` a shared request session? | `I-24` | Use a separate short session for incidental writes. |
 | C7 | **Monotonic LWW timestamps across online & offline writers.** Can an online edit write a timestamp earlier than a future-clamped offline write? | `P-02` | Online LWW writes use the DB clock and `GREATEST(db_now, stored_ts + 1µs)` via a shared helper so field timestamps never move backward. |
+| C8 | **References to soft-deletable parents.** Does any write point a row at a soft-deletable parent (`feeds.category_id` → `categories`) without checking the parent is still active? The foreign key does not catch soft deletes. | `K-01`, `K-01-F1` (an offline move raced a category delete; OPML `default_category_id` was never validated) | Check against active parent rows locked `FOR SHARE` (`ORDER BY id ASC`) **before** locking or writing the child (§5.1 parent → child). Cover **every** entry path, including bulk import, defaults, and optional request fields. Return `422`, not a foreign-key `500`, for a missing parent. |
+| C9 | **Predicate re-evaluation after a pre-lock pass.** After candidate rows are locked in `id ASC` order, does the later `UPDATE` re-run the predicate instead of targeting the locked IDs? | `K-04` | Add `id = ANY(CAST(:locked_ids AS uuid[]))` to the `UPDATE` (keep the re-check of state and LWW). Rows that start matching late are skipped, not locked out of order. |
 
 ## 3. Long-running processes
 
@@ -35,7 +37,7 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | :--- | :--- | :--- | :--- |
 | L1 | **Loop survival.** Can one exception (DB blip, failed heartbeat) end a daemon task for good while the process stays "healthy"? | `I-02` | Catch and log `Exception` per iteration, then back off; re-raise only `CancelledError`; the supervisor exits non-zero if all workers die. |
 | L2 | **Signal handling.** Do batch and cron commands handle `SIGTERM` by releasing leases and locks? | `I-03` | `loop.add_signal_handler` → cancel tasks → release in `except CancelledError`. |
-| L3 | **Event-loop blocking.** Is CPU-heavy parsing or hashing run on the event loop? | `I-19` | `await asyncio.to_thread(...)` or a subprocess. |
+| L3 | **Event-loop blocking.** Is CPU-heavy parsing or hashing run on the event loop? "Bounded" input is not the same as cheap: work out the worst case **per request** (rows per page × per-row cap), then measure it. Are DB round trips issued once per row? | `I-19`, `K-03` (100 × 64 KB HTML strips took 1.4 s on the loop, plus 100 serial `ts_headline` queries; the approved design called the bounded slices fine) | `await asyncio.to_thread(...)` or a subprocess; pre-slice to what the output needs; batch per-row SQL (`unnest(...) WITH ORDINALITY`). |
 | L4 | **Unbounded in-memory growth.** Are there per-host or per-key dicts that never shrink? | `I-23` | Prune idle entries; cap size. |
 | L5 | **Pooled connection hygiene.** Can a session lock or a failed cleanup leak back into the pool? | `I-16` | `invalidate()` the connection on cleanup failure or cancellation. |
 | L6 | **Busy-wait polling.** Are there short sleep loops that hold locks for long durations? | `I-03` | Use an event, or a bounded wait with a deadline. |
@@ -49,6 +51,7 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | D3 | **Defaults on reactivate/upsert.** Does re-creating or reactivating a row overwrite user-set fields with request defaults? | `I-13` | Apply only fields in `model_fields_set`. |
 | D4 | **One field, one purpose.** Is a single column (a hash, a timestamp) used for two meanings? | `A-01` | Split into separate columns. |
 | D5 | **SQLAlchemy `text()` bind-cast syntax.** Does raw SQL use `:param::type`, which SQLAlchemy leaves unbound as literal text? | `P-07` | Always use `CAST(:param AS type)` or `sa.bindparam(..., type_=...)` / `sa.cast(...)`. |
+| D6 | **Canonical idempotency hashes.** Is a payload hash (idempotency key, dedupe hash) computed over a serialization that differs across equivalent encodings, such as time-zone offsets, UUID letter case, or number vs string? | `K-05` | Normalize before hashing: timestamps to UTC, UUIDs and typed values to canonical form. Unit-test equivalent encodings → identical hash. |
 
 ## 5. Input handling & encoding
 
@@ -62,8 +65,9 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 
 | # | Check | Origin | Correct pattern |
 | :--- | :--- | :--- | :--- |
-| T1 | **The regression test exercises the fix.** Does it fail with the fix reverted, and are the fixed lines covered? | `I-02` follow-up | Revert-the-fix check plus coverage of the fixed lines ([§2.3](development-process.md#23-regression-testing-policy-mandatory)). |
+| T1 | **The regression test exercises the fix, on every fixed path.** Does it fail with the fix reverted, and are the fixed lines covered? When a fix spans several paths, does each path have a test that fails when only that path is reverted? | `I-02` follow-up, `K-01-F1` | Revert-the-fix check, one path at a time, with the full suite, plus coverage of the fixed lines ([§2.3](development-process.md#23-regression-testing-policy-mandatory)). |
 | T2 | **Promised tests exist.** Every case in the design's test-matrix section has a test. | `I-07` | Map each design test-matrix row to a test name in the review. |
-| T3 | **Gates are enforced, not just documented.** Coverage thresholds and critical-module lists are checked by `make check`. | `I-08` | `scripts/check-critical-coverage.py`; `CRITICAL_MODULES` matches design §12. |
+| T3 | **Gates are enforced, not just documented.** Coverage thresholds and critical-module lists are checked by `make check`. | `I-08` | `scripts/check-critical-coverage.py`; `CRITICAL_MODULES` matches the critical-modules section of every approved component design (`1a` §12, `1b` §10.1). |
 | T4 | **Docs in the same commit.** Status headers, index rows (no duplicates), env-var comments, and deviations from the design are updated together with the code. | `I-09` follow-up | Grep for stale status and duplicate rows before committing. |
 | T5 | **Reproducible builds.** Do images install from the lockfile? | `I-17` | `uv export --frozen` / `uv sync --frozen`. |
+| T6 | **Concurrency tests that can fail.** Does a race or lock-order test actually force the interleaving, and would it fail if the invariant broke? Internal retry loops (`40P01`/`40001`) turn a real deadlock into a passing end state. | `K-02` (the `T01b` lock-order test passed 5/5 with the sort reversed) | Force the overlap (barriers or hook points), disable retries (`max_attempts=1`), and assert ordering directly (capture statement order with `before_cursor_execute`) rather than only end state. Prove it with the invariant broken. |

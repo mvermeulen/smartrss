@@ -21,8 +21,9 @@ Process reference: [`docs/development-process.md` §2.3 and §7](../../../docs/d
    2. Apply the fix.
    3. **Prove the test.** Temporarily revert or disable the fix, run *just that test*, and confirm it **fails for the expected reason**. Restore the fix and confirm it passes. A test that passes either way is not a regression test; rewrite it so it reaches the fixed code path.
    4. **Check coverage of the fix.** In the `pytest --cov-report=term-missing` output, the fixed lines must not appear as missing.
-   5. Apply the same guard on **every** path with the same shape. For example, if the fix adds a check on the success path, look for the error, `304`, and unexpected-exception paths too. (In `1a`, `I-04` was first fixed on all paths but one.)
-   6. If the finding reveals a new *class* of bug, add a row to `docs/review-checklist.md`.
+   5. Apply the same guard on **every** path with the same shape. For example, if the fix adds a check on the success path, look for the error, `304`, and unexpected-exception paths too. Also look for other *inputs* that write the same column, such as import defaults and optional request fields. (In `1a`, `I-04` was first fixed on all paths but one. In `1b`, `K-01` locked the OPML category load but never validated OPML's `default_category_id` → `K-01-F1`.)
+   6. **Every path you list as fixed needs its own proven test.** Revert only that path's guard and run the **full** suite; it must fail. Name the test for each path in the resolution. (In `1b`, removing the OPML lock claimed under `K-01` left all 165 tests green.)
+   7. If the finding reveals a new *class* of bug, add a row to `docs/review-checklist.md`.
 
 3. **Sync the docs** (same commit as the fixes): design-doc deviations, `data-model.md`, `architecture.md`, `.env*.example` comments, `README.md`.
 

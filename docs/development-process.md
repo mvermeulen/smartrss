@@ -16,6 +16,10 @@ SmartRSS follows a **spec-first, test-integrated, docs-synchronized** workflow:
 4. **Sync Documentation**: Update affected design docs, schemas, ADRs, and `AGENTS.md` in the **same change** as the code.
 5. **Small, Focused Commits**: Keep commits cohesive (feature + its tests + its doc updates together) with clear commit messages describing *why* as well as *what*.
 6. **Milestone Branches**: Implement each milestone on a `milestone/<id>` branch so reviews target a committed diff. Merge to `main` only after the owner sets `Implementation Approved` (§4.1, §7). Doc-only changes (designs, reviews, process) may go directly to `main`.
+7. **Milestone PRs & merge method**:
+   - **One PR per milestone.** It is opened from `milestone/<id>` (often when the design is approved) and carries the implementation too. Update its title and description at each gate so they describe what the PR actually contains.
+   - **Merge with a merge commit, never squash or rebase.** Review documents cite commit hashes as evidence, and squash or rebase merges rewrite them. *(`1b`: the review docs cite `070b82c`, `2e7aadb` and `fdb7d30`.)*
+   - After merging, fast-forward the local `main` and delete `milestone/<id>` locally and on the remote.
 
 ---
 
@@ -54,7 +58,8 @@ Testing is an integral part of every code change, not an optional verification s
   2. Apply the fix and verify the new test **passes** along with the existing suite.
   3. Name or comment the test clearly so future maintainers understand the failure mode it guards against.
   4. **Prove it** (required when the fix was written before the test, which is the usual case for review findings): temporarily revert or disable the fix, run the test, confirm it **fails for the expected reason**, restore the fix, and confirm it passes. Then check that the coverage report shows the fixed lines as covered. A test that passes with and without the fix does not count. *(`1a` lesson: the first `I-02` test failed a different code path and passed either way.)*
-  5. **Record the evidence** in the review resolution or commit message, e.g. ``I-02: test_i02_… — reverted slot `except Exception`, test failed (slot died); restored, passed; runner.py:659-667 covered``.
+  5. **One proof per fixed path.** When a fix touches several paths (sync push, online `POST`/`PATCH`, OPML import, CLI, error hooks), prove each path separately: revert only that path's guard and run the **full** suite. If the suite stays green, that path has no test. *(`1b` lesson: the `K-01` resolution listed the OPML import as fixed, but removing its lock left all 165 tests passing, and the unvalidated `default_category_id` sat right next to it → `K-01-F1`.)*
+  6. **Record the evidence** in the review resolution or commit message, e.g. ``I-02: test_i02_… — reverted slot `except Exception`, test failed (slot died); restored, passed; runner.py:659-667 covered``.
 - **Real-World Feed/Document Quirks**: Whenever a real RSS feed, webpage, PDF, or LLM response triggers an unexpected edge case, add a sanitized minimal fixture to the test suite as a permanent regression case.
 
 ### 2.4 Non-Negotiable Invariant Test Matrix
@@ -106,6 +111,14 @@ Documentation is a **first-class deliverable**, kept continuously synchronized w
   | `In Implementation Review` | Implementation review open | Implementer / reviewer |
   | `Implementation Approved` | Implementation review `Verified`; milestone done; next milestone's coding may start | **Project owner only** |
 
+- **Status locations to update together** (in the same commit as any milestone status change):
+  1. the component design header (`docs/design/<milestone>-*.md`);
+  2. its entry in [`docs/design/README.md`](design/README.md);
+  3. the "Component Designs" row in [`docs/README.md`](README.md);
+  4. the review's row in [`docs/README.md`](README.md), plus the review file's own `Status` header (and an owner-decision line on approval);
+  5. the `Current Phase` line in [`AGENTS.md`](../AGENTS.md).
+
+  *(`1b`: the design header still said "awaiting implementation review" after the review was written.)*
 - Agents never set `Approved` or `Implementation Approved` on their own initiative; they do so only when the owner explicitly says to, in the same commit that records it.
 
 ### 4.2 Docs-in-the-Same-Change Rule
@@ -139,7 +152,7 @@ Before marking any implementation task complete (or committing), verify:
 - [ ] Local verification (`make check` / coverage gates) passes cleanly.
 - [ ] Affected docs (`docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, `docs/design/*`, `docs/decisions/*`, `docs/README.md`) are updated in the same commit.
 - [ ] Any new convention, guardrail, or lesson learned from user feedback is reflected in `AGENTS.md`, `docs/development-process.md`, or `.agents/skills/`.
-- [ ] Each regression test has recorded "fails with the fix reverted" evidence (§2.3).
+- [ ] Each regression test has recorded "fails with the fix reverted" evidence, for **each** fixed path (§2.3).
 - [ ] Status changes appear in the doc header **and** the `docs/README.md` index, with no stale or duplicate rows.
 - [ ] For milestone completion: implementation review exists, is `Verified`, and residual risks are owner-accepted (§7).
 
@@ -147,7 +160,7 @@ Before marking any implementation task complete (or committing), verify:
 
 ## 7. Review Gates
 
-Reviews are a required, recorded part of every milestone, not an optional extra. In `1a`, the design review found 6 blockers that `Approved`-ready prose hid. The implementation review found a security blocker (`I-01`) after `make check` passed. Each verification pass then found that some "Addressed" claims were incomplete (`N-01`–`N-11`; the `I-02`/`I-04`/`I-18`/`I-09` follow-ups).
+Reviews are a required, recorded part of every milestone, not an optional extra. In `1a`, the design review found 6 blockers that `Approved`-ready prose hid. The implementation review found a security blocker (`I-01`) after `make check` passed. Each verification pass then found that some "Addressed" claims were incomplete (`N-01`–`N-11`; the `I-02`/`I-04`/`I-18`/`I-09` follow-ups). In `1b`, the verification pass found that one of the four paths claimed fixed for `K-01` had no test and an unvalidated sibling input (`K-01-F1`).
 
 ### 7.1 When reviews happen
 | Gate | Input | Must reach `Verified` before |
@@ -159,7 +172,7 @@ Reviews are a required, recorded part of every milestone, not an optional extra.
 ### 7.2 Review document format
 - **File**: `docs/reviews/YYYY-MM-DD-<scope>-<design|implementation>-review.md`. Add a row to the [docs/README.md](README.md) index with status `Open`, and update that same row afterwards (never add a second row).
 - **Header**: date, scope (paths plus base commit), specs checked against, reviewer (agent/model or person), and status.
-- **Finding IDs**: one letter prefix per review, unique across the repo (used so far: `R`, `Q`, `B`, `M`, `S`, `A`, `N`, `T`, `I`, `P`). Number findings sequentially and never renumber them.
+- **Finding IDs**: one letter prefix per review, unique across the repo (used so far: `R`, `Q`, `B`, `M`, `S`, `A`, `N`, `T`, `I`, `P`, `K`). Number findings sequentially and never renumber them.
 - **Severity**:
   | Severity | Meaning | Before approval |
   | :--- | :--- | :--- |
@@ -175,7 +188,7 @@ Reviews are a required, recorded part of every milestone, not an optional extra.
 - **Who does what**: the reviewer (**Claude Code**) writes the review (`Open`). The implementer (**Antigravity**) fixes the findings, records resolutions and evidence, and sets `Addressed`. The reviewer runs the verification pass and sets `Verified`. The project owner approves.
 - **Separate verification pass**: run by the reviewer in a fresh session, never by the agent that wrote the fixes. Check every finding, not a sample:
   - Re-read the fix.
-  - Re-run the revert-the-fix check for Blocker/Major regression tests.
+  - Re-run the revert-the-fix check for every finding that has a code fix (optional for Nits), one fixed path at a time, with the **full** suite (§2.3 step 5). *(`1b` had no Blockers or Majors, so a Blocker/Major-only rule would have reverted nothing. The Minor-level revert of `K-01`'s OPML path found `K-01-F1`.)*
   - Confirm that the fix's lines are covered.
   - Confirm that the docs and index rows are updated.
   - Run `make check`.
