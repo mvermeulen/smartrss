@@ -22,6 +22,7 @@ from smartrss.db.engine import build_engine, build_sessionmaker
 from smartrss.db.models import AppSettings, Device, SyncState
 from smartrss.db.sync_log import APP_SETTINGS_ENTITY_ID, SyncEvent, sync_log
 from smartrss.logging import configure_logging
+from smartrss.search.fts import reindex_all_items
 from smartrss.security.auth import create_pairing_code, revoke_device
 from smartrss.security.safe_http import SafeHttpClient, SSRFPolicy
 from smartrss.worker.runner import run_worker_daemon, run_worker_once
@@ -32,12 +33,14 @@ devices_app = typer.Typer(help="Device management commands", no_args_is_help=Tru
 worker_app = typer.Typer(help="Background worker commands", no_args_is_help=True)
 settings_app = typer.Typer(help="Database app_settings commands", no_args_is_help=True)
 db_app = typer.Typer(help="Database migration and operational commands", no_args_is_help=True)
+search_app = typer.Typer(help="Full-text search index commands", no_args_is_help=True)
 
 app.add_typer(pair_app, name="pair")
 app.add_typer(devices_app, name="devices")
 app.add_typer(worker_app, name="worker")
 app.add_typer(settings_app, name="settings")
 app.add_typer(db_app, name="db")
+app.add_typer(search_app, name="search")
 
 EX_CONFIG = 78
 
@@ -383,6 +386,29 @@ def db_rotate_epoch(
             await engine.dispose()
 
     asyncio.run(_run())
+
+
+@search_app.command("reindex")
+def search_reindex(
+    batch_size: int = typer.Option(500, "--batch-size", min=1, max=5000, help="Rows per commit"),
+) -> None:
+    """Rebuild items.search_vector across all archive items using configured FTS_LANGUAGE."""
+    cfg = get_settings()
+
+    async def _run() -> int:
+        engine = build_engine(cfg.database_url, strict_sync_guard=cfg.synclog_strict_guard)
+        factory = build_sessionmaker(engine, strict_sync_guard=cfg.synclog_strict_guard)
+        try:
+            return await reindex_all_items(
+                factory,
+                fts_language=cfg.fts_language,
+                batch_size=batch_size,
+            )
+        finally:
+            await engine.dispose()
+
+    count = asyncio.run(_run())
+    typer.echo(f"Reindexed {count} items using FTS_LANGUAGE={cfg.fts_language}.")
 
 
 if __name__ == "__main__":

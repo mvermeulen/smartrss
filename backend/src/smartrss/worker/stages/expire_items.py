@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -53,7 +52,6 @@ async def run_expire_items(
                 await session.commit()
                 break
 
-            now = datetime.now(UTC)
             batch_ids = list(ids)
 
             def _expire_events(_res: object, _ids: list[uuid.UUID] = batch_ids) -> list[SyncEvent]:
@@ -65,9 +63,9 @@ async def run_expire_items(
                 .where(Item.id.in_(batch_ids))
                 .values(
                     state="expired",
-                    expired_at=now,
-                    read_state_updated_at=now,
-                    updated_at=now,
+                    expired_at=sa.func.now(),
+                    read_state_updated_at=sa.func.now(),
+                    updated_at=sa.func.now(),
                 ),
                 _expire_events,
             )

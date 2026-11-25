@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce >= 90% branch+line coverage on every Milestone 1a critical core module (§12, I-08)."""
+"""Enforce >= 90% branch+line coverage on every critical core module (1a §12, 1b §10.1, I-08)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 CRITICAL_MODULES: tuple[str, ...] = (
+    # Milestone 1a
     "src/smartrss/db/sync_log.py",
     "src/smartrss/security/safe_http.py",
     "src/smartrss/security/auth.py",
@@ -20,6 +21,11 @@ CRITICAL_MODULES: tuple[str, ...] = (
     "src/smartrss/jobs/locks.py",
     "src/smartrss/worker/stages/poll_feed.py",
     "src/smartrss/worker/stages/expire_items.py",
+    # Milestone 1b
+    "src/smartrss/domain/sync_merge.py",
+    "src/smartrss/domain/fts_text.py",
+    "src/smartrss/sync/service.py",
+    "src/smartrss/search/fts.py",
 )
 
 MIN_CRITICAL_PCT = 90.0
