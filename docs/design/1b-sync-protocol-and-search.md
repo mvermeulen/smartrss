@@ -1,6 +1,6 @@
 # Component Design 1b: Server Sync Engine, Conflict Resolution & Full-Text Search
 
-> **Status:** In Design Review *(2026-11-25 — Claude Code review findings `P-01`–`P-17`, owner decisions `Q-1`–`Q-4`, and verification follow-up `P-11-F1` addressed; awaiting final verification)*
+> **Status:** **Approved** by project owner 2026-11-25 *(after [`1b` design review](../reviews/2026-11-25-1b-design-review.md): findings `P-01`–`P-17` and follow-up `P-11-F1` verified; owner decisions `Q-1`–`Q-4` and residual risks `RR-1`/`RR-2` accepted — see §12)*
 > **Milestone:** `1b` — Server Sync Engine, Conflict Resolution & Search ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-STATE-01`–`02` (sync/restore transitions), `FR-STATE-03` (bounded bulk read; cluster read in `1e`), `FR-STATE-04` (partial: full-text archive search over title/author/summary/body; enrichment TL;DR/takeaways/tags in `1d`), `FR-SYNC-01`–`04`, `NFR-SYNC-01`, `NFR-SYNC-02` (500-mutation `< 5s` flush), `NFR-SEC-01`, `NFR-SEC-03` (XSS-safe search snippets)
 > **Related ADRs:** [ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)
@@ -839,3 +839,11 @@ In accordance with [development-process.md §4.2](../development-process.md#42-d
 - `feeds` (§4.4 & §5.1): document granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys in `field_updated_at`, include `poll_interval_minutes` in synced feed fields, and note `last_fetched_at`/`last_success_at` as online-only.
 - `ADR 0004` / `data-model.md` §5.2: document the client 48-hour acknowledged replay journal on `epoch_mismatch`, epoch-pinning of scoped `item_mark_bulk_read` (`all`/`feed`/`category` require `epoch` and reject on `epoch_mismatch` so pre-restore bounds never mark unseen post-restore items read, while `scope='items'` and single-field mutations stay epoch-agnostic; `P-11-F1`), the `server_now` clock-drift signal + 90-day dead-RTC lower bound, and the two-tier `mark_bulk_read` semantics (`scope='items'` LWW vs. scoped `unread`-only carve-out).
 
+---
+
+## 12. Accepted Residual Risks (Owner Sign-Off 2026-11-25)
+
+| ID | Residual risk | Impact | Why accepted |
+| :--- | :--- | :--- | :--- |
+| **RR-1** | **Scoped bulk mark-read is arrival-order-dependent** (`P-01` / `Q-2`, §6.5 item 4). `scope IN ('all','feed','category')` touches only rows that are `unread` when the mutation is applied, so a concurrent offline `read → unread` (or `expired → unread`) on the same item can end `read` or `unread` depending on which device syncs first. | The server still holds one result that every device converges to. The only effect is an occasional single item with the "other" plausible read/unread label, recoverable from History or search. | A fully commutative version would have to lock and re-emit every already-`read` archive row in scope on each "Mark all read", causing large write and sync amplification. |
+| **RR-2** | **`expired` items are excluded from all bulk mark-read modes**, including `scope='items'` / `mark_cluster_read` (§6.5 item 4). They stay `expired` instead of becoming `read`, with the same order-dependence as RR-1 for a concurrent `expired → unread` restore. | Archive labeling only: expired items are not in the inbox and do not count as unread. Opening an expired item or marking that single item read still works. | Keeps the "never actually read" signal (useful for `1g` evaluation) and matches `data-model.md` §5.2 ("never marks expired"). |

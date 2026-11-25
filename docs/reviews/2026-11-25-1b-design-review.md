@@ -5,7 +5,7 @@
 - **Specs checked against**: `requirements.md`, `data-model.md`, `architecture.md`, ADRs `0002`, `0004`, `0006`, `development-process.md` §2.4 and §7, `review-checklist.md`, `1a-backend-ingestion-and-security.md`
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `P` (`P-01`–`P-17`)
-- **Status**: `Addressed (2026-11-25) — awaiting verification (follow-up P-11-F1 addressed)` (2026-11-25: 16 ✅, 1 ⚠️ → `P-11-F1`)
+- **Status**: `Verified (2026-11-25)` — all 17 findings resolved (incl. follow-up `P-11-F1`); owner accepted residual risks `RR-1`/`RR-2` (§11) and marked `1b` **`Approved`** on 2026-11-25
 
 ## Review outcome
 
@@ -401,3 +401,39 @@ This violates `FR-STATE-03` / `data-model.md` §5.2 ("never marks unseen items")
 ## 9. Follow-up Resolutions (2026-11-25)
 
 - **P-11-F1** — Fixed. Added required `epoch: UUID` to scoped `item_mark_bulk_read` (`all`/`feed`/`category`) and left `scope='items'` and single-field mutations epoch-agnostic (`1b` §2 `1b-D05`, §6.4 table, §6.5 item 4, §6.7 steps 1/3/4). On push, the server checks `mutation.epoch == sync_state.instance_epoch` (read without `FOR UPDATE` in step 1, preserving §5.1 lock ordering) and immediately returns `outcome = "rejected", reason = "epoch_mismatch", affected_count = None` with zero item updates on mismatch. Updated the normative `1c`/Phase 2 restore protocol (§6.2 step 5) so clients drop or rewrite old-epoch scoped bulk reads as chunked `scope='items'` over pre-restore known IDs before overwriting local state. Added the exact `W = 1000 → restore 900 → post-restore poll 901..950 → offline bulk read` regression to `1b-T09` and recorded the rule in §11 (`ADR 0004` / `data-model.md` §5.2 alignment).
+
+---
+
+## 10. Final verification pass — `P-11-F1` (2026-11-25)
+
+- **Verifier**: Claude Code (Claude Opus 5.5), commit `bc5bd08`.
+- **`make check`**: green. 131 passed; total coverage 88.42%; every critical module meets the ≥ 90% gate. Only docs changed.
+
+| Check | Evidence | Result |
+| :--- | :--- | :--- |
+| Root cause addressed, not just the example | §6.5 item 4: `epoch` is required for `all`/`feed`/`category`, and a mismatch is rejected with zero side effects. Old-epoch sequence bounds can no longer reach post-restore items, whatever the timing. | ✅ |
+| All paths guarded | Validation (§6.5 item 4), request schema (§6.4 table), push flow: step 1 reads the epoch without a lock, so §5.1 ordering holds; step 3 locks candidates only for epoch-matching mutations; step 4 rejects. Single-field mutations and `scope='items'` stay correctly epoch-agnostic, because they carry no sequence bound. | ✅ |
+| Client contract | §6.2 step 5: the client drops old-epoch scoped bulk reads or rewrites them as `scope='items'` over item IDs known pre-restore, before re-bootstrap overwrites local state. | ✅ |
+| Test planned | `1b-T09(b)` replays the exact scenario `W=1000 → restore 900 → 901..950 → offline "mark all read"` and asserts `epoch_mismatch` while sibling mutations still apply. | ✅ |
+| Docs synced | `1b-D05`, §11 (ADR 0004 / `data-model.md` §5.2 alignment), resolution §9. | ✅ |
+
+**Verdict**: `P-11-F1` ✅, so `P-11` ✅. All 17 findings are resolved.
+
+**Note carried to the `1c` design (non-blocking)**: when the client rewrites an old-epoch scoped bulk read as `scope='items'`, it must give the rewritten mutations **new** `client_mutation_id`s. Reusing the original ID with a different payload is rejected as `mutation_id_conflict` (`P-17` `payload_sha256`), which would roll back the user's action.
+
+### Residual risks for owner acceptance (needed at approval)
+1. **Scoped bulk mark-read is order-dependent** (`P-01` / `Q-2`, §6.5 item 4).
+2. **`expired` items are excluded from bulk mark-read**, including `scope='items'` (§6.5 item 4).
+
+### Status
+`Verified (2026-11-25)`. The design is ready for the owner's approval decision.
+
+---
+
+## 11. Owner Approval (2026-11-25)
+
+The project owner approved the `1b` component design and accepted both residual risks from §10, recorded as `RR-1` and `RR-2` in design §12:
+- **RR-1**: scoped bulk mark-read (`all`/`feed`/`category`) depends on arrival order.
+- **RR-2**: `expired` items are excluded from every bulk mark-read mode.
+
+`1b` implementation may now begin. Per design §11, the `data-model.md` / ADR 0004 alignments land in the same commit as the `1b` implementation.
