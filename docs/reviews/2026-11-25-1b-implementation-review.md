@@ -4,7 +4,7 @@
 - **Scope**: Committed branch `milestone/1b`, `main` (`c8aa6f7`) → `070b82c` (`feat(1b): implement sync engine, LWW conflict resolution, and PostgreSQL FTS search`). Covers migration `0002`, `sync/` (`schemas.py`, `service.py`), `domain/sync_merge.py`, `domain/fts_text.py`, `search/fts.py`, the new routes (`sync`, `search`, `settings`), changes to `feeds.py`, `categories.py`, `sync_log.py`, `poll_feed.py`, `extract_content.py`, `maintenance.py`, `cli.py` and `config.py`, all new tests, `scripts/check-critical-coverage.py`, and the doc updates. Checked against [`docs/design/1b-sync-protocol-and-search.md`](../design/1b-sync-protocol-and-search.md) (Approved), `data-model.md`, ADR `0004`, and [`review-checklist.md`](../review-checklist.md).
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `K-`
-- **Status**: `Addressed (2026-11-25) — awaiting verification (K-01-F1 addressed)`
+- **Status**: `Verified (2026-11-25)` — `1b` **Implementation Approved** by the project owner (2026-11-25)
 
 ## Review outcome
 
@@ -309,3 +309,34 @@ All verification-pass follow-ups (`K-01-F1`) and drift notes have been addressed
 - `mypy src` (`strict = true`): Success — no issues found in 53 source files
 - `pytest --cov=smartrss --cov-branch --cov-fail-under=80`: **167 passed in 19.84s**, total coverage **91.16%**
 - `scripts/check-critical-coverage.py`: **16/16** critical modules ≥ 90% (`sync_merge.py` 100.00%, `url_canon.py` 100.00%, `expiration.py` 100.00%, `locks.py` 100.00%, `search/fts.py` 99.03%, `fts_text.py` 97.64%, `backoff.py` 97.47%, `expire_items.py` 96.67%, `sync_log.py` 95.93%, `queue.py` 95.12%, `sync/service.py` 94.53%, `extract/client.py` 92.98%, `security/auth.py` 92.48%, `safe_http.py` 91.79%, `poll_feed.py` 91.57%, `security/middleware.py` 90.80%).
+
+---
+
+## Final verification pass (2026-11-25)
+
+- **Verifier**: Claude Code, against `fdb7d30` (`fix(1b): address verification follow-up K-01-F1`).
+- **Result**: `K-01-F1` ✅ resolved, so `K-01` is now ✅. All 7 findings and the 1 follow-up are resolved, with no open follow-ups. Status set to **`Verified (2026-11-25)`**.
+
+### `make check`
+
+Green on `fdb7d30`: ruff and mypy clean, **167 passed**, **91.14 %** total coverage, and **16/16** critical modules ≥ 90 %. The implementer recorded 91.16 %. The 0.02-point difference is normal run-to-run variation and does not affect any gate.
+
+### `K-01-F1`
+
+| Check | Result |
+| :--- | :--- |
+| Fix present | `import_opml_endpoint` builds `active_cat_ids` from the category rows locked `FOR SHARE` (`ORDER BY id ASC`). It rejects a missing or soft-deleted `default_category_id` with `422 "Category not found"` before any feed is created or reactivated (`feeds.py:174-179`). This is the root cause: the category is checked against locked rows, so the check cannot race a concurrent delete either. |
+| All paths | Every place that assigns `feeds.category_id` now validates the category against locked active rows: push step 3a, `POST /feeds` (new and existing-feed branches), `PATCH /feeds/{id}`, and the OPML `default_category_id` and per-outline category name. Per-outline categories are either locked existing rows or new rows that are not yet committed. `DELETE /categories` clears child feeds itself. |
+| Guard revert | `if False:` in place of the guard → `test_k01_f1_opml_rejects_deleted_and_nonexistent_default_category_id` **fails** (`:205`); restored → passes. |
+| Lock revert | `.with_for_update(read=True)` removed from the OPML category load → `test_k01_f1_opml_locks_categories_for_share_before_feed_writes` **fails** (`:271`); restored → passes. This closes the gap where the full suite stayed green with the lock removed. |
+| Coverage | `feeds.py:160-179` does not appear in `Missing` (`150-151` → `231-252`). |
+| Restore | Checked with `diff` against the scratchpad copy; `git status` clean. |
+| Docs | The `1b` design status header has the stale "awaiting Claude Code implementation review" wording removed, and the `docs/README.md` row is updated (no duplicates). |
+
+Minor wording slip with no impact: the resolution says the unsubscribed feed stays `is_subscribed=False`, but the test asserts `status == "unsubscribed"`, which is the correct field.
+
+### Residual risks
+
+None open. The two observations from the first verification pass (the 8 KB `lead_excerpt` pre-slice; `payload_sha256` changing before any deployment) need no action.
+
+**Owner decision (2026-11-25):** the project owner approved the Milestone `1b` implementation (`Implementation Approved`).

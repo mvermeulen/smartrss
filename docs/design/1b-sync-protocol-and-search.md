@@ -1,6 +1,6 @@
 # Component Design 1b: Server Sync Engine, Conflict Resolution & Full-Text Search
 
-> **Status:** **Implemented — In Implementation Review** *(Design approved 2026-11-25 after [`1b` design review](../reviews/2026-11-25-1b-design-review.md); implemented 2026-11-25 on branch `milestone/1b` — implementation review findings `K-01`–`K-07` and follow-up `K-01-F1` addressed; awaiting final verification)*
+> **Status:** **Implemented — Implementation Approved** *(Design approved 2026-11-25 after [`1b` design review](../reviews/2026-11-25-1b-design-review.md); implemented on branch `milestone/1b`; implementation approved by the project owner 2026-11-25 after the [`1b` implementation review](../reviews/2026-11-25-1b-implementation-review.md) (`K-01`–`K-07`, `K-01-F1` verified))*
 > **Milestone:** `1b` — Server Sync Engine, Conflict Resolution & Search ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-STATE-01`–`02` (sync/restore transitions), `FR-STATE-03` (bounded bulk read; cluster read in `1e`), `FR-STATE-04` (partial: full-text archive search over title/author/summary/body; enrichment TL;DR/takeaways/tags in `1d`), `FR-SYNC-01`–`04`, `NFR-SYNC-01`, `NFR-SYNC-02` (500-mutation `< 5s` flush), `NFR-SEC-01`, `NFR-SEC-03` (XSS-safe search snippets)
 > **Related ADRs:** [ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)

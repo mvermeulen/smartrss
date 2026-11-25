@@ -1,7 +1,7 @@
 # SmartRSS — Agent Rules & Project Guide
 
 ## Project Status
-> **Current Phase: Phase 1 Implementation (Milestone `1a` implemented & approved; `1b` implemented — in implementation review; `1c`–`1g` pending design approval)**
+> **Current Phase: Phase 1 Implementation (Milestone `1a` implemented & approved; `1b` implemented & approved; `1c`–`1g` pending design approval)**
 > Do **not** write application code for a milestone until the requirements, architecture, data model, ADRs, and that milestone's component design in `docs/` are marked **`Approved`** / **`Accepted`** by the project owner.
 
 ## Overview
