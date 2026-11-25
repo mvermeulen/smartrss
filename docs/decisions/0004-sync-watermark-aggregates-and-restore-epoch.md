@@ -20,7 +20,7 @@ The initial design allocated `sync_seq` using a PostgreSQL `SEQUENCE` (`nextval(
 3. **Bootstrap Snapshot, Cache Eviction & Restore `instance_epoch`**:
    - New clients (or clients requiring resync) call `GET /api/v1/sync/bootstrap`, receiving the active working set (all feeds, categories, active interest profile, app settings, all `unread` + `starred` items, and `read` items from the last 14 days) along with the exact `watermark` (`current_seq`) and `instance_epoch`.
    - Every `bootstrap` and `pull` response includes `instance_epoch`. On PostgreSQL backup restore (or DB re-init), the restore procedure rotates `instance_epoch` (and clients also detect `client_cursor > server_watermark`).
-   - If `instance_epoch` changes or cursor regresses, the client retains its local unsynced mutation outbox, re-bootstraps cleanly from the server, and then flushes the outbox idempotently.
+   - If `instance_epoch` changes or cursor regresses, the client retains both its local unsynced mutation outbox and a rolling **48-hour acknowledged replay journal**, re-bootstraps cleanly from the server, and then flushes epoch-agnostic mutations (`item_set_state`, `item_set_starred`, `feed_set_field`, `scope='items'`) idempotently so zero post-backup state is lost. Scoped bulk mark-read mutations (`all`/`feed`/`category`) carry `epoch` and are dropped or rewritten to `scope='items'` on restore (with server-side `epoch_mismatch` rejection as defense-in-depth so pre-restore `up_to_sync_seq` bounds never mark unseen post-restore items read).
    - Clients locally evict `read`/`expired` unstarred items older than 14 days (while ignoring incoming deltas for evicted out-of-window items unless the item transitions back to `unread` or `starred`).
 
 ## Consequences

@@ -17,7 +17,8 @@ from smartrss.api.schemas import (
     CategoryUpdateRequest,
 )
 from smartrss.db.models import Category, Device, Feed
-from smartrss.db.sync_log import SyncEvent, execute_synced, sync_log
+from smartrss.db.sync_log import SyncEvent, sync_log
+from smartrss.domain.sync_merge import compute_online_lww_timestamp, parse_field_timestamp
 
 router = APIRouter(prefix="/api/v1/categories", tags=["categories"])
 
@@ -124,33 +125,39 @@ async def delete_category(
     if cat is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
 
-    now = datetime.now(UTC)
-    now_iso = now.isoformat()
-    cat.deleted_at = now
-    cat.updated_at = now
+    db_now: datetime = (await session.execute(sa.select(sa.func.now()))).scalar_one()
+    cat.deleted_at = db_now
+    cat.updated_at = db_now
 
-    # Clear category_id and stamp field_updated_at['category_id'] = now on affected child feeds
-    stmt = (
-        sa.update(Feed)
-        .where(Feed.category_id == category_id)
-        .values(
-            category_id=None,
-            field_updated_at=sa.func.jsonb_set(
-                Feed.field_updated_at,
-                sa.text("'{category_id}'::text[]"),
-                sa.func.to_jsonb(sa.cast(now_iso, sa.Text())),
-                True,
-            ),
-            updated_at=now,
+    # Lock affected child feeds in id ASC order (§5.1) and stamp field_updated_at['category_id']
+    # monotonically using PostgreSQL now() (P-02, C5, C7).
+    child_feeds = (
+        (
+            await session.execute(
+                sa.select(Feed)
+                .where(Feed.category_id == category_id)
+                .order_by(Feed.id.asc())
+                .with_for_update()
+            )
         )
-        .returning(Feed.id)
+        .scalars()
+        .all()
     )
-    _, feed_events = await execute_synced(
-        session,
-        stmt,
-        lambda res: [SyncEvent("feed", fid, "upsert") for fid in res.scalars().all()],
-    )
+    feed_events: list[SyncEvent] = []
+    for feed in child_feeds:
+        field_ts = dict(feed.field_updated_at or {})
+        stored_ts = (
+            parse_field_timestamp(field_ts, "category_id", feed.created_at)
+            if "category_id" in field_ts
+            else None
+        )
+        field_ts["category_id"] = compute_online_lww_timestamp(db_now, stored_ts).isoformat()
+        feed.category_id = None
+        feed.field_updated_at = field_ts
+        feed.updated_at = db_now
+        feed_events.append(SyncEvent("feed", feed.id, "upsert"))
 
+    await session.flush()
     events = [SyncEvent("category", category_id, "delete"), *feed_events]
     await sync_log.record(session, events)
     await session.commit()

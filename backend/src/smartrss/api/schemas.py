@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -234,3 +234,75 @@ class SystemHealthResponse(BaseModel):
     queue_counts: dict[str, dict[str, int]]
     dead_letter_count: int
     recent_runs: list[PipelineRunResponse]
+
+
+class AppSettingsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    default_expiration_days: int
+    backfill_cap: int
+    default_poll_interval_minutes: int
+    updated_at: datetime
+
+
+class AppSettingsUpdateRequest(BaseModel):
+    default_expiration_days: int | None = Field(default=None, ge=0, le=3650)
+    backfill_cap: int | None = Field(default=None, ge=0, le=500)
+    default_poll_interval_minutes: int | None = Field(default=None, ge=5, le=10080)
+
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self) -> AppSettingsUpdateRequest:
+        for field_name in self.model_fields_set:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} cannot be null")
+        return self
+
+
+class SnippetFragmentDTO(BaseModel):
+    text: str
+    highlight: bool
+
+
+class SearchItemDTO(BaseModel):
+    """Slim archive search item DTO omitting raw_summary/summary_truncated (P-08)."""
+
+    id: uuid.UUID
+    feed_id: uuid.UUID
+    cluster_id: uuid.UUID | None = None
+    raw_url: str
+    canonical_url: str
+    title: str
+    author: str | None
+    published_at: datetime | None
+    fetched_at: datetime
+    lead_excerpt: str | None
+    extraction_status: str
+    state: str
+    is_starred: bool
+    read_at: datetime | None
+    starred_at: datetime | None
+    expired_at: datetime | None
+    unexpired_at: datetime | None
+    read_state_updated_at: datetime
+    starred_updated_at: datetime
+    ingest_sync_seq: int
+    enrichment: Any | None = None
+    tags: list[str] = Field(default_factory=list)
+    research_sources: list[Any] = Field(default_factory=list)
+    user_feedback: Any | None = None
+    updated_at: datetime
+
+
+class SearchResultDTO(BaseModel):
+    item: SearchItemDTO
+    rank: float | None
+    snippet: list[list[SnippetFragmentDTO]]
+
+
+class SearchResponse(BaseModel):
+    query: str | None
+    sort: Literal["relevance", "newest"]
+    total: int
+    limit: int
+    offset: int
+    results: list[SearchResultDTO]

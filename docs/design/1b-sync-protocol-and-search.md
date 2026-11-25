@@ -1,6 +1,6 @@
 # Component Design 1b: Server Sync Engine, Conflict Resolution & Full-Text Search
 
-> **Status:** **Approved** by project owner 2026-11-25 *(after [`1b` design review](../reviews/2026-11-25-1b-design-review.md): findings `P-01`–`P-17` and follow-up `P-11-F1` verified; owner decisions `Q-1`–`Q-4` and residual risks `RR-1`/`RR-2` accepted — see §12)*
+> **Status:** **Implemented — In Implementation Review** *(Design approved 2026-11-25 after [`1b` design review](../reviews/2026-11-25-1b-design-review.md); implemented 2026-11-25 on branch `milestone/1b` — awaiting Claude Code implementation review)*
 > **Milestone:** `1b` — Server Sync Engine, Conflict Resolution & Search ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-STATE-01`–`02` (sync/restore transitions), `FR-STATE-03` (bounded bulk read; cluster read in `1e`), `FR-STATE-04` (partial: full-text archive search over title/author/summary/body; enrichment TL;DR/takeaways/tags in `1d`), `FR-SYNC-01`–`04`, `NFR-SYNC-01`, `NFR-SYNC-02` (500-mutation `< 5s` flush), `NFR-SEC-01`, `NFR-SEC-03` (XSS-safe search snippets)
 > **Related ADRs:** [ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)
@@ -830,14 +830,19 @@ Add the following `1b` modules to `CRITICAL_MODULES` in [`scripts/check-critical
 
 ---
 
-## 11. Planned High-Level Doc Alignments (Upon `1b` Approval / Implementation)
+## 11. High-Level Doc Alignments & Implementation Notes
 
-In accordance with [development-process.md §4.2](../development-process.md#42-docs-in-the-same-change-rule), the following minor refinements will be reflected in [docs/data-model.md](../data-model.md) in the same commit as `1b` approval/implementation:
-- `sync_state` (§4.2): add `pruned_through_seq BIGINT NOT NULL DEFAULT 0`.
-- `items` (§4.5): add `ingest_sync_seq BIGINT NOT NULL DEFAULT 0`.
-- `sync_mutations` (§4.9): mark `entity_id` nullable (for `scope='all'` / `scope='items'` bulk mark-read), add `payload_sha256 TEXT NOT NULL`, and add `affected_count INT NULL`.
-- `feeds` (§4.4 & §5.1): document granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys in `field_updated_at`, include `poll_interval_minutes` in synced feed fields, and note `last_fetched_at`/`last_success_at` as online-only.
-- `ADR 0004` / `data-model.md` §5.2: document the client 48-hour acknowledged replay journal on `epoch_mismatch`, epoch-pinning of scoped `item_mark_bulk_read` (`all`/`feed`/`category` require `epoch` and reject on `epoch_mismatch` so pre-restore bounds never mark unseen post-restore items read, while `scope='items'` and single-field mutations stay epoch-agnostic; `P-11-F1`), the `server_now` clock-drift signal + 90-day dead-RTC lower bound, and the two-tier `mark_bulk_read` semantics (`scope='items'` LWW vs. scoped `unread`-only carve-out).
+In accordance with [development-process.md §4.2](../development-process.md#42-docs-in-the-same-change-rule), all refinements below have been reflected in [docs/data-model.md](../data-model.md) and [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md) in the `1b` implementation commit:
+- `sync_state` (§4.2): added `pruned_through_seq BIGINT NOT NULL DEFAULT 0`.
+- `items` (§4.5): added `ingest_sync_seq BIGINT NOT NULL DEFAULT 0`.
+- `sync_mutations` (§4.9): marked `entity_id` nullable (for `scope='all'` / `scope='items'` bulk mark-read), added `payload_sha256 TEXT NOT NULL`, and added `affected_count INT NULL`.
+- `feeds` (§4.4 & §5.1): documented granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys in `field_updated_at`, included `poll_interval_minutes` in synced feed fields, and noted `last_fetched_at`/`last_success_at` as online-only.
+- `ADR 0004` / `data-model.md` §5.2: documented the client 48-hour acknowledged replay journal on `epoch_mismatch`, epoch-pinning of scoped `item_mark_bulk_read` (`all`/`feed`/`category` require `epoch` and reject on `epoch_mismatch` so pre-restore bounds never mark unseen post-restore items read, while `scope='items'` and single-field mutations stay epoch-agnostic; `P-11-F1`), the `server_now` clock-drift signal + 90-day dead-RTC lower bound, and the two-tier `mark_bulk_read` semantics (`scope='items'` LWW vs. scoped `unread`-only carve-out).
+
+### Minor Implementation Notes (Deviations Recorded)
+- **Alembic revision ID length**: Alembic's default `alembic_version.version_num` column is `VARCHAR(32)`. Migration file `0002_milestone_1b_sync_and_search.py` therefore uses `revision = "0002_milestone_1b_sync_search"` (29 chars).
+- **`DELETE /api/v1/categories/{id}` lock order**: Locks affected child `feeds` via `SELECT ... ORDER BY id ASC FOR UPDATE` (honoring §5.1) and stamps `field_updated_at['category_id']` via the shared `compute_online_lww_timestamp()` helper rather than an unordered Core `UPDATE ... jsonb_set`.
+- **`SyncLogWriter.record()` `clock_timestamp()`**: Reads `sa.func.clock_timestamp()` in the same `SELECT current_seq ... FOR UPDATE` round-trip and passes that monotonic timestamp to `sync_state.updated_at` and all `sync_changes.changed_at` rows inserted in the batch (compatible with SQLAlchemy Core bulk `INSERT` parameter binding).
 
 ---
 

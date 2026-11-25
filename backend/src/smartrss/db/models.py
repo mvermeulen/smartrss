@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.0 ORM models for Milestone 1a."""
+"""SQLAlchemy 2.0 ORM models for Milestones 1a–1b."""
 
 from __future__ import annotations
 
@@ -64,6 +64,7 @@ class SyncState(Base):
 
     id: Mapped[int] = mapped_column(sa.SmallInteger(), primary_key=True)
     current_seq: Mapped[int] = mapped_column(sa.BigInteger(), nullable=False, default=0)
+    pruned_through_seq: Mapped[int] = mapped_column(sa.BigInteger(), nullable=False, default=0)
     instance_epoch: Mapped[uuid.UUID] = mapped_column(
         postgresql.UUID(as_uuid=True), nullable=False, default=uuid.uuid4
     )
@@ -82,6 +83,33 @@ class SyncChange(Base):
     changed_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
     )
+
+
+class SyncMutation(Base):
+    __tablename__ = "sync_mutations"
+
+    client_mutation_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True), primary_key=True
+    )
+    device_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True), sa.ForeignKey("devices.id"), nullable=False
+    )
+    mutation_type: Mapped[str] = mapped_column(sa.Text(), nullable=False)
+    entity_type: Mapped[str] = mapped_column(sa.Text(), nullable=False)
+    entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        postgresql.UUID(as_uuid=True), nullable=True
+    )
+    payload_sha256: Mapped[str] = mapped_column(sa.Text(), nullable=False)
+    client_timestamp: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    effective_timestamp: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    server_applied_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+    outcome: Mapped[str] = mapped_column(sa.Text(), nullable=False)
+    rejection_reason: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    affected_count: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
 
 
 class Category(Base):
@@ -185,6 +213,8 @@ class Item(Base):
     )
     starred_updated_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
     unexpired_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    ingest_sync_seq: Mapped[int] = mapped_column(sa.BigInteger(), nullable=False, default=0)
+    search_vector: Mapped[Any | None] = mapped_column(postgresql.TSVECTOR(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
     )

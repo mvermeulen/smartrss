@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
@@ -22,11 +22,51 @@ from smartrss.api.schemas import (
 from smartrss.db.models import DEFAULT_RESEARCH_POLICY, AppSettings, Category, Device, Feed
 from smartrss.db.sync_log import SyncEvent, sync_log
 from smartrss.domain.opml import OpmlParseError, OpmlSubscription, export_opml, parse_opml
+from smartrss.domain.sync_merge import (
+    apply_feed_status_transition,
+    compute_online_lww_timestamp,
+    parse_field_timestamp,
+)
 from smartrss.domain.url_canon import canonicalize_url, default_title_from_url
 from smartrss.jobs.queue import enqueue_job
 from smartrss.security.safe_http import SafeHttpError, SSRFPolicy
 
 router = APIRouter(prefix="/api/v1/feeds", tags=["feeds"])
+
+
+def _stamp_online_lww(
+    field_ts: dict[str, str],
+    field: str,
+    db_now: datetime,
+    fallback: datetime,
+) -> None:
+    """Stamp an LWW field monotonically using DB clock (P-02, C5, C7)."""
+    stored_ts = parse_field_timestamp(field_ts, field, fallback) if field_ts else None
+    if field not in field_ts and not (
+        field.startswith("research_policy.") and "research_policy" in field_ts
+    ):
+        stored_ts = None
+    field_ts[field] = compute_online_lww_timestamp(db_now, stored_ts).isoformat()
+
+
+def _stamp_research_policy_fields(
+    field_ts: dict[str, str],
+    old_rp: dict[str, Any] | None,
+    new_rp: dict[str, Any],
+    db_now: datetime,
+    fallback: datetime,
+) -> None:
+    """Stamp granular research_policy.* LWW keys on online updates (S-04, P-02)."""
+    prev = old_rp or {}
+    for subkey in ("enabled", "fetch_pdfs"):
+        if prev.get(subkey) != new_rp.get(subkey) or f"research_policy.{subkey}" not in field_ts:
+            _stamp_online_lww(field_ts, f"research_policy.{subkey}", db_now, fallback)
+    if (
+        prev.get("guidance") != new_rp.get("guidance")
+        or prev.get("max_hops") != new_rp.get("max_hops")
+        or "research_policy" not in field_ts
+    ):
+        _stamp_online_lww(field_ts, "research_policy", db_now, fallback)
 
 
 def _sanitize_site_url(raw: str | None) -> str | None:
@@ -113,7 +153,7 @@ async def import_opml_endpoint(
             detail=str(exc),
         ) from exc
 
-    now = datetime.now(UTC)
+    now: datetime = (await session.execute(sa.select(sa.func.now()))).scalar_one()
     now_iso = now.isoformat()
     default_poll = await _get_default_poll_interval(session)
 
@@ -179,23 +219,16 @@ async def import_opml_endpoint(
                 skipped_duplicates += 1
                 continue
 
-            # Reactivate unsubscribed feed
+            # Reactivate unsubscribed feed using shared transition & monotonic LWW stamps
             updated_fields = dict(existing.field_updated_at or {})
-            updated_fields["status"] = now_iso
-            existing.status = "active"
-            existing.health_state = "healthy"
-            existing.consecutive_errors = 0
-            existing.last_error = None
-            existing.etag = None
-            existing.last_modified = None
-            existing.next_fetch_at = now
-            existing.initial_backfill_done = False
+            apply_feed_status_transition(existing, "active", now)
+            _stamp_online_lww(updated_fields, "status", now, existing.created_at)
             if sub.title:
                 existing.title = sub.title
-                updated_fields["title"] = now_iso
+                _stamp_online_lww(updated_fields, "title", now, existing.created_at)
             if category_id is not None:
                 existing.category_id = category_id
-                updated_fields["category_id"] = now_iso
+                _stamp_online_lww(updated_fields, "category_id", now, existing.created_at)
             if safe_site_url:
                 existing.site_url = safe_site_url
             existing.field_updated_at = updated_fields
@@ -321,7 +354,7 @@ async def create_feed(
                 detail="Category not found",
             )
 
-    now = datetime.now(UTC)
+    now: datetime = (await session.execute(sa.select(sa.func.now()))).scalar_one()
     now_iso = now.isoformat()
     user_title = body.title.strip() if body.title and body.title.strip() else None
 
@@ -336,33 +369,29 @@ async def create_feed(
                 detail="Feed URL is already subscribed",
             )
         field_ts = dict(existing.field_updated_at or {})
-        field_ts["status"] = now_iso
-        existing.status = "active"
-        existing.health_state = "healthy"
-        existing.consecutive_errors = 0
-        existing.last_error = None
-        existing.etag = None
-        existing.last_modified = None
-        existing.next_fetch_at = now
-        existing.initial_backfill_done = False
+        apply_feed_status_transition(existing, "active", now)
+        _stamp_online_lww(field_ts, "status", now, existing.created_at)
         if user_title is not None:
             existing.title = user_title
-            field_ts["title"] = now_iso
+            _stamp_online_lww(field_ts, "title", now, existing.created_at)
         if body.category_id is not None:
             existing.category_id = body.category_id
-            field_ts["category_id"] = now_iso
+            _stamp_online_lww(field_ts, "category_id", now, existing.created_at)
         if body.poll_interval_minutes is not None:
             existing.poll_interval_minutes = body.poll_interval_minutes
-            field_ts["poll_interval_minutes"] = now_iso
+            _stamp_online_lww(field_ts, "poll_interval_minutes", now, existing.created_at)
         if body.expiration_days_override is not None:
             existing.expiration_days_override = body.expiration_days_override
-            field_ts["expiration_days_override"] = now_iso
+            _stamp_online_lww(field_ts, "expiration_days_override", now, existing.created_at)
         if "fetch_full_text" in body.model_fields_set:
             existing.fetch_full_text = body.fetch_full_text
-            field_ts["fetch_full_text"] = now_iso
+            _stamp_online_lww(field_ts, "fetch_full_text", now, existing.created_at)
         if body.research_policy is not None:
-            existing.research_policy = body.research_policy.model_dump()
-            field_ts["research_policy"] = now_iso
+            new_rp = body.research_policy.model_dump()
+            _stamp_research_policy_fields(
+                field_ts, existing.research_policy, new_rp, now, existing.created_at
+            )
+            existing.research_policy = new_rp
         if (
             body.curation_instructions
             and body.curation_instructions != existing.curation_instructions
@@ -448,8 +477,7 @@ async def update_feed(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
 
     fields_set = body.model_fields_set
-    now = datetime.now(UTC)
-    now_iso = now.isoformat()
+    now: datetime = (await session.execute(sa.select(sa.func.now()))).scalar_one()
     field_ts: dict[str, str] = dict(feed.field_updated_at or {})
     trigger_poll = False
 
@@ -502,7 +530,7 @@ async def update_feed(
             feed.last_error = None
             feed.next_fetch_at = now
             feed.initial_backfill_done = False
-            field_ts["feed_url"] = now_iso
+            _stamp_online_lww(field_ts, "feed_url", now, feed.created_at)
             trigger_poll = True
 
     if "category_id" in fields_set:
@@ -520,32 +548,33 @@ async def update_feed(
                     detail="Category not found",
                 )
         feed.category_id = body.category_id
-        field_ts["category_id"] = now_iso
+        _stamp_online_lww(field_ts, "category_id", now, feed.created_at)
 
     if "title" in fields_set and body.title is not None:
         feed.title = body.title.strip()
-        field_ts["title"] = now_iso
+        _stamp_online_lww(field_ts, "title", now, feed.created_at)
 
     if "status" in fields_set and body.status is not None:
-        feed.status = body.status
-        field_ts["status"] = now_iso
+        if apply_feed_status_transition(feed, body.status, now):
+            trigger_poll = True
+        _stamp_online_lww(field_ts, "status", now, feed.created_at)
 
     if "poll_interval_minutes" in fields_set and body.poll_interval_minutes is not None:
         feed.poll_interval_minutes = body.poll_interval_minutes
-        field_ts["poll_interval_minutes"] = now_iso
+        _stamp_online_lww(field_ts, "poll_interval_minutes", now, feed.created_at)
 
     if "expiration_days_override" in fields_set:
         feed.expiration_days_override = body.expiration_days_override
-        field_ts["expiration_days_override"] = now_iso
+        _stamp_online_lww(field_ts, "expiration_days_override", now, feed.created_at)
 
     if "fetch_full_text" in fields_set and body.fetch_full_text is not None:
         feed.fetch_full_text = body.fetch_full_text
-        field_ts["fetch_full_text"] = now_iso
+        _stamp_online_lww(field_ts, "fetch_full_text", now, feed.created_at)
 
     if "research_policy" in fields_set and body.research_policy is not None:
         rp_dict: dict[str, Any] = body.research_policy.model_dump()
+        _stamp_research_policy_fields(field_ts, feed.research_policy, rp_dict, now, feed.created_at)
         feed.research_policy = rp_dict
-        field_ts["research_policy"] = now_iso
 
     feed.field_updated_at = field_ts
     feed.updated_at = now

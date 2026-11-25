@@ -13,10 +13,12 @@ import httpx
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from smartrss.config import get_settings
 from smartrss.db.models import Feed, Item
 from smartrss.db.sync_log import SyncEvent, execute_synced, sync_log
 from smartrss.domain.url_canon import compute_text_hash
 from smartrss.extract.client import extract_html_isolated
+from smartrss.search.fts import rebuild_item_search_vector
 from smartrss.security.safe_http import (
     DomainRateLimiter,
     ResponseTooLargeError,
@@ -89,6 +91,22 @@ async def _set_extraction_status(
         sa.update(Item).where(Item.id == item_id).values(**values),
         lambda _res: [SyncEvent("item", item_id, "upsert")],
     )
+    if extraction_status == "ok" and extracted_text is not None:
+        item_meta = (
+            await session.execute(
+                sa.select(Item.title, Item.author, Item.raw_summary).where(Item.id == item_id)
+            )
+        ).one_or_none()
+        if item_meta is not None:
+            await rebuild_item_search_vector(
+                session,
+                item_id=item_id,
+                title=item_meta.title,
+                author=item_meta.author,
+                raw_summary=item_meta.raw_summary,
+                extracted_text=extracted_text,
+                fts_language=get_settings().fts_language,
+            )
     await sync_log.record(session, events)
 
 

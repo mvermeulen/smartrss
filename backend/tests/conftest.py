@@ -88,14 +88,15 @@ async def _clean_db_for_integration(
         async with engine.begin() as conn:
             await conn.execute(
                 sa.text(
-                    "TRUNCATE TABLE stage_metrics, jobs, pipeline_runs, items, feeds, "
-                    "categories, sync_changes, pairing_codes, devices RESTART IDENTITY CASCADE"
+                    "TRUNCATE TABLE stage_metrics, jobs, pipeline_runs, sync_mutations, items, "
+                    "feeds, categories, sync_changes, pairing_codes, devices "
+                    "RESTART IDENTITY CASCADE"
                 )
             )
             await conn.execute(
                 sa.text(
-                    "UPDATE sync_state SET current_seq = 0, instance_epoch = gen_random_uuid(), "
-                    "updated_at = now() WHERE id = 1"
+                    "UPDATE sync_state SET current_seq = 0, pruned_through_seq = 0, "
+                    "instance_epoch = gen_random_uuid(), updated_at = now() WHERE id = 1"
                 )
             )
             await conn.execute(

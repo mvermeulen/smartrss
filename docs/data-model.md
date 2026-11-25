@@ -113,7 +113,7 @@ stateDiagram-v2
 - `pairing_codes`: `id (UUID PK)`, `code_hash (TEXT UNIQUE NOT NULL)`, `device_name (TEXT)`, `expires_at (TIMESTAMPTZ NOT NULL)`, `consumed_at (TIMESTAMPTZ NULL)`, `created_by_device_id (UUID NULL)`.
 
 ### 4.2 `sync_state` & `sync_changes`
-- `sync_state`: Single row (`id SMALLINT PK CHECK (id = 1)`), `current_seq BIGINT NOT NULL DEFAULT 0`, `instance_epoch UUID NOT NULL`, `updated_at TIMESTAMPTZ`.
+- `sync_state`: Single row (`id SMALLINT PK CHECK (id = 1)`), `current_seq BIGINT NOT NULL DEFAULT 0`, `pruned_through_seq BIGINT NOT NULL DEFAULT 0` (`CHECK >= 0`; exact contiguous retention boundary for `cursor_pruned`), `instance_epoch UUID NOT NULL`, `updated_at TIMESTAMPTZ`.
 - `sync_changes`:
   - `seq BIGINT PK` (allocated under `SELECT ... FROM sync_state WHERE id = 1 FOR UPDATE` at transaction end—see [ADR 0004](decisions/0004-sync-watermark-aggregates-and-restore-epoch.md))
   - `entity_type TEXT NOT NULL` (`category`, `feed`, `item`, `cluster`, `interest_profile`, `app_settings`)
@@ -154,7 +154,7 @@ stateDiagram-v2
 | `fetch_full_text` | `BOOLEAN` (DEFAULT TRUE) | |
 | `research_policy` | `JSONB` | `{enabled, fetch_pdfs, guidance, max_hops}` |
 | `curation_instructions` | `TEXT` | Standing per-feed natural-language LLM directives (e.g., *"look for topic X"*, *"skip weekly roundups"*); online-only optimistic-versioned edit (`config_version`) |
-| `field_updated_at` | `JSONB` (NOT NULL DEFAULT `'{}'`) | Per-field LWW timestamps (`status`, `category_id`, `title`, `expiration_days_override`, `research_policy.fetch_pdfs`, etc.) |
+| `field_updated_at` | `JSONB` (NOT NULL DEFAULT `'{}'`) | Per-field LWW timestamps (`status`, `category_id`, `title`, `expiration_days_override`, `poll_interval_minutes`, granular `research_policy.enabled` and `research_policy.fetch_pdfs`, etc.) |
 | `config_version` | `INT` (DEFAULT 1) | Optimistic concurrency token; increments **only** on `curation_instructions` writes (independent of `field_updated_at` LWW fields) |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | |
 
@@ -182,6 +182,7 @@ stateDiagram-v2
 | `read_state_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `state` (initialized to `fetched_at` on insert) |
 | `starred_updated_at` | `TIMESTAMPTZ` (NOT NULL) | Independent LWW timestamp for `is_starred` (initialized to `fetched_at` on insert) |
 | `unexpired_at` | `TIMESTAMPTZ` (NULL) | Set if user restores an `expired` item to `unread` |
+| `ingest_sync_seq` | `BIGINT` (NOT NULL DEFAULT 0) | Commit-ordered `sync_changes.seq` allocated at initial ingest (`poll_feed`); indexed for pruning-proof bounded `mark_bulk_read` |
 | `search_vector` | `TSVECTOR` (GIN indexed) | Rebuilt in application code on item/enrichment/tag update; configurable language (`english`); `extracted_text` sliced to first 64 KB (well under Postgres 1 MB limit) |
 
 ### 4.6 `item_enrichments`
@@ -228,7 +229,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 - **`prompt_configs`**: `id`, `name` (`enrichment_system`, `enrichment_user`, `mini_research`, etc.), `version (INT)`, `origin` (`default` | `user`), `default_revision (TEXT NULL)`, `template_text`, `model_override`, `is_active`, `notes`, `created_at`.
   - **Seeding & Upgrades**: Shipped prompt templates live in repo files and are seeded on startup with `origin = 'default'`. User edits create a new active row with `origin = 'user'`; future app upgrades add new `origin = 'default'` revisions without overwriting an active `origin = 'user'` prompt (surfacing an optional "View updated default" diff in the UI).
 - **`interest_profiles`**: `id`, `version (INT)`, `profile_markdown`, `is_active`, `created_at`. Online-only edit with optimistic `version` check.
-- **`sync_mutations`**: `client_mutation_id (UUID PK)`, `device_id (UUID FK → devices.id)`, `mutation_type`, `entity_type`, `entity_id`, `client_timestamp`, `effective_timestamp`, `server_applied_at`, `outcome` (`applied`, `superseded`, `rejected`), `rejection_reason (TEXT NULL)`. Pruned after 90 days.
+- **`sync_mutations`**: `client_mutation_id (UUID PK)`, `device_id (UUID FK → devices.id)`, `mutation_type`, `entity_type`, `entity_id (UUID NULL)`, `payload_sha256 (TEXT NOT NULL)`, `client_timestamp`, `effective_timestamp`, `server_applied_at`, `outcome` (`applied`, `superseded`, `rejected`), `rejection_reason (TEXT NULL)`, `affected_count (INT NULL)`. Pruned after 90 days.
 - **`jobs`**:
   - `id (BIGSERIAL PK)`, `job_type`, `dedupe_key (TEXT NOT NULL)`, `payload (JSONB)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `priority (SMALLINT DEFAULT 50)`, `status` (`queued`, `running`, `done`, `failed`), `attempts (INT DEFAULT 0)`, `max_attempts (INT DEFAULT 5)`, `run_after (TIMESTAMPTZ DEFAULT now())`, `locked_by (TEXT NULL)`, `locked_at (TIMESTAMPTZ NULL)`, `started_at (TIMESTAMPTZ NULL)`, `lease_expires_at (TIMESTAMPTZ NULL)`, `heartbeat_at (TIMESTAMPTZ NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `queue_wait_ms (INT NULL)`, `duration_ms (INT NULL)`, `last_error (TEXT NULL)`, `created_at`, `updated_at`.
   - **Dedupe index**: `CREATE UNIQUE INDEX uq_jobs_active_dedupe ON jobs (job_type, dedupe_key) WHERE status IN ('queued', 'running')`.
@@ -251,7 +252,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 | Entity (`sync_changes.entity_type`) | Synced Representation | Change Signal (`upsert`) | Removal Signal (`delete`) |
 | :--- | :--- | :--- | :--- |
 | `category` | Category row (`id`, `name`, `sort_order`) | Insert/update emits `category` `upsert` | Soft-delete (`deleted_at`) emits `category` `delete` |
-| `feed` | Feed row + `status`, `health_state`, `expiration_days_override`, `research_policy`, `curation_instructions`, **embedded `active_feed_instructions[]`** (active non-archived `feed_instruction` notes), `config_version`, `field_updated_at` | Poll health change, config edit, or feed instruction add/archive emits `feed` `upsert` | Never hard-deleted (unsubscribe emits `feed` `upsert` with `status='unsubscribed'`) |
+| `feed` | Feed row + `status`, `health_state`, `poll_interval_minutes`, `expiration_days_override`, `research_policy`, `curation_instructions`, **embedded `active_feed_instructions[]`** (active non-archived `feed_instruction` notes), `config_version`, `field_updated_at` *(omits online-only `last_fetched_at`/`last_success_at`)* | Poll health change, config edit, or feed instruction add/archive emits `feed` `upsert` | Never hard-deleted (unsubscribe emits `feed` `upsert` with `status='unsubscribed'`) |
 | `cluster` | Cluster row (`id`, `representative_item_id`, `title`, `max_relevance_tier`, `item_count`, `last_seen_at`) | Cluster creation/member/title/tier update emits `cluster` `upsert` | Emptied or merged cluster emits `cluster` `delete` |
 | `item` *(Aggregate)* | Item core fields + `state`, `is_starred`, `cluster_id` + **embedded** current `item_enrichment`, LLM `tags[]`, `research_sources[]` summaries (url/title/type/status), and current user item vote (`thumbs_up`/`thumbs_down`/reason) | Item ingest, state/star change, extraction, enrichment, tag replacement, research update, cluster reassignment, or item feedback emits parent `item` `upsert` | Items are permanent history (evicted locally by client window, never deleted on server) |
 | `interest_profile` | Active `interest_profiles` row (`version`, `profile_markdown`) | New active version emits `interest_profile` `upsert` | N/A (always one active profile) |
@@ -260,15 +261,15 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 *(Internal tables `jobs`, `pipeline_runs`, `stage_metrics`, `sync_mutations`, `item_embeddings`, `devices`, `pairing_codes`, and `prompt_configs` are **not** pushed down via `sync_changes`; `prompt_configs` and pipeline metrics are accessed online-only via dedicated management endpoints.)*
 
 ### 5.2 Per-Field Conflict Resolution & Merge Table (Upstream `sync/push`)
-- **Clock-Skew Clamping**: For every client mutation, the server computes `effective_ts = LEAST(client_timestamp, server_now + INTERVAL '5 minutes')` so a misconfigured phone clock far in the future cannot permanently win LWW.
-- **Push Response Contract**: `POST /api/v1/sync/push` returns an array of `{client_mutation_id, outcome: "applied" | "superseded" | "rejected", reason?, current_entity?}` so the client removes applied/superseded items from the outbox and rolls back + notifies the user on `rejected`.
+- **Clock-Skew Clamping & Dead-RTC Lower Bound**: For every client mutation, the server rejects timestamps older than `server_now - 90 days` (`reason = "clock_skew"`) and clamps future timestamps to `effective_ts = LEAST(client_timestamp, server_now + INTERVAL '5 minutes')`. Every `bootstrap`, `pull`, and `push` response includes `server_now` so clients can surface clock-drift warnings (`|client_now - server_now| > 5m`) without penalizing multi-day offline travel.
+- **Push Response Contract**: `POST /api/v1/sync/push` returns `{instance_epoch, server_now, results: [{client_mutation_id, outcome: "applied" | "superseded" | "rejected", reason?, affected_count?, current_entity_type?, current_entity?}]}` (deliberately omitting `watermark`) so the client removes applied/superseded items from the outbox and rolls back + notifies the user on `rejected`.
 
 | Mutable Field / Action | Offline Allowed? | Conflict Policy & Authority | Interaction with `expired` |
 | :--- | :--- | :--- | :--- |
 | `items.state` (`read` / `unread`) | Yes | Per-field LWW comparing `effective_ts` against `items.read_state_updated_at`. | Server expiration writes `read_state_updated_at = expired_at`. A later client `read` or `unread` wins; an *older* offline `unread` made before expiration is `superseded` (or if client explicitly restores from Archive, timestamp is newer and wins). |
 | `items.is_starred` | Yes | Per-field LWW comparing `effective_ts` against `items.starred_updated_at` (independent of `state`). | Starring an `expired` item succeeds and preserves it in Starred view (`state` unchanged unless also opened/restored). |
 | `mark_cluster_read` | Yes | Expands on client to explicit `item_ids[]` known at action time; applies per-item `state='read'` LWW. | Items added to the cluster *after* the offline action remain `unread`. |
-| `mark_bulk_read` (feed/category/all/older-than-X) | Yes | Bounded by `{scope, up_to_sync_seq, older_than_ts?}` (or explicit `item_ids[]`); server applies `state='read'` only to matching items whose ingest `sync_seq <= up_to_sync_seq`. | Never marks unseen items that arrived after the client's last pull. |
+| `mark_bulk_read` (feed/category/all/older-than-X) | Yes | Two-tier semantics: explicit `scope='items'` (`item_ids[]`) applies true per-item LWW over `state IN ('unread', 'read')` (epoch-agnostic); scoped modes (`all`/`feed`/`category`) are bounded by `{scope, up_to_sync_seq, epoch, older_than_ts?}`, reject stale `epoch != instance_epoch` (`epoch_mismatch`), and filter `state = 'unread'` + `ingest_sync_seq <= up_to_sync_seq` (owner-accepted non-commuting carve-out `RR-1`). | Never marks unseen items (including post-restore items); `expired` items are excluded in all modes (`RR-2`). |
 | `feeds.status`, `category_id`, `expiration_days_override`, `research_policy.fetch_pdfs`, `research_policy.enabled` | Yes | Per-field LWW via `feeds.field_updated_at[field_name]`. | N/A |
 | Item feedback (`thumbs_up` / `thumbs_down` / `reason`) | Yes | Append-only in `feedback_events` (deduped by `client_mutation_id`); latest event per item defines displayed vote state. | Allowed on expired items. |
 | Feed written instruction (`feed_instruction` add / archive) | Yes | Append-only creation in `feedback_events` (deduped by `client_mutation_id`); archiving sets `archived_at` idempotently by `feedback_event_id`. Emits parent `feed` `upsert`. | N/A |

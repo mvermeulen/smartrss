@@ -38,6 +38,7 @@ FEED_SYNCED_COLUMNS: frozenset[str] = frozenset(
         "title",
         "status",
         "health_state",
+        "poll_interval_minutes",
         "consecutive_errors",
         "last_error",
         "category_id",
@@ -50,6 +51,32 @@ FEED_SYNCED_COLUMNS: frozenset[str] = frozenset(
     }
 )
 
+ITEM_SYNCED_COLUMNS: frozenset[str] = frozenset(
+    {
+        "feed_id",
+        "guid",
+        "raw_url",
+        "canonical_url",
+        "title",
+        "author",
+        "published_at",
+        "fetched_at",
+        "raw_summary",
+        "extracted_text",
+        "extraction_status",
+        "entry_hash",
+        "content_hash",
+        "state",
+        "is_starred",
+        "read_at",
+        "starred_at",
+        "expired_at",
+        "read_state_updated_at",
+        "starred_updated_at",
+        "unexpired_at",
+    }
+)
+
 APP_SETTINGS_SYNCED_COLUMNS: frozenset[str] = frozenset(
     {
         "default_expiration_days",
@@ -57,6 +84,8 @@ APP_SETTINGS_SYNCED_COLUMNS: frozenset[str] = frozenset(
         "default_poll_interval_minutes",
     }
 )
+
+SYNC_CHANGE_INSERT_CHUNK_SIZE = 1000
 
 SYNCED_TABLES: frozenset[str] = frozenset({"categories", "feeds", "items", "app_settings"})
 
@@ -104,9 +133,12 @@ class SyncLogWriter:
             return []
 
         result = await session.execute(
-            sa.select(SyncState.current_seq).where(SyncState.id == 1).with_for_update()
+            sa.select(SyncState.current_seq, sa.func.clock_timestamp())
+            .where(SyncState.id == 1)
+            .with_for_update()
         )
-        current_seq = result.scalar_one()
+        current_seq_raw, changed_at = result.one()
+        current_seq = cast(int, current_seq_raw)
         count = len(events)
         new_seq = current_seq + count
         seqs = list(range(current_seq + 1, new_seq + 1))
@@ -114,20 +146,23 @@ class SyncLogWriter:
         await session.execute(
             sa.update(SyncState)
             .where(SyncState.id == 1)
-            .values(current_seq=new_seq, updated_at=sa.func.now())
+            .values(current_seq=new_seq, updated_at=changed_at)
         )
-        await session.execute(
-            sa.insert(SyncChange),
-            [
-                {
-                    "seq": seq,
-                    "entity_type": ev.entity_type,
-                    "entity_id": ev.entity_id,
-                    "op": ev.op,
-                }
-                for seq, ev in zip(seqs, events, strict=True)
-            ],
-        )
+        rows = [
+            {
+                "seq": seq,
+                "entity_type": ev.entity_type,
+                "entity_id": ev.entity_id,
+                "op": ev.op,
+                "changed_at": changed_at,
+            }
+            for seq, ev in zip(seqs, events, strict=True)
+        ]
+        for start in range(0, len(rows), SYNC_CHANGE_INSERT_CHUNK_SIZE):
+            await session.execute(
+                sa.insert(SyncChange),
+                rows[start : start + SYNC_CHANGE_INSERT_CHUNK_SIZE],
+            )
 
         recorded: set[tuple[str, uuid.UUID]] = session.info.setdefault("synclog_recorded", set())
         for ev in events:
@@ -171,7 +206,13 @@ def _entity_requires_sync(obj: Any, *, is_new: bool) -> tuple[str, uuid.UUID] | 
     if isinstance(obj, Category):
         return ("category", obj.id)
     if isinstance(obj, Item):
-        return ("item", obj.id)
+        if is_new:
+            return ("item", obj.id)
+        state = inspect(obj)
+        for col in ITEM_SYNCED_COLUMNS:
+            if state.attrs[col].history.has_changes():
+                return ("item", obj.id)
+        return None
     if isinstance(obj, Feed):
         if is_new:
             return ("feed", obj.id)

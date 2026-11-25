@@ -10,7 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from smartrss import __version__
-from smartrss.api.routes import auth, categories, feeds, health, items, system
+from smartrss.api.routes import (
+    auth,
+    categories,
+    feeds,
+    health,
+    items,
+    search,
+    sync,
+    system,
+)
+from smartrss.api.routes import settings as settings_routes
 from smartrss.config import Settings, get_settings
 from smartrss.db.engine import build_engine, build_sessionmaker
 from smartrss.logging import configure_logging
@@ -78,6 +88,9 @@ def create_app(
     app.include_router(categories.router)
     app.include_router(feeds.router)
     app.include_router(items.router)
+    app.include_router(settings_routes.router)
+    app.include_router(sync.router)
+    app.include_router(search.router)
     app.include_router(system.router)
 
     return app

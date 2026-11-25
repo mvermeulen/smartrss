@@ -9,7 +9,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import feedparser
 import httpx
@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from smartrss.config import get_settings
 from smartrss.db.models import AppSettings, Feed, Item
 from smartrss.db.sync_log import SyncEvent, execute_synced, sync_log
 from smartrss.domain.backoff import (
@@ -27,6 +28,7 @@ from smartrss.domain.backoff import (
 from smartrss.domain.expiration import clamp_published_at
 from smartrss.domain.url_canon import canonicalize_url, compute_text_hash, derive_fallback_guid
 from smartrss.jobs.queue import enqueue_job
+from smartrss.search.fts import SearchVectorInput, rebuild_items_search_vectors_batch
 from smartrss.security.safe_http import FetchResult, SafeHttpClient, SafeHttpError
 
 logger = logging.getLogger(__name__)
@@ -754,8 +756,10 @@ async def _poll_after_precheck(
             else:
                 new_entries.append(entry)
 
-        # Handle existing entries (entry_hash update detection; never revert read/expired -> unread)
+        # Handle existing entries in strict item.id ASC order (§5.1, P-04)
+        matched_existing.sort(key=lambda pair: pair[0].id)
         update_cutoff = fetched_at - timedelta(days=UPDATE_WINDOW_DAYS)
+        fts_entries: list[SearchVectorInput] = []
         for existing_item, entry in matched_existing:
             if (
                 existing_item.state == "unread"
@@ -785,6 +789,15 @@ async def _poll_after_precheck(
                     _upd_event,
                 )
                 all_events.extend(upd_events)
+                fts_entries.append(
+                    SearchVectorInput(
+                        item_id=existing_item.id,
+                        title=entry.title,
+                        author=existing_item.author,
+                        raw_summary=entry.raw_summary,
+                        extracted_text=existing_item.extracted_text,
+                    )
+                )
                 items_updated += 1
                 if feed_row.fetch_full_text:
                     await enqueue_job(
@@ -816,9 +829,11 @@ async def _poll_after_precheck(
             for entry in new_entries:
                 entries_to_insert.append((entry, False, 50))
 
+        inserted_ids: list[uuid.UUID] = []
         if entries_to_insert:
             insert_rows: list[dict[str, Any]] = []
             extract_prio_by_id: dict[uuid.UUID, int] = {}
+            insert_row_by_id: dict[uuid.UUID, dict[str, Any]] = {}
             for entry, is_overflow, extract_prio in entries_to_insert:
                 item_id = uuid.uuid4()
                 if is_overflow:
@@ -834,37 +849,36 @@ async def _poll_after_precheck(
                     if feed_row.fetch_full_text:
                         extract_prio_by_id[item_id] = extract_prio
 
-                insert_rows.append(
-                    {
-                        "id": item_id,
-                        "feed_id": feed_id,
-                        "guid": entry.guid,
-                        "raw_url": entry.raw_url,
-                        "canonical_url": entry.canonical_url,
-                        "title": entry.title,
-                        "author": entry.author,
-                        "published_at": entry.published_at,
-                        "fetched_at": fetched_at,
-                        "raw_summary": entry.raw_summary,
-                        "extracted_text": None,
-                        "extraction_status": extract_status,
-                        "entry_hash": entry.entry_hash,
-                        "content_hash": entry.entry_hash,
-                        "state": state,
-                        "is_starred": False,
-                        "read_at": read_at,
-                        "starred_at": None,
-                        "expired_at": expired_at,
-                        "read_state_updated_at": fetched_at,
-                        "starred_updated_at": fetched_at,
-                        "unexpired_at": None,
-                        "created_at": fetched_at,
-                        "updated_at": fetched_at,
-                    }
-                )
+                row_dict: dict[str, Any] = {
+                    "id": item_id,
+                    "feed_id": feed_id,
+                    "guid": entry.guid,
+                    "raw_url": entry.raw_url,
+                    "canonical_url": entry.canonical_url,
+                    "title": entry.title,
+                    "author": entry.author,
+                    "published_at": entry.published_at,
+                    "fetched_at": fetched_at,
+                    "raw_summary": entry.raw_summary,
+                    "extracted_text": None,
+                    "extraction_status": extract_status,
+                    "entry_hash": entry.entry_hash,
+                    "content_hash": entry.entry_hash,
+                    "state": state,
+                    "is_starred": False,
+                    "read_at": read_at,
+                    "starred_at": None,
+                    "expired_at": expired_at,
+                    "read_state_updated_at": fetched_at,
+                    "starred_updated_at": fetched_at,
+                    "unexpired_at": None,
+                    "created_at": fetched_at,
+                    "updated_at": fetched_at,
+                }
+                insert_rows.append(row_dict)
+                insert_row_by_id[item_id] = row_dict
 
             # I-05: Insert in chunks of 500 rows to stay well under Postgres's 65,535 param limit
-            inserted_ids: list[uuid.UUID] = []
             for start in range(0, len(insert_rows), INSERT_CHUNK_SIZE):
                 chunk_rows = insert_rows[start : start + INSERT_CHUNK_SIZE]
                 insert_stmt = (
@@ -885,6 +899,16 @@ async def _poll_after_precheck(
             items_ingested = len(inserted_ids)
 
             for iid in inserted_ids:
+                row_data = insert_row_by_id[iid]
+                fts_entries.append(
+                    SearchVectorInput(
+                        item_id=iid,
+                        title=str(row_data["title"]),
+                        author=cast(str | None, row_data["author"]),
+                        raw_summary=cast(str | None, row_data["raw_summary"]),
+                        extracted_text=None,
+                    )
+                )
                 prio = extract_prio_by_id.get(iid)
                 if prio is not None:
                     await enqueue_job(
@@ -896,6 +920,13 @@ async def _poll_after_precheck(
                         run_id=run_id,
                         priority=prio,
                     )
+
+        if fts_entries:
+            await rebuild_items_search_vectors_batch(
+                session,
+                fts_entries,
+                fts_language=get_settings().fts_language,
+            )
 
         # Column-scoped feed metadata update (poll-owned columns only)
         delay = compute_next_poll_delay(
@@ -941,7 +972,31 @@ async def _poll_after_precheck(
         all_events = [*feed_events, *all_events]
 
         if all_events:
-            await sync_log.record(session, all_events)
+            seqs = await sync_log.record(session, all_events)
+            if inserted_ids:
+                inserted_set = set(inserted_ids)
+                stamp_ids: list[uuid.UUID] = []
+                stamp_seqs: list[int] = []
+                for ev, seq in zip(all_events, seqs, strict=True):
+                    if ev.entity_type == "item" and ev.entity_id in inserted_set:
+                        stamp_ids.append(ev.entity_id)
+                        stamp_seqs.append(seq)
+                if stamp_ids:
+                    await execute_synced(
+                        session,
+                        sa.text(
+                            """
+                            UPDATE items
+                            SET ingest_sync_seq = v.seq
+                            FROM (
+                                SELECT unnest(CAST(:ids AS uuid[])) AS id,
+                                       unnest(CAST(:seqs AS bigint[])) AS seq
+                            ) AS v
+                            WHERE items.id = v.id
+                            """
+                        ).bindparams(ids=stamp_ids, seqs=stamp_seqs),
+                        lambda _res: [],
+                    )
         await session.commit()
 
     return PollFeedOutcome(

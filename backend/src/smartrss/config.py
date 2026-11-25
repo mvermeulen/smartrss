@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from smartrss.domain.fts_text import validate_fts_language
+
 
 def _split_csv(value: str | list[str]) -> list[str]:
     if isinstance(value, list):
@@ -54,7 +56,13 @@ class Settings(BaseSettings):
     default_expiration_days: int = Field(default=30, alias="DEFAULT_EXPIRATION_DAYS", ge=0)
 
     synclog_strict_guard: bool = Field(default=False, alias="SYNCLOG_STRICT_GUARD")
+    fts_language: str = Field(default="english", alias="FTS_LANGUAGE")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @field_validator("fts_language")
+    @classmethod
+    def _validate_fts_language(cls, value: str) -> str:
+        return validate_fts_language(value)
 
     @field_validator("cors_allow_origins_raw")
     @classmethod
