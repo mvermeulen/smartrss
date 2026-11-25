@@ -71,3 +71,12 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | T4 | **Docs in the same commit.** Status headers, index rows (no duplicates), env-var comments, and deviations from the design are updated together with the code. | `I-09` follow-up | Grep for stale status and duplicate rows before committing. |
 | T5 | **Reproducible builds.** Do images install from the lockfile? | `I-17` | `uv export --frozen` / `uv sync --frozen`. |
 | T6 | **Concurrency tests that can fail.** Does a race or lock-order test actually force the interleaving, and would it fail if the invariant broke? Internal retry loops (`40P01`/`40001`) turn a real deadlock into a passing end state. | `K-02` (the `T01b` lock-order test passed 5/5 with the sort reversed) | Force the overlap (barriers or hook points), disable retries (`max_attempts=1`), and assert ordering directly (capture statement order with `before_cursor_execute`) rather than only end state. Prove it with the invariant broken. |
+
+## 7. Local-first browser clients
+
+| # | Check | Origin | Correct pattern |
+| :--- | :--- | :--- | :--- |
+| B1 | **Server-base vs optimistic overlay.** Does rollback restore an enqueue-time snapshot instead of recomputing from the latest server-confirmed base row? | `U-01` | Keep server-confirmed `*_base` rows separate from display rows; derive display as pure `base ⊕ fold(outbox)` on every pull, push, and rollback. |
+| B2 | **IndexedDB key validity.** Are booleans indexed in IndexedDB / Dexie? | `U-03` | IndexedDB rejects booleans as keys (`DataError` / omitted from index). Store and index numeric `0 \| 1` alongside DTO booleans. |
+| B3 | **`[SecureContext]` APIs on plain-HTTP LAN fallback.** Does code call `crypto.randomUUID()`, `navigator.locks`, `navigator.storage`, or `navigator.serviceWorker` unconditionally? | `U-05` | Guard `[SecureContext]` APIs; provide `crypto.getRandomValues` UUIDv4 and IndexedDB lease-lock fallbacks for plain-HTTP LAN origins, and test on a non-localhost hostname. |
+| B4 | **Single-parse HTML sanitization (mXSS).** Does untrusted HTML go through `DOMParser` → serialize → DOMPurify → `innerHTML`? | `U-13` | Transform and sanitize in a single DOMPurify pass (`uponSanitizeElement` + `RETURN_DOM_FRAGMENT: true`) and mount the fragment via `replaceChildren()`, avoiding double-parse mXSS. |
