@@ -159,7 +159,7 @@ Reviews are a required, recorded part of every milestone, not an optional extra.
 ### 7.2 Review document format
 - **File**: `docs/reviews/YYYY-MM-DD-<scope>-<design|implementation>-review.md`. Add a row to the [docs/README.md](README.md) index with status `Open`, and update that same row afterwards (never add a second row).
 - **Header**: date, scope (paths plus base commit), specs checked against, reviewer (agent/model or person), and status.
-- **Finding IDs**: one letter prefix per review, unique across the repo (used so far: `R`, `Q`, `B`, `M`, `S`, `A`, `N`, `T`, `I`). Number findings sequentially and never renumber them.
+- **Finding IDs**: one letter prefix per review, unique across the repo (used so far: `R`, `Q`, `B`, `M`, `S`, `A`, `N`, `T`, `I`, `P`). Number findings sequentially and never renumber them.
 - **Severity**:
   | Severity | Meaning | Before approval |
   | :--- | :--- | :--- |

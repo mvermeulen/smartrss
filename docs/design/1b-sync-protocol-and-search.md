@@ -1,8 +1,8 @@
 # Component Design 1b: Server Sync Engine, Conflict Resolution & Full-Text Search
 
-> **Status:** In Design Review *(2026-11-25 — owner design trade-offs confirmed; handed off for Claude Code design review)*
+> **Status:** In Design Review *(2026-11-25 — Claude Code review findings `P-01`–`P-17` and owner decisions `Q-1`–`Q-4` addressed; awaiting verification pass)*
 > **Milestone:** `1b` — Server Sync Engine, Conflict Resolution & Search ([Requirements §6](../requirements.md#6-milestones--phasing))
-> **Requirements Covered:** `FR-STATE-01`–`02` (sync/restore transitions), `FR-SEARCH-01`, `FR-SYNC-01`–`04`, `NFR-SYNC-01`, `NFR-SYNC-02` (500-mutation `< 5s` flush), `NFR-SEC-01`, `NFR-SEC-03` (XSS-safe search snippets)
+> **Requirements Covered:** `FR-STATE-01`–`02` (sync/restore transitions), `FR-STATE-03` (bounded bulk read; cluster read in `1e`), `FR-STATE-04` (partial: full-text archive search over title/author/summary/body; enrichment TL;DR/takeaways/tags in `1d`), `FR-SYNC-01`–`04`, `NFR-SYNC-01`, `NFR-SYNC-02` (500-mutation `< 5s` flush), `NFR-SEC-01`, `NFR-SEC-03` (XSS-safe search snippets)
 > **Related ADRs:** [ADR 0002](../decisions/0002-native-sync-api-and-detached-client-model.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)
 > **Carry-over Design Items Resolved:** `S-04` (`feeds.config_version` independence from `field_updated_at`), `S-07` (bounded cursor-paginated `bootstrap`) from [Second-Pass Design Review](../reviews/2026-11-23-second-pass-design-review.md)
 
@@ -14,30 +14,30 @@ Milestone `1b` builds the server-side synchronization engine, per-field conflict
 
 ### In Scope for `1b`
 1. **Alembic Migration `0002_milestone_1b_sync_and_search`**:
-   - New `sync_mutations` table (idempotency log of client mutations, pruned after 90 days).
+   - New `sync_mutations` table (idempotency log of client mutations with `payload_sha256` conflict guard, pruned after 90 days).
    - `sync_state.pruned_through_seq BIGINT NOT NULL DEFAULT 0` for exact retention-boundary (`resync_required`) detection.
    - `items.ingest_sync_seq BIGINT NOT NULL DEFAULT 0` (indexed) for pruning-proof, commit-ordered `mark_bulk_read`.
-   - `items.search_vector TSVECTOR` + GIN index, with backfill for existing rows.
+   - `items.search_vector TSVECTOR` + GIN index, backfilled via the shared Python `HTMLParser` builder.
 2. **Sync Engine (`/api/v1/sync/*`)**:
-   - `GET /api/v1/sync/bootstrap`: Stateless keyset-paginated snapshot pinned to Page 1's `watermark` and `instance_epoch`, returning a forward-compatible aggregate wire envelope.
-   - `GET /api/v1/sync/pull`: Commit-ordered delta stream from `sync_changes` with within-page coalescing, bulk hydration, tombstone propagation, and exact `resync_required` detection (`epoch_mismatch`, `cursor_ahead`, `cursor_pruned`).
-   - `POST /api/v1/sync/push`: Single-transaction batch mutation processor (up to 500 mutations/request, `< 5s` target) with `client_mutation_id` idempotency, server clock-skew clamping (`+5 min`), deterministic value-rank LWW tie-breaking, bounded `mark_bulk_read`, and per-mutation `{applied | superseded | rejected}` outcomes.
+   - `GET /api/v1/sync/bootstrap`: Stateless keyset-paginated snapshot pinned to Page 1's `watermark` and `instance_epoch`, returning `server_now` and a forward-compatible aggregate wire envelope.
+   - `GET /api/v1/sync/pull`: Commit-ordered delta stream from `sync_changes` with within-page coalescing, bounded-column bulk hydration, tombstone propagation, `server_now`, and exact `resync_required` detection (`epoch_mismatch`, `cursor_ahead`, `cursor_pruned`).
+   - `POST /api/v1/sync/push`: Single-transaction batch mutation processor (up to 500 mutations / 5,000 explicit `item_ids` / 2 MiB body, `< 5s` target) with transient-error server retry (`40P01`/`40001`/`23505`), `client_mutation_id` + `payload_sha256` idempotency, server clock-skew clamping (`+5 min`) & dead-RTC rejection (`< server_now - 90d`), deterministic value-rank LWW tie-breaking, bounded `mark_bulk_read`, and per-mutation `{applied | superseded | rejected}` outcomes with slim entity snapshots.
 3. **Online Settings & LWW Consistency**:
    - `GET /api/v1/settings` and `PATCH /api/v1/settings` (online-only `app_settings` management emitting `app_settings` `upsert` in `sync_changes`).
-   - Align `PATCH /api/v1/feeds/{id}` and `POST /api/v1/feeds` reactivation so `field_updated_at` uses granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys alongside existing LWW keys, while `config_version` increments **only** on `curation_instructions` writes (`S-04`).
+   - Align `PATCH /api/v1/feeds/{id}`, `POST /api/v1/feeds` reactivation, and `DELETE /api/v1/categories/{id}` to use PostgreSQL `now()` (`C5`), monotonic `GREATEST(db_now, stored_ts + 1µs)` LWW timestamps, granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys, shared status-transition side effects (`unsubscribed → active` reset + poll enqueue; `paused → active|muted`), and `config_version` incrementing **only** on `curation_instructions` writes (`S-04`).
 4. **PostgreSQL Full-Text Archive Search**:
-   - `GET /api/v1/search`: Full-archive search via `websearch_to_tsquery`, weighted `search_vector` (`A: title`, `B: author`, `C: HTML-stripped raw_summary`, `D: extracted_text[:65536]`), facet filters, `relevance` / `newest` sorting, and **structured XSS-safe snippet fragments** computed on the returned page only.
+   - `GET /api/v1/search` (authenticated): Full-archive search via `websearch_to_tsquery` (with `querytree = 'T'` negation-only guard), weighted `search_vector` (`A: title`, `B: author`, `C: HTML-stripped raw_summary`, `D: extracted_text[:65536]`), facet filters, `relevance` / `newest` sorting, slim `SearchItemDTO` results, and **structured XSS-safe snippet fragments** (`list[list[SnippetFragment]]`) computed on the returned page only.
    - Application-code `search_vector` maintenance hooks in `poll_feed` and `extract_content`, plus `smartrss search reindex` CLI command.
 5. **1a Pipeline & Maintenance Updates**:
    - `SyncLogWriter.record()` uses `clock_timestamp()` (monotonic with `seq` under `sync_state FOR UPDATE`) and chunks large multi-row `INSERT`s to stay well below PostgreSQL's 65,535 bind-parameter cap (`D1`).
-   - `poll_feed` stamps `items.ingest_sync_seq` from the allocated `sync_changes.seq` inside the same final write transaction.
-   - `retention_cleanup` prunes `sync_changes` strictly by a contiguous `seq` prefix, updates `sync_state.pruned_through_seq` atomically, and prunes `sync_mutations` older than 90 days.
-   - Extend `sync_log.py` ORM sync guard with `ITEM_SYNCED_COLUMNS` so internal-only `Item` column updates (`search_vector`, `ingest_sync_seq`) do not spuriously require a `sync_changes` event.
+   - `FEED_SYNCED_COLUMNS` adds `poll_interval_minutes` so online poll-interval edits emit a `feed` `upsert`; `ITEM_SYNCED_COLUMNS` excludes internal-only `Item` columns (`search_vector`, `ingest_sync_seq`, `updated_at`).
+   - `poll_feed` sorts `matched_existing` by `item.id ASC` before per-item updates (honoring §5.1 lock order) and stamps `items.ingest_sync_seq` from the allocated `sync_changes.seq` inside the same final write transaction.
+   - `retention_cleanup` updates `app_settings` before `sync_state` (honoring §5.1 lock order), prunes `sync_changes` strictly by a contiguous `seq` prefix, updates `sync_state.pruned_through_seq` atomically, and prunes `sync_mutations` older than 90 days.
 6. **Verification & Benchmarks**:
-   - Real-Postgres concurrent-commit `sync_seq` gap-free test, `hypothesis` permutation convergence tests (including tied/clamped timestamps), 500-mutation flush benchmark (`< 5s`), and full restore-epoch end-to-end sync recovery drill.
+   - Real-Postgres concurrent-commit `sync_seq` gap-free & deadlock-free lock-order tests, unit + real-Postgres `hypothesis` permutation convergence tests (including tied/clamped timestamps and bulk mark-read), 500-mutation & 20,000-item bulk-read benchmarks (`< 5s`), and full restore-epoch end-to-end sync recovery drill (covering both pending outbox and 48h acknowledged replay journal).
 
 ### Explicitly Out of Scope for `1b`
-- React/TypeScript/Dexie client UI, Service Worker, and local outbox (`1c`).
+- React/TypeScript/Dexie client UI, Service Worker, local outbox, and 48h acknowledged replay journal implementation (`1c`).
 - Database tables for `item_enrichments`, `tags`, `item_tags`, `interest_profiles`, `prompt_configs` (`1d`).
 - Database tables for `clusters`, `cluster_exclusions`, `item_embeddings` and `split_cluster` mutation execution (`1e`).
 - Database table for `research_sources` (`1f`).
@@ -47,17 +47,17 @@ Milestone `1b` builds the server-side synchronization engine, per-field conflict
 
 ## 2. Key `1b` Design Trade-offs & Decisions
 
-All seven trade-offs below were reviewed and confirmed with the project owner on 2026-11-25.
+All seven trade-offs below were reviewed and confirmed with the project owner on 2026-11-25 (with `1b-D04` refined per owner decision `Q-2` on `P-01`).
 
 | # | Decision Area | Chosen Approach | Alternative(s) Considered | Rationale |
 | :--- | :--- | :--- | :--- | :--- |
-| **B-01** *(S-07)* | **Bootstrap pagination & snapshot consistency** *(Confirmed)* | **Stateless keyset pagination pinned to Page 1's `watermark`**: Page 1 captures `{watermark, instance_epoch}` first and returns metadata + first item page (`limit=500`, `ORDER BY id ASC`); Pages 2..N fetch remaining items by `cursor`; client then runs `sync/pull?since_seq=<page1_watermark>`. | (a) Single unpaginated response with hard cap; (b) server-side frozen snapshot session. | Zero server state, bounded HTTP/memory footprint even for 20k+ items, and mathematically gap-free because any write after Page 1's watermark has `seq > watermark` and is replayed idempotently by the trailing `pull`. |
-| **B-02** | **Item sync payload scope (`extracted_text` & `raw_summary`)** *(Confirmed)* | **Metadata + capped `raw_summary` (32,768 chars + `summary_truncated`) + derived `lead_excerpt` (1,500 chars plain text); omit full `extracted_text`**. | (a) Truncated 8–16 KB `extracted_text` in sync; (b) full `extracted_text` in sync. | Keeps 2,000-item client cache at ~4–8 MB (ideal for Ubuntu Dexie and Phase 2 Android), respects ADR 0002's metadata-only boundary, and still powers strong detached search while full-archive body search runs via Postgres FTS. |
-| **B-03** | **`sync/pull` coalescing & `resync_required` detection** *(Confirmed)* | **Within-page coalescing** (fetch `LIMIT + 1` raw rows, advance `next_seq` to max raw `seq`, collapse per `(entity_type, entity_id)` keeping highest `seq`/`op`) + **`sync_state.pruned_through_seq`** returning HTTP `200` `{resync_required: true, resync_reason}`. | (a) Uncoalesced raw log replay; (b) `MIN(sync_changes.seq)` check + HTTP `410`. | Avoids 3–4× redundant serialization per item; `pruned_through_seq` is 100% deterministic even if `sync_changes` becomes empty after 90 idle days; HTTP `200` distinguishes expected recovery from transport errors. |
-| **B-04** | **`sync/push` atomicity & equal-timestamp LWW tie-breaking** *(Confirmed)* | **Single DB transaction per push batch** (max 500 mutations, pre-validated so bad mutations record `rejected` without aborting the batch, single `SyncLogWriter.record()` at commit) + **deterministic value-rank tie-breaker** on `effective_ts == stored_ts`. | (a) One transaction per mutation; (b) `last_mutation_id` columns; (c) naive `>=` / `>`. | Single transaction clears the `< 5s` 500-mutation target (~50–150 ms) with minimal `sync_state` lock contention; value-rank tie-breaking needs zero extra columns and guarantees strict arrival-order-independent convergence (`hypothesis`). |
-| **B-05** | **Bounded `mark_bulk_read` (`up_to_sync_seq`)** *(Confirmed)* | **Add `items.ingest_sync_seq BIGINT NOT NULL DEFAULT 0`** (indexed; stamped by `poll_feed` from its allocated `sync_changes.seq`), supporting both scoped `{scope, up_to_sync_seq, older_than_ts?}` and explicit `item_ids[]`. | (a) Explicit `item_ids[]` only; (b) `fetched_at <= client_ts`. | Survives 90-day `sync_changes` pruning permanently, avoids huge UUID arrays for "Mark all read", and gives exact commit-order bounds immune to clock skew. |
-| **B-06** | **Forward-compatible sync surface vs. stub tables** *(Confirmed)* | **Finalize the forward-compatible JSON wire envelope in `1b`** (`clusters: []`, `interest_profile: null`, item `enrichment: null` / `tags: []` / `research_sources: []` / `user_feedback: null`, feed `active_feed_instructions: []`); **add only `1b`-owned DB tables/columns** now and defer `1d`–`1g` tables to their milestones. | Create empty stub tables for `1d`–`1g` in `1b`. | Gives `1c` a stable TypeScript/Dexie contract without locking `1d`–`1g` schemas before their component design reviews. |
-| **B-07** | **Full-text search snippets & query parsing** *(Confirmed)* | **`websearch_to_tsquery` + structured XSS-safe snippet fragments** (`list[{text, highlight}]`) built via `ts_headline` with control-character sentinels on the returned page only; HTML-stripped `raw_summary` and 64 KB `extracted_text` slice in `search_vector`. | (a) Raw HTML `<mark>` snippets; (b) no snippets; (c) `plainto_tsquery`. | Natural query UX without syntax-error crashes, zero HTML emitted by the search API (zero XSS surface even for articles discussing `<script>` tags), and fast page-scoped headline generation. |
+| **1b-D01** *(S-07)* | **Bootstrap pagination & snapshot consistency** *(Confirmed)* | **Stateless keyset pagination pinned to Page 1's `watermark`**: Page 1 captures `{watermark, instance_epoch, server_now}` first and returns metadata + first item page (`limit=500`, `ORDER BY id ASC`); Pages 2..N fetch remaining items by `cursor`; client then runs `sync/pull?since_seq=<page1_watermark>`. | (a) Single unpaginated response with hard cap; (b) server-side frozen snapshot session. | Zero server state, bounded HTTP/memory footprint even for 20k+ items, and mathematically gap-free because any write after Page 1's watermark has `seq > watermark` and is replayed idempotently by the trailing `pull`. |
+| **1b-D02** | **Item sync payload scope (`extracted_text` & `raw_summary`)** *(Confirmed)* | **Metadata + capped `raw_summary` (32,768 chars + `summary_truncated`) + derived `lead_excerpt` (1,500 chars plain text); omit full `extracted_text`**. SQL hydration projects bounded `LEFT(...)` slices only. | (a) Truncated 8–16 KB `extracted_text` in sync; (b) full `extracted_text` in sync. | Keeps 2,000-item client cache at ~4–8 MB (ideal for Ubuntu Dexie and Phase 2 Android), avoids pulling 15 MB of TOASTed bodies per page into the API process, respects ADR 0002's metadata-only boundary, and powers detached search while full-archive body search runs via Postgres FTS. |
+| **1b-D03** | **`sync/pull` coalescing & `resync_required` detection** *(Confirmed)* | **Within-page coalescing** (fetch `LIMIT + 1` raw rows, advance `next_seq` to max raw `seq`, collapse per `(entity_type, entity_id)` keeping highest `seq`/`op`) + **`sync_state.pruned_through_seq`** returning HTTP `200` `{resync_required: true, resync_reason}`. | (a) Uncoalesced raw log replay; (b) `MIN(sync_changes.seq)` check + HTTP `410`. | Avoids 3–4× redundant serialization per item; `pruned_through_seq` is 100% deterministic even if `sync_changes` becomes empty after 90 idle days; HTTP `200` distinguishes expected recovery from transport errors. |
+| **1b-D04** | **`sync/push` atomicity & equal-timestamp LWW tie-breaking** *(Confirmed; refined per `Q-2`)* | **Single DB transaction per push batch** (max 500 mutations, transient-error retry up to 3 attempts, pre-validated so bad mutations record `rejected` without aborting the batch, single `SyncLogWriter.record()` at commit) + **deterministic value-rank tie-breaker** on `effective_ts == stored_ts`. | (a) One transaction per mutation; (b) `last_mutation_id` columns; (c) naive `>=` / `>`. | Single transaction clears the `< 5s` 500-mutation target (~50–150 ms) with minimal `sync_state` lock contention; value-rank tie-breaking guarantees strict arrival-order-independent convergence for single-field LWW mutations (`item_set_state`, `item_set_starred`, `feed_set_field`) and explicit `scope='items'` bulk mark-read over `unread`/`read` items. Scoped bulk mark-read (`all`/`feed`/`category`) intentionally filters `state = 'unread'` only as an owner-accepted non-commuting carve-out to avoid archive-wide write/sync amplification (see §6.5). |
+| **1b-D05** | **Bounded `mark_bulk_read` (`up_to_sync_seq`)** *(Confirmed)* | **Add `items.ingest_sync_seq BIGINT NOT NULL DEFAULT 0`** (indexed; stamped by `poll_feed` from its allocated `sync_changes.seq`), supporting both scoped `{scope, up_to_sync_seq, older_than_ts?}` and explicit `item_ids[]`. | (a) Explicit `item_ids[]` only; (b) `fetched_at <= client_ts`. | Survives 90-day `sync_changes` pruning permanently, avoids huge UUID arrays for "Mark all read", and gives exact commit-order bounds immune to clock skew. |
+| **1b-D06** | **Forward-compatible sync surface vs. stub tables** *(Confirmed)* | **Finalize the forward-compatible JSON wire envelope in `1b`** (`clusters: []`, `interest_profile: null`, item `enrichment: null` / `tags: []` / `research_sources: []` / `user_feedback: null`, feed `active_feed_instructions: []`); **add only `1b`-owned DB tables/columns** now and defer `1d`–`1g` tables to their milestones. | Create empty stub tables for `1d`–`1g` in `1b`. | Gives `1c` a stable TypeScript/Dexie contract without locking `1d`–`1g` schemas before their component design reviews. |
+| **1b-D07** | **Full-text search snippets & query parsing** *(Confirmed)* | **`websearch_to_tsquery` + structured XSS-safe snippet fragments** (`list[list[{text, highlight}]]`) built via `ts_headline` with `STX`/`ETX`/`EOT` control-character sentinels on the returned page only; HTML-stripped `raw_summary` and 64 KB `extracted_text` slice in `search_vector`. | (a) Raw HTML `<mark>` snippets; (b) no snippets; (c) `plainto_tsquery`. | Natural query UX without syntax-error crashes, zero HTML emitted by the search API (zero XSS surface even for articles discussing `<script>` tags), unambiguous fragment boundaries, and fast page-scoped headline generation. |
 
 ---
 
@@ -74,46 +74,47 @@ backend/
 │   ├── config.py                            # Add FTS_LANGUAGE (allow-listed Postgres text search config, default "english")
 │   ├── db/
 │   │   ├── models.py                        # Add SyncMutation ORM model; add pruned_through_seq, ingest_sync_seq, search_vector columns
-│   │   └── sync_log.py                      # clock_timestamp(), chunked inserts (D1), ITEM_SYNCED_COLUMNS
+│   │   └── sync_log.py                      # clock_timestamp(), chunked inserts (D1), ITEM_SYNCED_COLUMNS, poll_interval_minutes in FEED_SYNCED_COLUMNS
 │   ├── domain/
-│   │   ├── sync_merge.py                    # Pure LWW clock-skew clamp, value-rank tie-breakers, HTML stripper, lead_excerpt & summary truncation
-│   │   └── fts_text.py                      # Pure FTS language allow-list, structured snippet parser (control-char sentinels -> fragments)
+│   │   ├── sync_merge.py                    # Pure LWW clock-skew clamp & lower-bound check, value-rank tie-breakers, monotonic online LWW helper, shared feed status transition helper, payload hash, HTML stripper, lead_excerpt & summary truncation
+│   │   └── fts_text.py                      # Pure FTS language allow-list, structured snippet parser (STX/ETX/EOT sentinels -> list[list[Fragment]])
 │   ├── sync/
 │   │   ├── __init__.py
-│   │   ├── schemas.py                       # Sync wire DTOs (bootstrap, pull, push discriminated union, forward-compatible aggregates)
-│   │   └── service.py                       # Bootstrap pagination, pull coalescing + hydration, single-tx push engine & bulk mark-read
+│   │   ├── schemas.py                       # Sync wire DTOs (bootstrap, pull, push discriminated union, slim push snapshots, forward-compatible aggregates)
+│   │   └── service.py                       # Bootstrap pagination, bounded-slice pull coalescing + hydration, retrying single-tx push engine & bulk mark-read
 │   ├── search/
 │   │   ├── __init__.py
 │   │   └── fts.py                           # rebuild_item_search_vector(), bulk reindex helper, GET /api/v1/search SQL execution
 │   ├── api/
 │   │   ├── app.py                           # Mount sync, search, and settings routers
-│   │   ├── schemas.py                       # Add AppSettingsResponse / AppSettingsUpdateRequest & search response DTOs
+│   │   ├── schemas.py                       # Add AppSettingsResponse / AppSettingsUpdateRequest & SearchItemDTO / search response DTOs
 │   │   └── routes/
-│   │       ├── feeds.py                     # Normalize granular research_policy.* LWW timestamps in field_updated_at (S-04)
+│   │       ├── categories.py                # DELETE /categories/{id}: DB clock + monotonic field_updated_at['category_id']
+│   │       ├── feeds.py                     # DB clock + monotonic granular field_updated_at (S-04) + shared status-transition helper
 │   │       ├── settings.py                  # New: GET /api/v1/settings, PATCH /api/v1/settings
-│   │       ├── sync.py                      # New: GET /bootstrap, GET /pull, POST /push
-│   │       └── search.py                    # New: GET /api/v1/search
+│   │       ├── sync.py                      # New: GET /bootstrap, GET /pull, POST /push (2 MiB body cap)
+│   │       └── search.py                    # New: GET /api/v1/search (authenticated)
 │   ├── worker/stages/
-│   │   ├── poll_feed.py                     # Stamp items.ingest_sync_seq + rebuild search_vector on insert/update
+│   │   ├── poll_feed.py                     # Sort matched_existing by item.id ASC (§5.1) + stamp items.ingest_sync_seq + rebuild search_vector
 │   │   ├── extract_content.py               # Rebuild search_vector when extracted_text is written
-│   │   └── maintenance.py                   # Contiguous-prefix sync_changes prune + sync_state.pruned_through_seq + sync_mutations 90d prune
+│   │   └── maintenance.py                   # Lock-ordered retention cleanup (app_settings before sync_state) + contiguous-prefix sync_changes prune + sync_mutations 90d prune
 │   └── cli.py                               # Add `smartrss search reindex` CLI command
 └── tests/
     ├── unit/
-    │   ├── test_sync_merge_properties.py    # Hypothesis permutation convergence, clock-skew clamping, tie-breakers, HTML strip / truncation
-    │   └── test_fts_text.py                 # FTS language allow-list, HTML stripping, XSS-safe snippet fragment parsing
+    │   ├── test_sync_merge_properties.py    # Hypothesis permutation convergence, clock-skew clamp/lower-bound, online monotonic LWW, tie-breakers, HTML strip / truncation
+    │   └── test_fts_text.py                 # FTS language allow-list, HTML stripping, XSS-safe multi-fragment snippet parsing
     └── integration/
-        ├── test_sync_watermark_concurrency.py # Real-Postgres interleaved commit-order gap-free pull test
-        ├── test_sync_bootstrap_and_pull.py  # Multi-page bootstrap + mid-bootstrap writes, coalescing, tombstones, resync_required (all 3 reasons)
-        ├── test_sync_push_and_conflicts.py  # Idempotency, cross-device conflict, LWW item/feed merges, expired->unread, bulk mark-read, 500-mutation <5s benchmark
-        ├── test_sync_restore_epoch_drill.py # Simulated DB restore rewind + epoch rotation + client outbox survival & idempotent flush
-        └── test_search_fts.py               # Weighted ranking, websearch phrases/negation, stop-words, filters, XSS-safe snippets, poll/extract hooks, reindex CLI
+        ├── test_sync_watermark_concurrency.py # Real-Postgres interleaved commit-order gap-free pull test + poll_feed/push lock-order deadlock test
+        ├── test_sync_bootstrap_and_pull.py  # Multi-page bootstrap + mid-bootstrap writes, coalescing & cross-entity ordering, tombstones, resync_required (all 3 reasons), push->pull two-device test
+        ├── test_sync_push_and_conflicts.py  # Idempotency, payload_sha256 mismatch, concurrent duplicate push retry, LWW item/feed/online merges, expired->unread, bulk mark-read, real-PG hypothesis permutations, 500-mutation & 20k bulk-read benchmarks
+        ├── test_sync_restore_epoch_drill.py # Simulated DB restore rewind + epoch rotation + pending outbox & 48h acknowledged replay journal recovery
+        └── test_search_fts.py               # Weighted ranking, websearch phrases/negation/negation-only 422, stop-words, filters, XSS-safe multi-fragment snippets, poll/extract hooks, reindex CLI
 ```
 
 ### Configuration Additions (`config.py` & `.env.example`)
 | Variable | Default | Validation / Notes |
 | :--- | :--- | :--- |
-| `FTS_LANGUAGE` | `english` | Must be in explicit allow-list `{"english", "simple", "danish", "dutch", "finnish", "french", "german", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "turkish"}`. Never interpolated raw into SQL; passed as a validated Postgres `regconfig` literal/parameter. Changing it requires running `smartrss search reindex`. |
+| `FTS_LANGUAGE` | `english` | Must be in explicit allow-list `{"english", "simple", "danish", "dutch", "finnish", "french", "german", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "turkish"}`. Never interpolated raw into SQL; bound via `CAST(:fts_cfg AS regconfig)`. Changing it requires running `smartrss search reindex`. |
 
 ---
 
@@ -129,6 +130,7 @@ Migration `0002` is strictly reversible (`downgrade()` drops the table, indexes,
 | `mutation_type` | `TEXT` | `NOT NULL` (`item_set_state`, `item_set_starred`, `item_mark_bulk_read`, `feed_set_field`, …) |
 | `entity_type` | `TEXT` | `NOT NULL` (`item`, `feed`, `cluster`, `bulk`) |
 | `entity_id` | `UUID` | `NULL` (populated for single-entity mutations and feed/category-scoped bulk mutations; `NULL` for `scope='all'` or `scope='items'`) |
+| `payload_sha256` | `TEXT` | `NOT NULL` (SHA-256 hex digest of canonical JSON mutation payload; detects same-device reuse of a `client_mutation_id` with a different payload) |
 | `client_timestamp` | `TIMESTAMPTZ` | `NOT NULL` |
 | `effective_timestamp` | `TIMESTAMPTZ` | `NOT NULL` (clamped: `LEAST(client_timestamp, server_now + INTERVAL '5 minutes')`) |
 | `server_applied_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT now()` |
@@ -154,8 +156,8 @@ Migration `0002` is strictly reversible (`downgrade()` drops the table, indexes,
      *(These small partial indexes make `GET /api/v1/sync/bootstrap` fast even when the permanent archive grows to hundreds of thousands of `expired` and old `read` items.)*
 
 ### 4.3 Migration `0002` Backfill Rules
-- **`items.ingest_sync_seq`**: Backfill existing rows with the minimum `sync_changes.seq` for `(entity_type = 'item', entity_id = items.id)`, defaulting to `0` if no `sync_changes` row exists (so pre-migration items are always included in any `up_to_sync_seq >= 0` bulk mark-read).
-- **`items.search_vector`**: Backfill existing rows in `0002` using SQL `setweight(to_tsvector(:cfg, ...))` with `LEFT(COALESCE(extracted_text, ''), 65536)` and basic HTML-tag stripping (`regexp_replace(COALESCE(raw_summary, ''), '<[^>]+>', ' ', 'g')`), matching the Python builder's weights. New/updated items are maintained by the Python `rebuild_item_search_vector()` helper.
+- **`items.ingest_sync_seq`**: Backfill existing rows with the minimum `sync_changes.seq` for `(entity_type = 'item', entity_id = items.id)`, defaulting to `0` if no `sync_changes` row exists (so pre-migration items are always included in any `up_to_sync_seq >= 0` bulk mark-read). *(Note: if early insert events were already pruned before `0002`, `MIN(seq)` selects the earliest remaining update event; this approximation is harmless prior to deployment and never affects post-`0002` items stamped at insert time.)*
+- **`items.search_vector`**: Migration `0002` resolves `fts_cfg = validate_fts_language(os.environ.get("FTS_LANGUAGE", "english"))` (using the allow-list in `domain/fts_text.py`) and backfills existing `items` rows in 500-row batches using the **same Python `HTMLParser` summary stripper and `extracted_text[:65536]` slicer** as `rebuild_item_search_vector()` (with `CAST(:fts_cfg AS regconfig)`). This guarantees backfilled lexemes are byte-for-byte identical to rows produced by `poll_feed`, `extract_content`, and `smartrss search reindex`, without diverging on `<script>`/`<style>` blocks or HTML entities.
 
 ---
 
@@ -166,48 +168,57 @@ All database transactions across API and worker MUST acquire row locks in this s
 1. `categories` (by `id ASC`)
 2. `feeds` (by `id ASC`)
 3. `items` (by `id ASC`)
-4. `sync_state` (`id = 1`, **always last**, immediately before `COMMIT`)
+4. `jobs` (active dedupe target / `id ASC`, e.g. `enqueue_job` during `unsubscribed → active`)
+5. `app_settings` (`id = 1`)
+6. `sync_state` (`id = 1`, **always last**, immediately before `COMMIT`)
 
 No slow I/O (HTTP fetch, subprocess extraction, or future LLM inference) may ever occur inside a transaction holding any of these locks (`ADR 0004`, `S-02`).
 
 ### 5.2 `SyncLogWriter` Hardening (`db/sync_log.py`)
 - **Monotonic `changed_at`**: `SyncLogWriter.record()` explicitly writes `changed_at = sa.func.clock_timestamp()` (instead of transaction-start `now()`) while holding `sync_state FOR UPDATE`, ensuring `changed_at` is monotonically non-decreasing with `seq`.
 - **Chunked Inserts (`D1`)**: When `len(events) > 1000` (e.g., a large `mark_bulk_read`), `SyncLogWriter.record()` inserts into `sync_changes` in chunks of `1000` rows (4,000 bind parameters per chunk, far below PostgreSQL's 65,535 limit) within the same transaction while holding the single `sync_state FOR UPDATE` lock.
-- **`ITEM_SYNCED_COLUMNS`**: Add explicit `ITEM_SYNCED_COLUMNS` to `_entity_requires_sync()` (excluding server-only `search_vector`, `ingest_sync_seq`, `updated_at`), matching `FEED_SYNCED_COLUMNS` and `APP_SETTINGS_SYNCED_COLUMNS`.
+- **`FEED_SYNCED_COLUMNS` & `ITEM_SYNCED_COLUMNS`**:
+  - Add `poll_interval_minutes` to `FEED_SYNCED_COLUMNS` so `PATCH /api/v1/feeds/{id}` updating `poll_interval_minutes` emits a `feed` `upsert` in `sync_changes` (keeping every field in `SyncFeedDTO` backed by a sync event). `last_fetched_at` and `last_success_at` intentionally stay **excluded** from both `FEED_SYNCED_COLUMNS` and `SyncFeedDTO` so polling never floods `sync_changes` and clients never display arbitrarily stale poll timestamps.
+  - Add explicit `ITEM_SYNCED_COLUMNS` to `_entity_requires_sync()` (excluding server-only `search_vector`, `ingest_sync_seq`, `updated_at`), matching `FEED_SYNCED_COLUMNS` and `APP_SETTINGS_SYNCED_COLUMNS`.
 
-### 5.3 `poll_feed` `ingest_sync_seq` Stamping
-In `poll_feed.py`, immediately after `seqs = await sync_log.record(session, all_events)` returns inside the final short write transaction:
-- Map each newly inserted `item_id` (from `inserted_ids`) to its allocated `seq` from `seqs`.
-- Execute a single `UNNEST`-based `UPDATE` via `execute_synced(..., lambda _res: [])` (2 bind parameters total regardless of batch size):
-  ```sql
-  UPDATE items
-  SET ingest_sync_seq = v.seq
-  FROM (SELECT unnest(:ids::uuid[]) AS id, unnest(:seqs::bigint[]) AS seq) AS v
-  WHERE items.id = v.id
-  ```
-- Existing items updated via `entry_hash` change keep their original `ingest_sync_seq` (their initial ingest order never regresses).
+### 5.3 `poll_feed` Lock-Order & `ingest_sync_seq` Stamping
+In `poll_feed.py`'s final short write transaction:
+1. **Sorted item updates (§5.1)**: Sort `matched_existing` by `item.id ASC` before issuing per-item `UPDATE`s so `poll_feed` strictly honors the `items (id ASC)` lock order when running concurrently with `POST /api/v1/sync/push`.
+2. **Stamping `ingest_sync_seq`**: Immediately after `seqs = await sync_log.record(session, all_events)` returns:
+   - Map each newly inserted `item_id` (from `inserted_ids`) to its allocated `seq` by zipping `all_events` with `seqs` and filtering to `event.entity_type == "item" and event.entity_id in inserted_id_set` *(never indexing `seqs` by position in `inserted_ids`, because `all_events` prepends the feed event and interleaves updated-item events)*.
+   - Execute a single `UNNEST`-based `UPDATE` via `execute_synced(..., lambda _res: [])` using standard `CAST(...)` bind syntax (`D5`, 2 bind parameters total regardless of batch size):
+     ```sql
+     UPDATE items
+     SET ingest_sync_seq = v.seq
+     FROM (
+       SELECT unnest(CAST(:ids AS uuid[])) AS id,
+              unnest(CAST(:seqs AS bigint[])) AS seq
+     ) AS v
+     WHERE items.id = v.id
+     ```
+   - Existing items updated via `entry_hash` change keep their original `ingest_sync_seq` (their initial ingest order never regresses).
 
 ### 5.4 Contiguous-Prefix Retention Cleanup (`worker/stages/maintenance.py`)
-To eliminate any possibility of holes in `sync_changes` and keep `pruned_through_seq` exact:
-1. Compute the contiguous prefix cutoff inside the `retention_cleanup` transaction:
+To eliminate any possibility of holes in `sync_changes`, keep `pruned_through_seq` exact, and honor the §5.1 lock hierarchy (`app_settings` before `sync_state`):
+1. Update `app_settings.last_retention_cleanup_at = now()` (internal operational column, zero sync events — acquires `app_settings` lock before `sync_state`).
+2. Delete `sync_mutations` older than 90 days:
+   ```sql
+   DELETE FROM sync_mutations WHERE server_applied_at < now() - INTERVAL '90 days'
+   ```
+3. Compute the contiguous prefix cutoff inside the same `retention_cleanup` transaction:
    ```sql
    SELECT MAX(seq) FROM sync_changes WHERE changed_at < now() - INTERVAL '90 days'
    ```
-2. If `cutoff_seq IS NOT NULL`:
+4. If `cutoff_seq IS NOT NULL`:
    - Delete strictly by prefix: `DELETE FROM sync_changes WHERE seq <= :cutoff_seq`.
-   - Atomically advance `sync_state`:
+   - Atomically advance `sync_state` **last**:
      ```sql
      UPDATE sync_state
      SET pruned_through_seq = GREATEST(pruned_through_seq, :cutoff_seq),
          updated_at = now()
      WHERE id = 1
      ```
-     *(Acquiring the `sync_state` row lock at the end of `retention_cleanup` respects the global lock order and prevents races with concurrent `sync/pull` reads.)*
-3. Delete `sync_mutations` older than 90 days:
-   ```sql
-   DELETE FROM sync_mutations WHERE server_applied_at < now() - INTERVAL '90 days'
-   ```
-4. Update `app_settings.last_retention_cleanup_at = now()` (internal operational column, zero sync events).
+     *(Acquiring `sync_state` strictly last respects §5.1 and prevents deadlocks with `PATCH /api/v1/settings` and races with concurrent `sync/pull` reads.)*
 
 ---
 
@@ -240,8 +251,6 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   "status": "active | paused | muted | unsubscribed",
   "health_state": "healthy | degraded | broken | gone",
   "poll_interval_minutes": 60,
-  "last_fetched_at": "2026-11-25T12:00:00Z | null",
-  "last_success_at": "2026-11-25T12:00:00Z | null",
   "consecutive_errors": 0,
   "last_error": "string | null",
   "expiration_days_override": "int | null",
@@ -261,9 +270,9 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   "updated_at": "2026-11-25T12:00:00Z"
 }
 ```
-*(In `1b`, `active_feed_instructions` is always `[]`; populated by `1g`.)*
+*(In `1b`, `active_feed_instructions` is always `[]`; populated by `1g`. Operational poll timestamps `last_fetched_at` and `last_success_at` are intentionally omitted from `SyncFeedDTO` and served online-only via `GET /api/v1/feeds` and System Health so every synced feed field is backed by `FEED_SYNCED_COLUMNS`.)*
 
-#### `SyncItemDTO` *(Metadata-Only Aggregate — Decision B-02 & B-06)*
+#### `SyncItemDTO` *(Metadata-Only Aggregate — Decision `1b-D02` & `1b-D06`)*
 ```json
 {
   "id": "uuid",
@@ -295,9 +304,10 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   "updated_at": "2026-11-25T12:00:00Z"
 }
 ```
-- **`raw_summary` capping**: Truncated at `32_768` characters if longer, setting `summary_truncated = true`; otherwise passed verbatim with `summary_truncated = false`. Full `extracted_text` is **omitted** from sync payloads (stays server-only for Postgres FTS and `GET /api/v1/items/{id}`).
+- **Bounded SQL column projection**: Both `bootstrap` and `pull` hydration project `LEFT(items.raw_summary, 32769)` (32,768 + 1 sentinel character to detect truncation) and `LEFT(items.extracted_text, 8192)` (ample headroom for whitespace normalization into 1,500 chars) instead of loading full TOASTed 20–30 KB `extracted_text` columns into the API process.
+- **`raw_summary` capping**: Truncated at `32_768` characters if longer (`len > 32_768`), setting `summary_truncated = true`; otherwise passed verbatim with `summary_truncated = false`. Full `extracted_text` is **omitted** from sync payloads (stays server-only for Postgres FTS and `GET /api/v1/items/{id}`).
 - **`lead_excerpt` derivation**: Derived in pure Python (`domain/sync_merge.py`):
-  - Source text: `extracted_text` if non-empty, else HTML-stripped `raw_summary`.
+  - Source text: `LEFT(extracted_text, 8192)` if non-empty, else HTML-stripped `raw_summary`.
   - Normalize consecutive whitespace to single spaces, strip leading/trailing whitespace, slice to `1_500` characters (or `null` if empty).
   - Conveniently reuses the exact same 1,500-character excerpt window specified for `1e` embeddings (`data-model.md` §4.7).
 - **Forward-compatible fields in `1b`**: `cluster_id = null`, `enrichment = null`, `tags = []`, `research_sources = []`, `user_feedback = null`.
@@ -327,6 +337,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 ```json
 {
   "instance_epoch": "uuid",
+  "server_now": "2026-11-25T12:00:00Z",
   "watermark": 1234,
   "categories": [ ... ],
   "feeds": [ ... ],
@@ -339,13 +350,17 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 }
 ```
 - **Page 1 (`cursor` omitted)**:
-  - Executes inside a single `REPEATABLE READ` read-only transaction so `sync_state` (`watermark`, `instance_epoch`), metadata collections, and the first page of items come from a consistent DB snapshot.
+  - Executes inside a single `REPEATABLE READ` read-only transaction so `sync_state` (`watermark`, `instance_epoch`), `server_now = SELECT now()`, metadata collections, and the first page of items come from a consistent DB snapshot.
   - Returns full `categories` (`WHERE deleted_at IS NULL ORDER BY sort_order ASC, id ASC`), `feeds` (`ORDER BY id ASC`, including `unsubscribed` so clients know feed metadata for retained starred items and re-subscribe state), `clusters: []`, `interest_profile: null`, `app_settings`, and the first `limit` working-set `items`.
 - **Pages 2..N (`cursor` provided)**:
-  - Returns `instance_epoch`, `watermark: null` *(omitted deliberately so clients can never accidentally overwrite Page 1's pinned `watermark` with a later sequence and introduce a sync gap)*, `categories: null`, `feeds: null`, `clusters: null`, `interest_profile: null`, `app_settings: null`, plus the next `limit` working-set `items` where `items.id > :cursor`.
-- **Working-Set Item Filter** (uses PostgreSQL `now()`, `C5`):
+  - Returns `instance_epoch`, `server_now`, `watermark: null` *(omitted deliberately so clients can never accidentally overwrite Page 1's pinned `watermark` with a later sequence and introduce a sync gap)*, `categories: null`, `feeds: null`, `clusters: null`, `interest_profile: null`, `app_settings: null`, plus the next `limit` working-set `items` where `items.id > :cursor`.
+- **Working-Set Item Filter** (uses PostgreSQL `now()`, `C5`, and bounded `LEFT(...)` column projection):
   ```sql
-  SELECT *
+  SELECT id, feed_id, raw_url, canonical_url, title, author, published_at, fetched_at,
+         LEFT(raw_summary, 32769) AS raw_summary_slice,
+         LEFT(extracted_text, 8192) AS extracted_text_slice,
+         extraction_status, state, is_starred, read_at, starred_at, expired_at, unexpired_at,
+         read_state_updated_at, starred_updated_at, ingest_sync_seq, updated_at
   FROM items
   WHERE (
     state = 'unread'
@@ -357,12 +372,12 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   LIMIT :limit + 1
   ```
   - Fetching `limit + 1` rows determines `has_more = len(rows) > limit` accurately without an extra `COUNT(*)` query. If `has_more` is true, slice to `rows[:limit]` and set `next_cursor = rows[limit - 1].id`; else `next_cursor = None`.
-- **Client Bootstrap Protocol (Normative for `1c` and Phase 2)**:
-  1. Call Page 1 (`cursor` omitted). Save `page1_epoch = instance_epoch` and `page1_watermark = watermark`.
+- **Client Bootstrap & Restore-Replay Protocol (Normative for `1c` and Phase 2)**:
+  1. Call Page 1 (`cursor` omitted). Save `page1_epoch = instance_epoch` and `page1_watermark = watermark`. Check `|client_now - server_now| > 5 minutes` to surface a non-blocking clock-drift warning banner if the device clock is misconfigured.
   2. While `has_more == true`, call `GET /api/v1/sync/bootstrap?cursor=<next_cursor>&limit=500`. If `response.instance_epoch != page1_epoch` on any page, abort and restart from Step 1.
-  3. Commit local working set + `cursor = page1_watermark` + `epoch = page1_epoch`.
-  4. Immediately run `GET /api/v1/sync/pull?since_seq=<page1_watermark>&epoch=<page1_epoch>` to converge any changes committed during bootstrap pagination.
-  5. If the client retained an unsynced local outbox (e.g., after `resync_required` restore recovery), flush it via `POST /api/v1/sync/push` after bootstrap completes.
+  3. Commit the complete local working set + `cursor = page1_watermark` + `epoch = page1_epoch` inside a **single local Dexie transaction**, tolerating temporarily dangling `feed_id`/`category_id` references (e.g., feeds created after Page 1 whose items appeared on Pages 2..N) until Step 4 completes.
+  4. Immediately run `GET /api/v1/sync/pull?since_seq=<page1_watermark>&epoch=<page1_epoch>` to converge any changes (including newly created feeds/categories) committed during bootstrap pagination.
+  5. **48-hour Acknowledged Replay Journal & Restore Recovery (Owner decision `Q-1` / `P-11`)**: Clients MUST retain recently acknowledged mutations in a local replay journal for a rolling **48-hour window** (covering the 24h nightly backup interval + margin). When bootstrap is triggered by `resync_reason == "epoch_mismatch"` (DB backup restore), the client retains both its pending unsynced outbox **and** its 48-hour acknowledged replay journal, re-bootstraps cleanly, and flushes both via `POST /api/v1/sync/push` so zero post-backup read/star/feed-toggle state is lost (mutations already in the restored DB hit `sync_mutations` as idempotent replays; post-backup mutations re-apply cleanly via LWW).
 
 ---
 
@@ -381,6 +396,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   "resync_required": false,
   "resync_reason": null,
   "instance_epoch": "uuid",
+  "server_now": "2026-11-25T12:02:00Z",
   "watermark": 1250,
   "next_seq": 1250,
   "has_more": false,
@@ -411,6 +427,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   "resync_required": true,
   "resync_reason": "epoch_mismatch | cursor_ahead | cursor_pruned",
   "instance_epoch": "uuid",
+  "server_now": "2026-11-25T12:02:00Z",
   "watermark": 1250,
   "next_seq": 1250,
   "has_more": false,
@@ -420,7 +437,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 
 **Exact Server Execution Algorithm**
 1. Execute inside a single `REPEATABLE READ` read-only transaction (prevents reading a `sync_state` row from snapshot T1 and `sync_changes` rows from snapshot T2!).
-2. Read `sync_state WHERE id = 1`: `(current_seq, instance_epoch, pruned_through_seq)`.
+2. Read `server_now = SELECT now()` and `sync_state WHERE id = 1`: `(current_seq, instance_epoch, pruned_through_seq)`.
 3. Check resync conditions in priority order:
    - `epoch != instance_epoch` → return `resync_required=True, resync_reason="epoch_mismatch"`.
    - `since_seq > current_seq` → return `resync_required=True, resync_reason="cursor_ahead"`.
@@ -436,7 +453,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 5. Compute `has_more = len(raw_rows) > limit`, slice `page_rows = raw_rows[:limit]`.
    - If `page_rows` is empty: `next_seq = since_seq`, `changes = []`, return.
    - Otherwise: `next_seq = page_rows[-1].seq`.
-6. **Within-page coalescing (Decision B-03)**:
+6. **Within-page coalescing (Decision `1b-D03`)**:
    - Iterate `page_rows` in ascending `seq` order and keep the **latest** row per `(entity_type, entity_id)`.
    - Sort the surviving deduplicated entries by `seq ASC` so `changes` stays strictly ordered by `seq`.
 7. **Bulk hydration** (grouped by `entity_type`, chunked at 500 IDs for `D1` safety):
@@ -444,9 +461,13 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
    - For `op == "upsert"`:
      - `category`: load from `categories WHERE id = ANY(:ids)`. If missing or `deleted_at IS NOT NULL` (deleted by a later transaction beyond this page), emit `op = "delete", data = None` so clients never see a soft-deleted row as active (the later `delete` tombstone on a subsequent page is an idempotent no-op).
      - `feed`: load from `feeds WHERE id = ANY(:ids)` → `SyncFeedDTO`. (If missing, emit `op = "delete", data = None`.)
-     - `item`: load from `items WHERE id = ANY(:ids)` → `SyncItemDTO`. (If missing, emit `op = "delete", data = None`.)
+     - `item`: load using bounded `LEFT(raw_summary, 32769)` and `LEFT(extracted_text, 8192)` slices from `items WHERE id = ANY(:ids)` → `SyncItemDTO`. (If missing, emit `op = "delete", data = None`.)
      - `app_settings`: load `app_settings WHERE id = 1` → `SyncAppSettingsDTO`.
      - Future types (`cluster`, `interest_profile`): handled cleanly when `1d`/`1e` introduce their tables.
+- **Normative Client Pull Application Rule (`1c` and Phase 2)**:
+  - Apply each `sync/pull` page (all `changes` + advancing `cursor = next_seq`) inside a **single local Dexie transaction**.
+  - Because within-page coalescing retains the latest `seq` per entity, a parent entity's upsert can appear *after* a child item referencing it (e.g. `[feed(1), item(2), feed(3)]` coalesces to `[item(2), feed(3)]`). Clients MUST tolerate temporarily dangling `feed_id`/`category_id` references within a page or across multi-page pulls until `has_more == false`.
+  - Compare `|client_now - server_now| > 5 minutes` to surface a non-blocking clock-drift warning banner if the device clock is skewed.
 
 ---
 
@@ -466,16 +487,17 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
   ]
 }
 ```
-- **Batch bounds**: `0 <= len(mutations) <= 500`. Requests exceeding 500 mutations return `422 Unprocessable Entity` (client chunks larger outboxes into batches of ≤ 500).
-- **Duplicate `client_mutation_id` inside the same request array**: The first occurrence processes normally; any duplicate within the same request array receives the identical replay outcome without double-applying.
+- **Request-body size cap (`S6`)**: Maximum HTTP body size for `POST /api/v1/sync/push` is **`2 MiB`** (`2_097_152` bytes); larger payloads are rejected with `413 Payload Too Large` before JSON parsing.
+- **Batch bounds**: `0 <= len(mutations) <= 500`, and total explicit `item_ids` across all `scope='items'` mutations in a single push request MUST be `<= 5_000` (each individual `scope='items'` mutation remains capped at `<= 1_000`). Requests exceeding either bound return `422 Unprocessable Entity` (client chunks larger outboxes into smaller batches).
+- **Duplicate `client_mutation_id` inside the same request array**: The first occurrence processes normally; any duplicate within the same request array with the same `payload_sha256` receives the identical replay outcome without double-applying, while a duplicate with a **different** `payload_sha256` receives `outcome = "rejected", reason = "mutation_id_conflict"`.
 - **Timezone requirement**: `client_timestamp` MUST be timezone-aware (reject naive datetimes with `422`).
 
 #### Supported Mutation Types in `1b` (Discriminated Union on `type`)
 
 | `type` | Payload Fields | Validation & Conflict Policy |
 | :--- | :--- | :--- |
-| **`item_set_state`** | `item_id: UUID`, `state: Literal["read", "unread"]` | Per-field LWW comparing `(effective_ts, state_rank(new))` vs `(item.read_state_updated_at, state_rank(item.state))`. Rejects if `item_id` not found (`entity_not_found`). |
-| **`item_set_starred`** | `item_id: UUID`, `is_starred: bool` | Per-field LWW comparing `(effective_ts, star_rank(new))` vs `(item.starred_updated_at, star_rank(item.is_starred))`. Orthogonal to `state`; starring an `expired` item succeeds and keeps `state='expired'`. Rejects if `item_id` not found (`entity_not_found`). |
+| **`item_set_state`** | `item_id: UUID`, `state: Literal["read", "unread"]` | Per-field LWW comparing `(effective_ts, state_rank(new))` vs `(item.read_state_updated_at, state_rank(item.state))`. Rejects if `item_id` not found (`entity_not_found`) or `client_timestamp < server_now - 90d` (`clock_skew`). |
+| **`item_set_starred`** | `item_id: UUID`, `is_starred: bool` | Per-field LWW comparing `(effective_ts, star_rank(new))` vs `(item.starred_updated_at, star_rank(item.is_starred))`. Orthogonal to `state`; starring an `expired` item succeeds and keeps `state='expired'`. Rejects if `item_id` not found (`entity_not_found`) or `clock_skew`. |
 | **`item_mark_bulk_read`** | `scope: Literal["all", "feed", "category", "items"]`, `up_to_sync_seq: int \| null`, `feed_id: UUID \| null`, `category_id: UUID \| null`, `older_than_ts: datetime \| null`, `item_ids: list[UUID] \| null` | See §6.5 below. |
 | **`feed_set_field`** | `feed_id: UUID`, `field: Literal["status", "category_id", "expiration_days_override", "research_policy.enabled", "research_policy.fetch_pdfs"]`, `value: Any` (typed per field) | Per-field LWW comparing `(effective_ts, field_rank(new))` vs `(stored_ts, field_rank(current))`. See §6.6 below. |
 
@@ -485,7 +507,7 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 ```json
 {
   "instance_epoch": "uuid",
-  "watermark": 1260,
+  "server_now": "2026-11-25T12:00:01Z",
   "results": [
     {
       "client_mutation_id": "uuid",
@@ -493,14 +515,17 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
       "reason": "string | null",
       "affected_count": "int | null",
       "current_entity_type": "item | feed | null",
-      "current_entity": { "...SyncItemDTO or SyncFeedDTO..." }
+      "current_entity": { "...SyncPushItemSnapshot or SyncPushFeedSnapshot..." }
     }
   ]
 }
 ```
-- **`current_entity` population policy**:
+- **No `watermark` in push response (Normative for `1c` and Phase 2 — `P-03`)**: `POST /api/v1/sync/push` deliberately **omits** any sequence/watermark field so a client can never mistakenly advance its pull cursor past concurrent changes from other devices or pollers (`NFR-SYNC-01`). **Normative rule:** Clients MUST advance their pull cursor **only** from `GET /api/v1/sync/pull.next_seq` or `GET /api/v1/sync/bootstrap` Page 1 `watermark`. Clients SHOULD run `GET /api/v1/sync/pull` immediately after `POST /api/v1/sync/push`; receiving the push's own changes back in that pull is expected and idempotent.
+- **Slim `current_entity` policy (`P-08`)**:
   - **`applied`**: `current_entity = None`, `current_entity_type = None` (keeps a 500-mutation flush response lean; `affected_count` is populated for `item_mark_bulk_read`).
-  - **`superseded`** or **`rejected`**: Populate `current_entity_type` + `current_entity` whenever the target entity exists (so the client immediately reconciles or rolls back its Dexie record without waiting for `pull`); `None` if `reason == "entity_not_found"`.
+  - **`superseded`** or **`rejected`**: Populate `current_entity_type` + a slim snapshot whenever the target entity exists (so the client immediately reconciles or rolls back its Dexie record without waiting for `pull`, while keeping even a 500-mutation all-superseded response `< 512 KB` instead of ~16 MB); `None` if `reason == "entity_not_found"`:
+    - `SyncPushItemSnapshot`: `{id, state, is_starred, read_at, starred_at, expired_at, unexpired_at, read_state_updated_at, starred_updated_at, updated_at}` *(omits `raw_summary`, `lead_excerpt`, and non-mutable fields)*.
+    - `SyncPushFeedSnapshot`: `{id, status, category_id, expiration_days_override, research_policy, config_version, field_updated_at, updated_at}`.
 
 ---
 
@@ -508,14 +533,16 @@ All timestamps serialize as ISO-8601 UTC (`Z` / `+00:00`).
 
 Pure deterministic functions with zero DB dependencies (tested exhaustively with `hypothesis`):
 
-1. **Clock-Skew Clamping (`C5`)**:
+1. **Clock-Skew Clamping & Dead-RTC Lower Bound (`C5`, Owner decision `Q-3`)**:
    - At the start of `POST /api/v1/sync/push`, query `server_now = (await session.execute(sa.select(sa.func.now()))).scalar_one()`.
-   - For every mutation:
+   - **Dead-RTC lower bound**: If `client_timestamp.astimezone(UTC) < server_now - timedelta(days=90)` (beyond the 90-day `sync_changes` retention window, catching a dead RTC / 1970 clock without ever rejecting multi-day offline travel), reject the mutation with `outcome = "rejected", reason = "clock_skew"` (and populate slim `current_entity` if the target exists).
+   - **Future clamp**: Otherwise compute:
      ```python
      max_allowed = server_now + timedelta(minutes=5)
      effective_ts = min(client_timestamp.astimezone(UTC), max_allowed)
      ```
-2. **Deterministic Value-Rank LWW Comparator (Decision B-04)**:
+   - In addition, `server_now` is returned on every `bootstrap`, `pull`, and `push` response so `1c` can compare `|client_now - server_now| > 5 minutes` and warn the user of device clock drift directly.
+2. **Deterministic Value-Rank LWW Comparator (Decision `1b-D04`)**:
    - Let `incoming_key = (effective_ts, rank(new_value))` and `stored_key = (stored_ts, rank(current_value))`.
    - **Tie-break ranks**:
      - `items.state`: `{"expired": 1, "unread": 2, "read": 3}` (`read > unread > expired`).
@@ -528,8 +555,8 @@ Pure deterministic functions with zero DB dependencies (tested exhaustively with
      - If `new_value == current_value` and `effective_ts <= stored_ts`: **`superseded`** (no-op; no `sync_changes` emitted).
      - If `new_value == current_value` and `effective_ts > stored_ts`: advance `stored_ts = effective_ts`, emit `sync_changes` `upsert` (so other devices converge on the latest LWW timestamp), and return **`applied`**.
      - If `incoming_key > stored_key`: apply `new_value`, set `stored_ts = effective_ts`, emit `sync_changes` `upsert`, return **`applied`**.
-     - Else (`incoming_key <= stored_key`): leave DB unchanged, return **`superseded`** with `current_entity`.
-   - **Proof of Commutativity**: Because `(effective_ts, rank(value))` defines a strict total order on `(timestamp, value)` pairs for every field, taking the maximum over any finite set of mutations yields the exact same `(timestamp, value)` regardless of arrival order or duplicates.
+     - Else (`incoming_key <= stored_key`): leave DB unchanged, return **`superseded`** with slim `current_entity`.
+   - **Scope of Commutativity**: Because `(effective_ts, rank(value))` defines a strict total order on `(timestamp, value)` pairs for every field, taking the maximum over any finite set of single-field LWW mutations (`item_set_state`, `item_set_starred`, `feed_set_field`) — plus explicit `scope='items'` bulk mark-read on `unread`/`read` items — yields the exact same `(timestamp, value)` regardless of arrival order or duplicates. Scoped bulk mark-read (`all`/`feed`/`category`) and `expired` exclusion are deliberate non-commuting carve-outs documented in item 4 below.
 3. **Side-Effect Timestamps on `item_set_state` & `item_set_starred`**:
    - When `item_set_state` wins and sets `state = "read"`:
      - `item.state = "read"`, `item.read_at = effective_ts`, `item.read_state_updated_at = effective_ts`, `item.unexpired_at = None`, `item.updated_at = server_now`.
@@ -538,27 +565,36 @@ Pure deterministic functions with zero DB dependencies (tested exhaustively with
      - `item.state = "unread"`, `item.read_at = None`, `item.read_state_updated_at = effective_ts`, `item.updated_at = server_now`.
    - When `item_set_starred` wins:
      - `item.is_starred = new_starred`, `item.starred_at = effective_ts if new_starred else None`, `item.starred_updated_at = effective_ts`, `item.updated_at = server_now`. (`item.state` is untouched.)
-4. **Bounded `item_mark_bulk_read` Rules (Decision B-05)**:
+4. **Bounded `item_mark_bulk_read` Rules (Decision `1b-D05`, Owner decision `Q-2` / `P-01`)**:
    - **Validation**:
      - `scope == "all"`: requires `up_to_sync_seq is not None` (`>= 0`); `feed_id`, `category_id`, `item_ids` must be `None`.
      - `scope == "feed"`: requires `feed_id` and `up_to_sync_seq >= 0`; rejects with `entity_not_found` if feed doesn't exist.
      - `scope == "category"`: requires `category_id` and `up_to_sync_seq >= 0`; rejects with `category_not_found` if category doesn't exist or `deleted_at IS NOT NULL`.
-     - `scope == "items"`: requires non-empty `item_ids` (`1 <= len(item_ids) <= 1000`); `up_to_sync_seq` optional/ignored.
-   - **Matching filter**:
-     - Always `items.state = 'unread'` (never touches `read` or `expired`; starred unread items DO transition to `read` while staying `is_starred = True`).
-     - Scoped modes (`all`/`feed`/`category`): `items.ingest_sync_seq <= :up_to_sync_seq`.
-     - Optional `older_than_ts` (timezone-aware): `COALESCE(items.published_at, items.fetched_at) < :older_than_ts`.
-     - Per-item LWW guard: `(effective_ts > items.read_state_updated_at) OR (effective_ts = items.read_state_updated_at)` (since `rank('read') = 3 > rank('unread') = 2`, on `state = 'unread'` an equal timestamp always wins!).
+     - `scope == "items"`: requires non-empty `item_ids` (`1 <= len(item_ids) <= 1000`, with total explicit `item_ids` across the entire push request `<= 5000`); `up_to_sync_seq` optional/ignored.
+   - **Two-tier matching semantics (`Q-2`)**:
+     - **Explicit `scope == "items"` (true per-item LWW over `unread` & `read`)**: For each existing item in `item_ids` with `state IN ('unread', 'read')` (still excluding `expired` as a documented carve-out; starred items stay `is_starred = True`), apply the exact same LWW `item_set_state(state='read', effective_ts)` rule as single-item writes:
+       - `unread` rows with `effective_ts >= read_state_updated_at` flip to `read` (`read_at = effective_ts, read_state_updated_at = effective_ts, unexpired_at = None, updated_at = server_now`) and emit `item` `upsert`.
+       - Already-`read` rows with `effective_ts > read_state_updated_at` advance `read_state_updated_at = effective_ts, read_at = effective_ts, updated_at = server_now` and emit `item` `upsert`.
+       - This makes `scope='items'` (including `1e` `mark_cluster_read`) strictly commutative with `item_set_state` across `unread`/`read` items!
+     - **Scoped modes (`scope IN ('all', 'feed', 'category')` — owner-accepted non-commuting carve-out)**:
+       - Filter strictly to `items.state = 'unread'` (never touches already-`read` or `expired` archive rows, avoiding locking and re-emitting tens of thousands of historical archived `read` items on every "Mark all read" click; starred unread items DO transition to `read` while staying `is_starred = True`).
+       - Filter `items.ingest_sync_seq <= :up_to_sync_seq`, plus optional `older_than_ts` (`COALESCE(items.published_at, items.fetched_at) < :older_than_ts`), plus per-item LWW guard `effective_ts >= items.read_state_updated_at` (since `rank('read') = 3 > rank('unread') = 2`).
+       - **Documented non-commuting carve-out**: Because scoped bulk read skips rows that are currently `read` or `expired`, an offline `read → unread` (or `expired → unread`) mutation at `t2 < t3` can produce `unread` if the bulk read arrives before it, vs. `read` if the bulk read arrives after it. Accepted by the project owner (`Q-2`) to preserve O(unread) latency and zero archive sync amplification.
    - **Execution & Outcome**:
-     - Locks matching `items` rows in `id ASC` order (respecting §5.1 lock ordering), updates `state = 'read', read_at = effective_ts, read_state_updated_at = effective_ts, updated_at = server_now`, records `SyncEvent("item", id, "upsert")` for every modified item.
+     - Locks matching `items` rows in `id ASC` order (respecting §5.1 lock ordering), updates matching rows, records `SyncEvent("item", id, "upsert")` for every modified item.
      - Records `outcome = "applied"`, `affected_count = <modified_rows>` (even if `0` items matched — e.g., already read by another device — the mutation is valid and `applied` with `affected_count = 0`, never `rejected`).
 
-### 6.6 `feed_set_field` & Online `PATCH /api/v1/feeds/{id}` Alignment (`S-04`)
+### 6.6 `feed_set_field`, Online Monotonic LWW & Shared Status Helper (`S-04`, `P-02`, `Q-4`)
 
+- **Shared Feed Status Transition Helper (`domain/sync_merge.py` — Owner decision `Q-4`)**:
+  - Introduce `apply_feed_status_transition(feed, new_status, db_now) -> bool` (returns `should_enqueue_poll`) used identically by **both** online `PATCH /api/v1/feeds/{id}` (`routes/feeds.py`) and offline `feed_set_field` (`sync/service.py`):
+    - If `old_status == "unsubscribed"` and `new_status == "active"`: reset `etag = None`, `last_modified = None`, `health_state = "healthy"`, `consecutive_errors = 0`, `last_error = None`, `initial_backfill_done = False`, `next_fetch_at = db_now`, set `feed.status = "active"`, and return `True` (caller enqueues `poll_feed` with `priority=10, bump_existing=True` in §5.1 lock order after `items` and before `sync_state`).
+    - If `old_status == "paused"` and `new_status in ("active", "muted")`: set `next_fetch_at = min(feed.next_fetch_at, db_now)` if `feed.next_fetch_at` else `db_now`, set `feed.status = new_status`, return `False`.
+    - Otherwise: set `feed.status = new_status`, return `False`.
 - **Allowed `feed_set_field` fields & validation**:
   | `field` | Expected `value` | Rejection Cases | Side Effects on Apply |
   | :--- | :--- | :--- | :--- |
-  | `status` | `"active" \| "paused" \| "muted" \| "unsubscribed"` | Invalid enum → `invalid_field_value` | If `unsubscribed → active`: reset `etag=None`, `last_modified=None`, `health_state='healthy'`, `consecutive_errors=0`, `last_error=None`, `initial_backfill_done=False`, `next_fetch_at=server_now`, and enqueue `poll_feed` (`priority=10`, `bump_existing=True`). If `paused → active\|muted`: set `next_fetch_at = LEAST(COALESCE(next_fetch_at, server_now), server_now)`. |
+  | `status` | `"active" \| "paused" \| "muted" \| "unsubscribed"` | Invalid enum → `invalid_field_value` | Calls shared `apply_feed_status_transition(feed, value, server_now)` and enqueues `poll_feed` if returned `True`. |
   | `category_id` | `UUID \| null` | Non-null UUID missing or `deleted_at IS NOT NULL` → `category_not_found` | Sets `feed.category_id = value`. |
   | `expiration_days_override` | `int (0..3650) \| null` | Out of range / non-int → `invalid_field_value` | Sets `feed.expiration_days_override = value`. |
   | `research_policy.enabled` | `bool` | Non-bool → `invalid_field_value` | Updates `feed.research_policy["enabled"] = value` (preserving sibling keys). |
@@ -566,39 +602,65 @@ Pure deterministic functions with zero DB dependencies (tested exhaustively with
 - **Stored LWW timestamp lookup**:
   - Read `field_updated_at.get(field)`; for `research_policy.<subkey>`, fall back to `field_updated_at.get("research_policy")` if the granular key is absent (backward compatibility with `1a` rows). If neither exists, treat stored timestamp as `feed.created_at`.
   - On win, write `field_updated_at[field] = effective_ts.isoformat()`.
-- **`config_version` independence (`S-04`)**:
+- **Online Monotonic LWW Rule (`P-02`, `C5`, `C7`) & `config_version` independence (`S-04`)**:
   - `feed_set_field` NEVER reads or increments `feeds.config_version`.
-  - In online `PATCH /api/v1/feeds/{id}` (`routes/feeds.py`):
+  - Add pure helper `compute_online_lww_timestamp(db_now: datetime, stored_ts: datetime | None) -> datetime` in `domain/sync_merge.py`:
+    ```python
+    if stored_ts is not None and stored_ts >= db_now:
+        return stored_ts + timedelta(microseconds=1)
+    return db_now
+    ```
+  - **Online `PATCH /api/v1/feeds/{id}` and `POST /api/v1/feeds` reactivation (`routes/feeds.py`)**:
+    - Read `db_now = (await session.execute(sa.select(sa.func.now()))).scalar_one()` (never Python `datetime.now(UTC)`).
     - `config_version` increments **only** when `curation_instructions` actually changes (requires matching `expected_config_version`, returning `409 Conflict` on mismatch).
-    - When `research_policy` is updated via `PATCH /api/v1/feeds/{id}` or `POST /api/v1/feeds` reactivation, stamp granular `field_updated_at["research_policy.enabled"]` and `field_updated_at["research_policy.fetch_pdfs"]` for each subfield that changed (plus `field_updated_at["research_policy"]` for non-LWW subkeys `guidance`/`max_hops`), ensuring online edits properly beat older offline toggles.
+    - For every LWW field modified online (`status`, `category_id`, `expiration_days_override`, `research_policy.enabled`, `research_policy.fetch_pdfs`, `title`, `feed_url`, `poll_interval_minutes`, `fetch_full_text`), always apply the online value and stamp `field_updated_at[f] = compute_online_lww_timestamp(db_now, stored_ts_f).isoformat()` (for `research_policy`, stamp granular `research_policy.enabled` and `research_policy.fetch_pdfs` when changed, plus `research_policy` when `guidance`/`max_hops` change). Because the timestamp is strictly monotonic and always `>= db_now` and `> stored_ts_f`, a future-clamped offline write can never cause an online edit's timestamp to move backwards or lose to an older offline toggle.
+    - Status edits in `PATCH /api/v1/feeds/{id}` call the shared `apply_feed_status_transition(feed, body.status, db_now)` helper (`Q-4`).
+  - **Online `DELETE /api/v1/categories/{id}` (`routes/categories.py`)**:
+    - Read `db_now = SELECT now()`, set `cat.deleted_at = db_now`, `cat.updated_at = db_now`, and update affected child feeds (`ORDER BY id ASC` / bulk `UPDATE`) setting `category_id = NULL`, `updated_at = db_now`, and `field_updated_at['category_id']` monotonically via `GREATEST(now(), COALESCE(CAST(field_updated_at->>'category_id' AS timestamptz), CAST('-infinity' AS timestamptz)) + INTERVAL '1 microsecond')` formatted as ISO-8601 UTC.
 
-### 6.7 Single-Transaction Push Execution Flow (`sync/service.py`)
+### 6.7 Single-Transaction Push Execution Flow & Transient Retry Policy (`sync/service.py`, `P-05`)
+
+- **Transient-Error Retry Policy (`P-05`)**:
+  - Wrap the push transaction below in a bounded retry loop of **up to 3 attempts** with jittered backoff (`20–100 ms`), issuing `await session.rollback()` between attempts, retrying **only** on PostgreSQL SQLSTATE:
+    - `40P01` (`deadlock_detected`),
+    - `40001` (`serialization_failure`),
+    - `23505` (`unique_violation`) on `sync_mutations_pkey` (handles the realistic case where a client times out and retries a push while the first request is still committing — on attempt 2, step 2 finds the committed `sync_mutations` rows and returns the identical cached replay with HTTP `200`).
+  - If all 3 attempts fail with a retryable SQLSTATE, return HTTP `503 Service Unavailable` with `Retry-After: 1` (which `1c`'s outbox treats as retryable without dropping mutations).
 
 ```text
 1. Begin transaction. Read server_now = SELECT now().
-2. Bulk-load existing sync_mutations WHERE client_mutation_id = ANY(batch_ids) (chunked at 500).
-   - Maintain a `seen_in_batch: dict[UUID, SyncPushResult]` map so duplicate
-     client_mutation_ids within the same request array reuse the first occurrence's
-     outcome without inserting a duplicate PK into sync_mutations.
+2. Compute canonical payload_sha256 for every mutation in the batch.
+   Bulk-load existing sync_mutations WHERE client_mutation_id = ANY(batch_ids) (chunked at 500).
+   - Maintain a `seen_in_batch: dict[UUID, tuple[str, SyncPushResult]]` map (payload_sha256, result)
+     so duplicate client_mutation_ids within the same request array reuse the first occurrence's
+     outcome if payload_sha256 matches, or record outcome="rejected", reason="mutation_id_conflict"
+     if payload_sha256 differs.
    - For any mutation_id already persisted in sync_mutations:
-     - Same device_id → prepare cached replay outcome (+ fresh current_entity if superseded/rejected).
-     - Different device_id → prepare outcome="rejected", reason="mutation_id_conflict".
+     - Same device_id AND matching payload_sha256 → prepare cached replay outcome
+       (+ fresh slim current_entity if superseded/rejected).
+     - Different device_id OR mismatched payload_sha256 → prepare outcome="rejected",
+       reason="mutation_id_conflict".
 3. Collect all non-replayed target IDs up front to preserve strict §5.1 lock ordering:
-   - Active categories referenced by feed_set_field / item_mark_bulk_read (read check).
+   - Active categories referenced by feed_set_field / item_mark_bulk_read (read check / id ASC).
    - Feeds referenced by feed_set_field / item_mark_bulk_read → lock ORDER BY id ASC FOR UPDATE.
    - Items union: (explicit item_ids from item_set_state / item_set_starred / scope='items')
      UNION (candidate unread item_ids matching any scoped item_mark_bulk_read in this batch)
      → lock in strict ascending UUID order (ORDER BY id ASC FOR UPDATE, chunked at 500 if large).
 4. Process non-replayed mutations sequentially in request array order:
+   - Check dead-RTC lower bound (client_timestamp < server_now - 90 days → rejected: "clock_skew").
    - Compute effective_ts = min(client_timestamp, server_now + 5 minutes).
    - Validate entity existence & field rules → record "rejected" without raising DB errors.
    - Apply pure LWW merge in memory/SQL against the already-locked rows → "applied" or "superseded".
-   - Stage SyncMutation row (one per unique client_mutation_id) + collect SyncEvent(s) for modified entities.
-5. Bulk-insert staged SyncMutation rows (chunked at 500 for D1 safety).
-6. Coalesce staged SyncEvents by (entity_type, entity_id) preserving order, and call
+   - Stage any poll_feed job enqueues (for unsubscribed → active feed transitions) so jobs locks
+     are acquired after items and before sync_state (§5.1).
+   - Stage SyncMutation row (one per unique client_mutation_id, with payload_sha256) +
+     collect SyncEvent(s) for modified entities.
+5. Execute staged enqueue_job() calls (acquires jobs locks per §5.1 step 4).
+6. Bulk-insert staged SyncMutation rows (chunked at 500 for D1 safety).
+7. Coalesce staged SyncEvents by (entity_type, entity_id) preserving order, and call
    await sync_log.record(session, coalesced_events) ONCE (acquires sync_state FOR UPDATE last).
-7. Read final watermark = current_seq (from sync_state) and instance_epoch.
-8. Commit transaction and return SyncPushResponse.
+8. Read instance_epoch from sync_state, commit transaction, and return SyncPushResponse
+   (instance_epoch, server_now, results — no watermark).
 ```
 
 ---
@@ -610,7 +672,8 @@ Exposes `app_settings` over REST (previously CLI-only in `1a`) so clients can in
 - **`GET /api/v1/settings`** (authenticated): Returns `SyncAppSettingsDTO` (`default_expiration_days`, `backfill_cap`, `default_poll_interval_minutes`, `updated_at`).
 - **`PATCH /api/v1/settings`** (authenticated, JSON-only):
   - Accepts optional fields: `default_expiration_days (0..3650)`, `backfill_cap (0..500)`, `default_poll_interval_minutes (5..10080)`.
-  - Uses `model_fields_set` (`D3`), acquires `AppSettings WHERE id = 1 FOR UPDATE`, updates only changed fields, emits `SyncEvent("app_settings", APP_SETTINGS_ENTITY_ID, "upsert")` via `sync_log.record()` **only if at least one synced value actually changed** (`D2`), and commits.
+  - Passing an explicit `null` for any non-nullable field returns `422 Unprocessable Entity`.
+  - Uses `model_fields_set` (`D3`), acquires `AppSettings WHERE id = 1 FOR UPDATE` (before `sync_state` per §5.1), updates only changed fields using DB `now()`, emits `SyncEvent("app_settings", APP_SETTINGS_ENTITY_ID, "upsert")` via `sync_log.record()` **only if at least one synced value actually changed** (`D2`), and commits.
 
 ---
 
@@ -624,14 +687,14 @@ Exposes `app_settings` over REST (previously CLI-only in `1a`) so clients can in
   | **`B`** | `items.author` | — | Plain text (`COALESCE(author, '')`) |
   | **`C`** | `items.raw_summary` | `+ takeaways[]` (`1d`) | Strip HTML via stdlib `HTMLParser` (skipping `<script>`/`<style>` content, capped to first 256 KB raw input before parsing, collapsing whitespace, `S1`/`S5`) |
   | **`D`** | `items.extracted_text` | `+ research_context` (`1f`) | Slice to first `65_536` characters (`extracted_text[:65536]`) |
-- **SQL Expression** (`rebuild_item_search_vector(session, item_id, language=...)` and batch variant for `poll_feed`):
+- **SQL Expression** (`rebuild_item_search_vector(session, item_id, language=...)` and batch variant for `poll_feed`, using `CAST(...)` bind syntax per `D5`):
   ```sql
   UPDATE items
   SET search_vector =
-      setweight(to_tsvector(:fts_cfg::regconfig, COALESCE(:title, '')), 'A') ||
-      setweight(to_tsvector(:fts_cfg::regconfig, COALESCE(:author, '')), 'B') ||
-      setweight(to_tsvector(:fts_cfg::regconfig, COALESCE(:summary_plain, '')), 'C') ||
-      setweight(to_tsvector(:fts_cfg::regconfig, COALESCE(:body_slice, '')), 'D')
+      setweight(to_tsvector(CAST(:fts_cfg AS regconfig), COALESCE(:title, '')), 'A') ||
+      setweight(to_tsvector(CAST(:fts_cfg AS regconfig), COALESCE(:author, '')), 'B') ||
+      setweight(to_tsvector(CAST(:fts_cfg AS regconfig), COALESCE(:summary_plain, '')), 'C') ||
+      setweight(to_tsvector(CAST(:fts_cfg AS regconfig), COALESCE(:body_slice, '')), 'D')
   WHERE id = :item_id
   ```
 - **Maintenance Hooks**:
@@ -643,10 +706,12 @@ Exposes `app_settings` over REST (previously CLI-only in `1a`) so clients can in
 
 ### 8.2 `GET /api/v1/search`
 
+**Authentication & Security**: `GET /api/v1/search` requires a valid per-device bearer token (`Authorization: Bearer <token>`) and is protected by `1a`'s `Host` allow-list and CORS allow-list middleware (`ADR 0006`).
+
 **Query Parameters**
 | Param | Type | Default | Constraints / Behavior |
 | :--- | :--- | :--- | :--- |
-| `q` | `str \| null` | `null` | `max_length=500`. Parsed via `websearch_to_tsquery(:fts_cfg::regconfig, :q)`. If provided and blank/whitespace-only, treated as `None`; if non-blank but reduces to an empty `tsquery` (e.g. only stop-words `"the and"` or punctuation `"!!!"`), returns `results=[], total=0` immediately. |
+| `q` | `str \| null` | `null` | `max_length=500`. Parsed via `websearch_to_tsquery(CAST(:fts_cfg AS regconfig), :q)`. If provided and blank/whitespace-only, treated as `None`. If non-blank and `numnode(tsq) = 0` (only stop-words `"the and"` or punctuation `"!!!"`), returns `results=[], total=0` immediately. If `querytree(tsq) = 'T'` (negation-only or non-GIN-indexable query such as `"-foo"`, `"-foo -bar"`, `-"hello world"`, or `"foo OR -bar"` — verified on PG16), returns `422 Unprocessable Entity` (`"Search query must include at least one positive required search term"`). |
 | `feed_id` | `UUID \| null` | `null` | Exact match on `items.feed_id`. |
 | `category_id` | `UUID \| null` | `null` | Matches items whose feed has `feeds.category_id == :category_id`. |
 | `state` | `Literal["unread", "read", "expired"] \| null` | `null` | Exact match on `items.state`. |
@@ -657,24 +722,31 @@ Exposes `app_settings` over REST (previously CLI-only in `1a`) so clients can in
 | `limit` | `int` | `20` | `1 <= limit <= 100`. |
 | `offset` | `int` | `0` | `0 <= offset <= 10000`. |
 
-**Structured XSS-Safe Snippets (Decision B-07)**
-- Computed **only** for the `limit` rows returned on the current page (never over the full match set), and only when `q` produced a non-empty `tsquery`.
-- Source text per matched row: plain text built from `extracted_text[:65536]` if non-empty, else HTML-stripped `raw_summary[:65536]` if non-empty, else `title`, with any literal `\x02` (`STX`) and `\x03` (`ETX`) control characters stripped first.
-- PostgreSQL `ts_headline` runs with:
+**Structured XSS-Safe Snippets (Decision `1b-D07`, `P-15`)**
+- Computed **only** for the `limit` rows returned on the current page (never over the full match set), and only when `q` produced a non-empty, GIN-indexable `tsquery`.
+- Source text per matched row: plain text built from `LEFT(extracted_text, 65536)` if non-empty, else HTML-stripped `LEFT(raw_summary, 65536)` if non-empty, else `title`, with any literal `\x02` (`STX`), `\x03` (`ETX`), and `\x04` (`EOT`) control characters stripped first.
+- PostgreSQL `ts_headline` runs with `CAST(...)` and a double-quoted `chr(4)` fragment delimiter (verified on PG16 to preserve unambiguous fragment boundaries without dropping spaces or colliding with article `…`):
   ```sql
   ts_headline(
-    :fts_cfg::regconfig,
+    CAST(:fts_cfg AS regconfig),
     :plain_text,
     :tsq,
-    'StartSel=' || chr(2) || ', StopSel=' || chr(3) || ', MaxWords=35, MinWords=15, MaxFragments=2, FragmentDelimiter= … '
+    'StartSel=' || chr(2) || ', StopSel=' || chr(3) || ', MaxWords=35, MinWords=15, MaxFragments=2, FragmentDelimiter="' || chr(4) || '"'
   )
   ```
-- Python (`domain/fts_text.py`) parses the returned string on `\x02` / `\x03` boundaries into a list of typed fragments:
+- Python (`domain/fts_text.py`) splits the returned string on `\x04` into fragments and parses each fragment on `\x02` / `\x03` boundaries into `list[list[SnippetFragment]]`:
   ```json
   "snippet": [
-    { "text": "PostgreSQL ", "highlight": false },
-    { "text": "pgvector", "highlight": true },
-    { "text": " HNSW indexes accelerate nearest-neighbor search", "highlight": false }
+    [
+      { "text": "PostgreSQL ", "highlight": false },
+      { "text": "pgvector", "highlight": true },
+      { "text": " HNSW indexes accelerate nearest-neighbor search", "highlight": false }
+    ],
+    [
+      { "text": "Tune ", "highlight": false },
+      { "text": "pgvector", "highlight": true },
+      { "text": " ef_search for recall", "highlight": false }
+    ]
   ]
   ```
 - **Security property**: Zero HTML tags are ever injected or interpreted; even if an article's body literally contains `<script>alert(1)</script>`, it is returned as inert plain text inside `{"text": "<script>alert(1)</script>", "highlight": false}` and rendered safely as React text nodes in `1c`.
@@ -689,16 +761,20 @@ Exposes `app_settings` over REST (previously CLI-only in `1a`) so clients can in
   "offset": 0,
   "results": [
     {
-      "item": { "...SyncItemDTO..." },
+      "item": { "...SearchItemDTO (SyncItemDTO minus raw_summary/summary_truncated)..." },
       "rank": 0.4125,
       "snippet": [
-        { "text": "...", "highlight": false },
-        { "text": "pgvector", "highlight": true }
+        [
+          { "text": "...", "highlight": false },
+          { "text": "pgvector", "highlight": true }
+        ]
       ]
     }
   ]
 }
 ```
+- **Slim `SearchItemDTO` (`P-08`)**: Search results omit `raw_summary` and `summary_truncated` (retaining `lead_excerpt` plus structured `snippet` fragments) so up to 100 search results stay compact.
+- **Normative Client Cache Rule (`1c` and Phase 2 — `P-17`)**: Search results can return `expired` or `>14d read` archive items outside the client's working set. Clients MUST treat search results as **display-only** and MUST NOT blindly merge them into Dexie's active working set; if the user stars or restores a search result to `unread`, the resulting mutation/pull brings the item into the working set normally.
 
 ---
 
@@ -708,14 +784,15 @@ Cross-checked against [docs/review-checklist.md](../review-checklist.md):
 
 | Checklist ID | Concern | Design Mitigation in `1b` |
 | :--- | :--- | :--- |
-| **S1 / S5** | Untrusted HTML/text in libraries & parser limits | HTML stripping uses stdlib `HTMLParser` (linear-time, non-recursive, never touches filesystem/URLs) on a pre-sliced input cap (`<= 256 KB`). `FTS_LANGUAGE` is validated against a strict allow-list. |
-| **S6** | Size caps & JSON payload bounds | `sync/push` capped at `500` mutations; `item_ids` in `item_mark_bulk_read` capped at `1,000`; `raw_summary` capped at `32,768` chars; `lead_excerpt` at `1,500` chars; `extracted_text` omitted from sync and sliced to `65,536` chars for FTS/headline; `q` capped at `500` chars. |
-| **C1 / Deadlocks** | Concurrent writes & stale reads | Strict global lock order (`categories` → `feeds` (`id ASC`) → `items` (`id ASC`) → `sync_state`). `bootstrap` Page 1 and `pull` run in single `REPEATABLE READ` read transactions so `sync_state` and rows share one snapshot. |
-| **C5** | Single clock | `sync/push` reads `server_now = SELECT now()` from PostgreSQL once per batch; `bootstrap` uses DB `now() - INTERVAL '14 days'`; `SyncLogWriter` uses `clock_timestamp()` under `sync_state FOR UPDATE`. |
+| **S1 / S5** | Untrusted HTML/text in libraries & parser limits | HTML stripping uses stdlib `HTMLParser` (linear-time, non-recursive, never touches filesystem/URLs) on a pre-sliced input cap (`<= 256 KB`). `FTS_LANGUAGE` is validated against a strict allow-list and bound via `CAST(:fts_cfg AS regconfig)`. |
+| **S6** | Size caps & JSON payload bounds | `sync/push` capped at `2 MiB` body (`413`), `500` mutations, and `5,000` total explicit `item_ids` (`1,000` per mutation); `raw_summary` capped at `32,768` chars; `lead_excerpt` at `1,500` chars; push `current_entity` uses slim snapshots and search omits `raw_summary`; `extracted_text` omitted from sync and projected via `LEFT(..., 8192)` on hydration / `LEFT(..., 65536)` on FTS/headline; `q` capped at `500` chars. |
+| **C1 / Deadlocks** | Concurrent writes & stale reads | Strict global lock order (`categories` → `feeds` (`id ASC`) → `items` (`id ASC`, including `poll_feed` sorting `matched_existing`) → `jobs` → `app_settings` → `sync_state`). `bootstrap` Page 1 and `pull` run in single `REPEATABLE READ` read transactions. `sync/push` retries `40P01`/`40001`/`23505` up to 3× with jitter before returning `503`. |
+| **C5 / C7** | Single clock & monotonic LWW | `sync/push`, online `PATCH /feeds`, `POST /feeds` reactivation, `DELETE /categories`, and `PATCH /settings` all use PostgreSQL `SELECT now()`. Online LWW edits use `GREATEST(db_now, stored_ts + 1µs)` via shared `compute_online_lww_timestamp()`. `SyncLogWriter` uses `clock_timestamp()` under `sync_state FOR UPDATE`. |
 | **D1** | PostgreSQL 65,535 bind-param limit | `SyncLogWriter.record()` chunks `sync_changes` inserts at `1,000` rows; `pull` hydration & `push` pre-loads chunk at `500` IDs; `poll_feed` `ingest_sync_seq` update uses `UNNEST` (2 params total). |
-| **D2** | Sync emission guard | `ITEM_SYNCED_COLUMNS` added to `sync_log.py`; all synced mutations (`sync/push`, `PATCH /api/v1/settings`, `PATCH /api/v1/feeds`) go through `SyncLogWriter.record()`; `search_vector` & `ingest_sync_seq` updates explicitly emit zero extra events. |
-| **D3** | Defaults on partial updates | `PATCH /api/v1/settings` and `feed_set_field` apply only explicitly provided fields (`model_fields_set`), never clobbering sibling keys in `research_policy` or `app_settings`. |
-| **L3** | Event-loop responsiveness | HTML stripping and snippet parsing run quickly on bounded slices (`<= 64–256 KB`); bulk `smartrss search reindex` commits in 500-row batches. |
+| **D2** | Sync emission guard | `poll_interval_minutes` added to `FEED_SYNCED_COLUMNS` (`last_fetched_at`/`last_success_at` excluded from `SyncFeedDTO`); `ITEM_SYNCED_COLUMNS` added to `sync_log.py`; all synced mutations go through `SyncLogWriter.record()`; `search_vector` & `ingest_sync_seq` updates explicitly emit zero extra events. |
+| **D3** | Defaults on partial updates | `PATCH /api/v1/settings` (rejecting explicit `null` with `422`) and `feed_set_field` apply only explicitly provided fields (`model_fields_set`), never clobbering sibling keys in `research_policy` or `app_settings`. |
+| **D5** | SQLAlchemy `text()` bind casts | All parameterized casts in SQLAlchemy `text()` use `CAST(:param AS type)` (verified on SQLAlchemy 2.1.9) instead of `:param::type`. |
+| **L3** | Event-loop responsiveness | HTML stripping and snippet parsing run quickly on bounded slices (`<= 64–256 KB`); bulk `smartrss search reindex` and `0002` backfill commit in 500-row batches. |
 
 ---
 
@@ -732,18 +809,18 @@ Add the following `1b` modules to `CRITICAL_MODULES` in [`scripts/check-critical
 
 | # | Test Area | Layer | Required Assertions |
 | :--- | :--- | :--- | :--- |
-| **M-01** | **Gap-free concurrent-commit `sync_seq`** | Integration (Real PG) | Two concurrent DB connections: Tx A begins first, mutates an item, pauses; Tx B begins second, mutates another item, commits; client pulls `since_seq=0` (sees Tx B); Tx A commits (receives higher `seq`); client pulls `since_seq=B.seq` → receives Tx A with zero skipped or duplicated rows. |
-| **M-02** | **LWW commutativity & clock-skew convergence** | Unit (`hypothesis`) | Generate random sets of `item_set_state`, `item_set_starred`, and `feed_set_field` mutations including **identical timestamps**, out-of-order arrivals, duplicates, and far-future timestamps (`+1 year`, clamped to `server_now + 5 min`). Assert every permutation converges to the exact same final state and timestamps. |
-| **M-03** | **Bootstrap pagination + mid-bootstrap writes** | Integration (Real PG) | Seed > 2 pages of mixed `unread`, `starred`, recent `read` (<= 14d), old `read` (> 14d), and `expired` items. Verify working-set filter, keyset pagination without duplicates/gaps, mid-bootstrap inserts/mutations caught by trailing `pull(page1_watermark)`, and `instance_epoch` mismatch detection mid-pagination. |
-| **M-04** | **`sync/pull` coalescing, tombstones & `resync_required`** | Integration (Real PG) | Verify multiple `sync_changes` for the same item coalesce to 1 hydrated DTO while advancing `next_seq` to max raw `seq`; verify `category` soft-delete emits `op="delete"` even if pulled before its delete `seq`; verify all 3 `resync_required` reasons (`epoch_mismatch`, `cursor_ahead`, `cursor_pruned` including empty-table-after-prune). |
-| **M-05** | **`sync/push` idempotency, rejections & `expired` transitions** | Integration (Real PG) | Duplicate `client_mutation_id` (same device → cached replay, no duplicate side effects; different device → `rejected: mutation_id_conflict`); invalid `item_id` / deleted `category_id` returns `rejected` + `current_entity` without rolling back valid sibling mutations in the same batch; `expired → unread` sets `unexpired_at` and survives `expire_items`; starring an `expired` item leaves `state='expired'`. |
-| **M-06** | **Bounded `mark_bulk_read` (`up_to_sync_seq` & `item_ids`)** | Integration (Real PG) | Poll batch 1 (`seq <= W`), poll batch 2 (`seq > W`), push `item_mark_bulk_read(scope='feed', up_to_sync_seq=W)` → batch 1 marked `read`, batch 2 stays `unread`, `expired` untouched, starred unread marked `read` while staying `is_starred=True`; verify `older_than_ts`, `category` scope, `items` scope, and persistence across `sync_changes` pruning. |
-| **M-07** | **`feeds.config_version` vs `field_updated_at` (`S-04`)** | Integration (Real PG) | Offline `feed_set_field` (`status`, `category_id`, `research_policy.fetch_pdfs`) never bumps `config_version`; concurrent online `PATCH curation_instructions` with original `expected_config_version` still succeeds; online `PATCH research_policy.fetch_pdfs` stamps granular `field_updated_at` and beats older offline toggle. |
-| **M-08** | **500-mutation flush performance benchmark (`NFR-SYNC-02`)** | Integration (Real PG) | Push 500 mixed mutations in a single `POST /api/v1/sync/push` call against real PostgreSQL; assert wall-clock time `< 5.0s` (expected `< 0.5s`) and all 500 `sync_mutations` + coalesced `sync_changes` recorded cleanly. |
-| **M-09** | **DB restore-epoch end-to-end sync recovery drill** | Integration (Real PG) | Simulate a paired client at `seq = N, epoch = E1` with pending offline outbox mutations; simulate backup restore (rewind `current_seq < N`, rotate `instance_epoch = E2`); verify `sync/pull` returns `resync_required (epoch_mismatch)`, client re-bootstraps, flushes outbox idempotently, and converges with zero lost mutations. |
-| **M-10** | **PostgreSQL FTS ranking, filters, hooks & XSS-safe snippets** | Unit + Integration (Real PG) | Verify `A > B > C > D` weighting (`title` beats `extracted_text`), `websearch_to_tsquery` phrases & `-exclude`, stop-word-only/punctuation queries return empty cleanly, HTML tags in `raw_summary` are stripped (not matched), `poll_feed` & `extract_content` populate `search_vector`, `smartrss search reindex` works, and `<script>` / `\x02` / `\x03` payloads produce safe plain-text `SnippetFragment[]`. |
-| **M-11** | **Online settings API & retention cleanup** | Integration (Real PG) | `GET`/`PATCH /api/v1/settings` emits diff-gated `app_settings` `upsert`; `retention_cleanup` prunes contiguous `sync_changes` prefix, advances `sync_state.pruned_through_seq`, and prunes `sync_mutations` older than 90 days. |
-| **M-12** | **Alembic `0002` upgrade + downgrade round-trip** | Integration (Real PG) | Migrate `base → 0001 → seed rows → 0002` (verifying `ingest_sync_seq` and `search_vector` backfill) → `downgrade 0001` → `upgrade head` cleanly. |
+| **1b-T01** | **Gap-free concurrent-commit `sync_seq` & lock ordering** | Integration (Real PG) | (a) Two concurrent DB connections: Tx A begins first, mutates an item, pauses; Tx B begins second, mutates another item, commits; client pulls `since_seq=0` (sees Tx B); Tx A commits (receives higher `seq`); client pulls `since_seq=B.seq` → receives Tx A with zero skipped or duplicated rows. (b) Two-connection test where `poll_feed` updates two existing items while `sync/push` locks the same two items, asserting sorted `item.id ASC` update order and zero deadlocks (`P-04`). |
+| **1b-T02** | **LWW commutativity, clock-skew & mixed-batch convergence** | Unit + Integration (`hypothesis`) | (a) Pure `hypothesis` tests over `item_set_state`, `item_set_starred`, `feed_set_field` including identical timestamps, out-of-order arrivals, duplicates, far-future timestamps (`+1 year`, clamped to `server_now + 5 min`), and dead-RTC timestamps (`< server_now - 90d` → `rejected: clock_skew`). (b) Real-Postgres `hypothesis` test (small `max_examples`) permuting mixed batches through `sync/service.py` including `item_mark_bulk_read`: asserts identical final rows across permutations for `scope='items'` on `unread`/`read` items, and asserts the documented non-commuting carve-out for `scope='feed'` (`P-01`). |
+| **1b-T03** | **Bootstrap pagination + mid-bootstrap writes** | Integration (Real PG) | Seed > 2 pages of mixed `unread`, `starred`, recent `read` (<= 14d), old `read` (> 14d), and `expired` items. Verify working-set filter, bounded SQL slice projection, keyset pagination without duplicates/gaps, `server_now` presence, mid-bootstrap inserts/mutations caught by trailing `pull(page1_watermark)`, and `instance_epoch` mismatch detection mid-pagination. |
+| **1b-T04** | **`sync/pull` coalescing, cross-entity ordering, push→pull & `resync_required`** | Integration (Real PG) | (a) Multiple `sync_changes` for the same item coalesce to 1 hydrated DTO while advancing `next_seq` to max raw `seq`. (b) Coalescing `[feed(1), item(2), feed(3)]` emits `[item(2), feed(3)]` (`P-12`). (c) Two-device push→pull test (`P-03`): Device B pushes, Device A pushes (no `watermark` in response), Device A pulls from its old cursor and receives B's change. (d) `category` soft-delete emits `op="delete"` even if pulled before its delete `seq`. (e) All 3 `resync_required` reasons (`epoch_mismatch`, `cursor_ahead`, `cursor_pruned` including empty-table-after-prune). |
+| **1b-T05** | **`sync/push` idempotency, payload hash, concurrent retry & `expired` transitions** | Integration (Real PG) | (a) Duplicate `client_mutation_id` (same device + same `payload_sha256` → cached replay, no duplicate side effects; same device + different `payload_sha256` → `rejected: mutation_id_conflict`; different device → `rejected: mutation_id_conflict`). (b) Two concurrent pushes of the same 50-mutation batch from the same device both return `200` with identical outcomes and single application (`P-05`). (c) Dead-RTC timestamp `< server_now - 90d` → `rejected: clock_skew`. (d) Request > 5,000 total explicit `item_ids` → `422`; body > 2 MiB → `413`. (e) Invalid `item_id` / deleted `category_id` returns `rejected` + slim `current_entity` without rolling back sibling mutations; `expired → unread` sets `unexpired_at` and survives `expire_items`; starring an `expired` item leaves `state='expired'`. |
+| **1b-T06** | **Bounded `mark_bulk_read` (`up_to_sync_seq`, `scope='items'` & two-order regression)** | Integration (Real PG) | Poll batch 1 (`seq <= W`), poll batch 2 (`seq > W`), push `item_mark_bulk_read(scope='feed', up_to_sync_seq=W)` → batch 1 marked `read`, batch 2 stays `unread`, `expired` untouched, starred unread marked `read` while staying `is_starred=True`; verify `older_than_ts`, `category` scope, `items` scope, and persistence across `sync_changes` pruning. Explicit two-order regression from `P-01`: `scope='items'` converges identically in both arrival orders; `scope='feed'` documents the accepted `unread`-only carve-out. |
+| **1b-T07** | **Online LWW monotonicity, `config_version`, `poll_interval_minutes` & status side effects (`S-04`, `P-02`, `P-06`, `Q-4`)** | Integration (Real PG) | (a) Offline `feed_set_field` never bumps `config_version`; concurrent online `PATCH curation_instructions` with original `expected_config_version` succeeds. (b) Fast-laptop `P-02` regression: laptop pushes `muted@+4m`, online `PATCH active` at `t+1m`, tablet pushes `paused@+2m` in both arrival orders → both converge to `active` with non-decreasing `field_updated_at['status']`; same monotonic check for `DELETE /categories/{id}`. (c) Online `PATCH status: unsubscribed → active` runs the exact same reset + `poll_feed` enqueue as offline `feed_set_field` (`Q-4`). (d) `PATCH poll_interval_minutes` emits a `feed` `upsert` visible via `sync/pull`, and `last_fetched_at`/`last_success_at` are absent from `SyncFeedDTO` (`P-06`). |
+| **1b-T08** | **500-mutation flush, response-size & 20k bulk-read benchmarks (`NFR-SYNC-02`, `P-08`, `P-09`)** | Integration (Real PG) | (a) Push 500 mixed mutations in one `POST /api/v1/sync/push` call → wall-clock `< 5.0s` (expected `< 0.5s`) and all 500 `sync_mutations` + coalesced `sync_changes` recorded cleanly. (b) Push 500 all-superseded mutations against items with 32 KB `raw_summary` → response payload `< 512 KB` (`P-08`). (c) `item_mark_bulk_read(scope='all')` over 20,000 unread items → completes `< 5.0s` with chunked `SyncLogWriter` inserts (`P-09`). |
+| **1b-T09** | **DB restore-epoch end-to-end sync recovery drill (`Q-1`, `P-11`)** | Integration (Real PG) | Simulate a paired client at `seq = N, epoch = E1` with both (a) recently-acknowledged mutations in its 48h replay journal (pushed after backup time) and (b) pending offline outbox mutations; simulate backup restore (rewind `current_seq < N`, rotate `instance_epoch = E2`); verify `sync/pull` returns `resync_required (epoch_mismatch)`, client re-bootstraps, replays both the 48h journal and pending outbox idempotently, and converges with zero lost read/star/feed state. |
+| **1b-T10** | **PostgreSQL FTS ranking, filters, negation guard, hooks & XSS-safe snippets (`P-13`, `P-15`)** | Unit + Integration (Real PG) | Verify bearer auth required (`401` without token); `A > B > C > D` weighting (`title` beats `extracted_text`); `websearch_to_tsquery` phrases & `foo -bar`; stop-word/punctuation-only queries return empty cleanly; negation-only / non-indexable queries (`-foo`, `-foo -bar`, `-"hello world"`, `foo OR -bar`) return `422` (`P-13`); HTML tags in `raw_summary` are stripped; `poll_feed` & `extract_content` populate `search_vector`; `smartrss search reindex` works; `SearchItemDTO` omits `raw_summary`; `<script>` / `\x02` / `\x03` / `\x04` payloads and multi-fragment matches produce safe `list[list[SnippetFragment]]` preserving fragment boundaries (`P-15`). |
+| **1b-T11** | **Online settings API & lock-ordered retention cleanup** | Integration (Real PG) | `GET`/`PATCH /api/v1/settings` rejects explicit `null` with `422` (`P-17`), emits diff-gated `app_settings` `upsert`; `retention_cleanup` updates `app_settings` before `sync_state` (`P-04`), prunes contiguous `sync_changes` prefix, advances `sync_state.pruned_through_seq`, and prunes `sync_mutations` older than 90 days. |
+| **1b-T12** | **Alembic `0002` upgrade + downgrade round-trip** | Integration (Real PG) | Migrate `base → 0001 → seed rows (including HTML with <script>/entities) → 0002` (verifying `ingest_sync_seq` and Python-builder `search_vector` backfill match `smartrss search reindex`, `P-14`) → `downgrade 0001` → `upgrade head` cleanly. |
 
 ---
 
@@ -752,6 +829,7 @@ Add the following `1b` modules to `CRITICAL_MODULES` in [`scripts/check-critical
 In accordance with [development-process.md §4.2](../development-process.md#42-docs-in-the-same-change-rule), the following minor refinements will be reflected in [docs/data-model.md](../data-model.md) in the same commit as `1b` approval/implementation:
 - `sync_state` (§4.2): add `pruned_through_seq BIGINT NOT NULL DEFAULT 0`.
 - `items` (§4.5): add `ingest_sync_seq BIGINT NOT NULL DEFAULT 0`.
-- `sync_mutations` (§4.9): mark `entity_id` nullable (for `scope='all'` / `scope='items'` bulk mark-read) and add `affected_count INT NULL`.
-- `feeds` (§4.4): document granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys in `field_updated_at`.
+- `sync_mutations` (§4.9): mark `entity_id` nullable (for `scope='all'` / `scope='items'` bulk mark-read), add `payload_sha256 TEXT NOT NULL`, and add `affected_count INT NULL`.
+- `feeds` (§4.4 & §5.1): document granular `research_policy.enabled` / `research_policy.fetch_pdfs` keys in `field_updated_at`, include `poll_interval_minutes` in synced feed fields, and note `last_fetched_at`/`last_success_at` as online-only.
+- `ADR 0004` / `data-model.md` §5.2: document the client 48-hour acknowledged replay journal on `epoch_mismatch`, the `server_now` clock-drift signal + 90-day dead-RTC lower bound, and the two-tier `mark_bulk_read` semantics (`scope='items'` LWW vs. scoped `unread`-only carve-out).
 

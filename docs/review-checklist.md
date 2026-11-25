@@ -27,6 +27,7 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | C4 | **Enqueue while running.** Does a "trigger now" or dedupe enqueue silently no-op when the job is `running`, while the API reports success? | `I-14`, `I-04` | Return the true outcome; re-enqueue after the running job closes. |
 | C5 | **One clock.** Are times compared or computed with both the DB `now()` and the Python clock? | `I-21` | Use `sa.func.now() + make_interval(...)` for DB-side scheduling. |
 | C6 | **Request-scoped side effects.** Does a dependency or helper `commit()` a shared request session? | `I-24` | Use a separate short session for incidental writes. |
+| C7 | **Monotonic LWW timestamps across online & offline writers.** Can an online edit write a timestamp earlier than a future-clamped offline write? | `P-02` | Online LWW writes use the DB clock and `GREATEST(db_now, stored_ts + 1µs)` via a shared helper so field timestamps never move backward. |
 
 ## 3. Long-running processes
 
@@ -47,6 +48,7 @@ Each item lists what to look for, how it went wrong before, and what "correct" l
 | D2 | **Every synced write emits a `sync_changes` event**, diff-gated, inside the same transaction. | ADR 0004 | `execute_synced` plus `SyncLogWriter`; the guards stay installed in tests. |
 | D3 | **Defaults on reactivate/upsert.** Does re-creating or reactivating a row overwrite user-set fields with request defaults? | `I-13` | Apply only fields in `model_fields_set`. |
 | D4 | **One field, one purpose.** Is a single column (a hash, a timestamp) used for two meanings? | `A-01` | Split into separate columns. |
+| D5 | **SQLAlchemy `text()` bind-cast syntax.** Does raw SQL use `:param::type`, which SQLAlchemy leaves unbound as literal text? | `P-07` | Always use `CAST(:param AS type)` or `sa.bindparam(..., type_=...)` / `sa.cast(...)`. |
 
 ## 5. Input handling & encoding
 
