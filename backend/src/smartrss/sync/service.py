@@ -36,6 +36,7 @@ from smartrss.domain.sync_merge import (
     merge_feed_field,
     merge_item_starred,
     merge_item_state,
+    normalize_utc,
     parse_field_timestamp,
 )
 from smartrss.jobs.queue import enqueue_job
@@ -404,7 +405,25 @@ async def sync_pull(
 
 
 def _mutation_payload_sha256(mutation: SyncMutationInput) -> str:
+    """Compute canonical payload SHA-256 invariant to TZ offset and UUID case (K-05)."""
     payload = mutation.model_dump(mode="json", exclude={"client_mutation_id"})
+    payload["client_timestamp"] = normalize_utc(mutation.client_timestamp).isoformat()
+    if isinstance(mutation, ItemMarkBulkReadMutation) and mutation.older_than_ts is not None:
+        payload["older_than_ts"] = normalize_utc(mutation.older_than_ts).isoformat()
+    elif (
+        isinstance(mutation, FeedSetFieldMutation)
+        and mutation.field == "category_id"
+        and mutation.value is not None
+    ):
+        try:
+            parsed_uuid = (
+                mutation.value
+                if isinstance(mutation.value, uuid.UUID)
+                else uuid.UUID(str(mutation.value))
+            )
+            payload["value"] = str(parsed_uuid)
+        except (ValueError, TypeError):
+            pass
     return compute_payload_sha256(payload)
 
 
@@ -603,7 +622,7 @@ async def _execute_push_once(
                 if skew_err is None and eff_preview is not None:
                     scoped_bulk_indices.append(idx)
 
-    # 3a. Active categories (id ASC)
+    # 3a. Active categories (id ASC FOR SHARE; blocks concurrent DELETE until push commits; K-01)
     active_category_ids: set[uuid.UUID] = set()
     if cat_ids_to_check:
         sorted_cats = sorted(cat_ids_to_check)
@@ -615,6 +634,7 @@ async def _execute_push_once(
                         sa.select(Category.id)
                         .where(Category.id.in_(chunk), Category.deleted_at.is_(None))
                         .order_by(Category.id.asc())
+                        .with_for_update(read=True)
                     )
                 )
                 .scalars()
@@ -644,6 +664,9 @@ async def _execute_push_once(
                 feeds_by_id[f.id] = f
 
     # 3c. Items union locked in strict id ASC order (lightweight PK lock if scoped bulk present)
+    # Keep each scoped bulk mutation's own pre-locked candidate IDs so the UPDATE never locks
+    # rows outside the §5.1 pre-locked set (K-04).
+    scoped_candidates_by_idx: dict[int, set[uuid.UUID]] = {}
     scoped_candidate_ids: set[uuid.UUID] = set()
     for idx in scoped_bulk_indices:
         bm = cast(ItemMarkBulkReadMutation, mutations[idx])
@@ -651,11 +674,12 @@ async def _execute_push_once(
             continue
         if bm.scope == "category" and bm.category_id not in active_category_ids:
             continue
-        cand_ids = (
+        cand_ids = set(
             (await session.execute(sa.select(Item.id).where(*_scoped_bulk_conditions(bm))))
             .scalars()
             .all()
         )
+        scoped_candidates_by_idx[idx] = cand_ids
         scoped_candidate_ids.update(cand_ids)
 
     all_item_ids_to_lock = sorted(explicit_item_ids | scoped_candidate_ids)
@@ -872,6 +896,9 @@ async def _execute_push_once(
         else:
             # ItemMarkBulkReadMutation
             eff_to_store = effective_ts
+            prelocked_ids: list[uuid.UUID] | None = None
+            if mutation.scope != "items":
+                prelocked_ids = sorted(scoped_candidates_by_idx.get(idx, set()) | explicit_item_ids)
             outcome, reason, affected_count, cur_type, cur_entity = await _apply_bulk_mark_read(
                 session,
                 mutation=mutation,
@@ -882,6 +909,7 @@ async def _execute_push_once(
                 feeds_by_id=feeds_by_id,
                 items_by_id=items_by_id,
                 staged_events=staged_events,
+                prelocked_candidate_ids=prelocked_ids,
             )
 
         res = SyncPushResult(
@@ -1017,6 +1045,7 @@ async def _apply_bulk_mark_read(
     feeds_by_id: dict[uuid.UUID, Feed],
     items_by_id: dict[uuid.UUID, Item],
     staged_events: list[SyncEvent],
+    prelocked_candidate_ids: Sequence[uuid.UUID] | None = None,
 ) -> tuple[
     Literal["applied", "superseded", "rejected"],
     str | None,
@@ -1065,9 +1094,20 @@ async def _apply_bulk_mark_read(
     if items_by_id:
         await session.flush()
 
+    if not prelocked_candidate_ids:
+        return "applied", None, 0, None, None
+
+    conditions = _scoped_bulk_conditions(mutation, effective_ts=effective_ts)
+    # Restrict UPDATE strictly to the §5.1 pre-locked candidate set (K-04)
+    conditions.append(
+        sa.text("items.id = ANY(CAST(:prelocked_ids AS uuid[]))").bindparams(
+            prelocked_ids=list(prelocked_candidate_ids)
+        )
+    )
+
     update_stmt = (
         sa.update(Item)
-        .where(*_scoped_bulk_conditions(mutation, effective_ts=effective_ts))
+        .where(*conditions)
         .values(
             state="read",
             read_at=effective_ts,

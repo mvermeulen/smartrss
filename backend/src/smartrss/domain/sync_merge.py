@@ -14,6 +14,7 @@ from smartrss.domain.fts_text import strip_html_to_plain_text
 MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 MAX_PAST_CLOCK_SKEW = timedelta(days=90)
 MAX_RAW_SUMMARY_CHARS = 32_768
+MAX_HTML_EXCERPT_INPUT_CHARS = 8_192
 LEAD_EXCERPT_CHARS = 1_500
 
 STATE_RANK: dict[str, int] = {
@@ -130,10 +131,10 @@ def derive_lead_excerpt(
 ) -> str | None:
     """Build 1,500-char plain-text lead_excerpt from extracted_text or stripped raw_summary."""
     if extracted_text and extracted_text.strip():
-        collapsed = _WHITESPACE_RE.sub(" ", extracted_text).strip()
+        collapsed = _WHITESPACE_RE.sub(" ", extracted_text[:MAX_HTML_EXCERPT_INPUT_CHARS]).strip()
         return collapsed[:LEAD_EXCERPT_CHARS] if collapsed else None
     if raw_summary:
-        plain = strip_html_to_plain_text(raw_summary)
+        plain = strip_html_to_plain_text(raw_summary, max_input_chars=MAX_HTML_EXCERPT_INPUT_CHARS)
         return plain[:LEAD_EXCERPT_CHARS] if plain else None
     return None
 

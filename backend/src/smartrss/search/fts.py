@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -105,6 +106,45 @@ def _build_vector_params(entry: SearchVectorInput, fts_cfg: str) -> dict[str, An
     }
 
 
+def _build_vector_params_batch(
+    entries: Sequence[SearchVectorInput],
+    fts_cfg: str,
+) -> list[dict[str, Any]]:
+    return [_build_vector_params(entry, fts_cfg) for entry in entries]
+
+
+def _prepare_page_texts(
+    rows: Sequence[tuple[str, str | None, str | None]],
+    *,
+    need_headline: bool,
+) -> tuple[list[str], list[str | None]]:
+    """Strip HTML and derive headline inputs + lead_excerpts off the event loop (K-03, L3)."""
+    headline_inputs: list[str] = []
+    lead_excerpts: list[str | None] = []
+    for title, raw_summary_slice, extracted_text_slice in rows:
+        if need_headline:
+            headline_inputs.append(
+                prepare_headline_input(
+                    title=title,
+                    raw_summary=raw_summary_slice,
+                    extracted_text=extracted_text_slice,
+                )
+            )
+        lead_excerpts.append(
+            derive_lead_excerpt(
+                extracted_text=extracted_text_slice,
+                raw_summary=raw_summary_slice,
+            )
+        )
+    return headline_inputs, lead_excerpts
+
+
+def _parse_headlines_batch(
+    raw_headlines: Sequence[str | None],
+) -> list[list[list[SnippetFragment]]]:
+    return [parse_headline_fragments(str(raw or "")) for raw in raw_headlines]
+
+
 async def rebuild_item_search_vector(
     session: AsyncSession,
     *,
@@ -117,16 +157,14 @@ async def rebuild_item_search_vector(
 ) -> None:
     """Rebuild items.search_vector for a single item without emitting a sync_changes event."""
     fts_cfg = validate_fts_language(fts_language)
-    params = _build_vector_params(
-        SearchVectorInput(
-            item_id=item_id,
-            title=title,
-            author=author,
-            raw_summary=raw_summary,
-            extracted_text=extracted_text,
-        ),
-        fts_cfg,
+    entry = SearchVectorInput(
+        item_id=item_id,
+        title=title,
+        author=author,
+        raw_summary=raw_summary,
+        extracted_text=extracted_text,
     )
+    params = await asyncio.to_thread(_build_vector_params, entry, fts_cfg)
     await execute_synced(session, _UPDATE_SEARCH_VECTOR_SQL.bindparams(**params), lambda _res: [])
 
 
@@ -140,8 +178,9 @@ async def rebuild_items_search_vectors_batch(
     if not entries:
         return
     fts_cfg = validate_fts_language(fts_language)
-    for entry in entries:
-        params = _build_vector_params(entry, fts_cfg)
+    # Offload CPU-heavy HTML stripping to a worker thread so event loop stays responsive (K-03, L3)
+    params_list = await asyncio.to_thread(_build_vector_params_batch, entries, fts_cfg)
+    for params in params_list:
         await execute_synced(
             session,
             _UPDATE_SEARCH_VECTOR_SQL.bindparams(**params),
@@ -332,35 +371,48 @@ async def search_items(
 
     page_rows = (await session.execute(page_stmt.limit(limit).offset(offset), query_params)).all()
 
-    headline_sql = sa.text(
+    batched_headline_sql = sa.text(
         """
-        SELECT ts_headline(
-            CAST(:fts_cfg AS regconfig),
-            :plain_text,
-            websearch_to_tsquery(CAST(:fts_cfg AS regconfig), :q),
-            'StartSel=' || chr(2) || ', StopSel=' || chr(3)
-            || ', MaxWords=35, MinWords=15, MaxFragments=2, FragmentDelimiter="' || chr(4) || '"'
-        )
+        SELECT u.ord,
+               ts_headline(
+                   CAST(:fts_cfg AS regconfig),
+                   u.plain_text,
+                   websearch_to_tsquery(CAST(:fts_cfg AS regconfig), :q),
+                   'StartSel=' || chr(2) || ', StopSel=' || chr(3)
+                   || ', MaxWords=35, MinWords=15, MaxFragments=2, FragmentDelimiter="'
+                   || chr(4) || '"'
+               ) AS hl
+        FROM unnest(CAST(:texts AS text[])) WITH ORDINALITY AS u(plain_text, ord)
+        ORDER BY u.ord ASC
         """
     )
 
-    results: list[SearchResultRow] = []
-    for row in page_rows:
-        snippet: list[list[SnippetFragment]] = []
-        if cleaned_q is not None:
-            plain_source = prepare_headline_input(
-                title=row.title,
-                raw_summary=row.raw_summary_slice,
-                extracted_text=row.extracted_text_slice,
-            )
-            hl_raw: str | None = (
-                await session.execute(
-                    headline_sql,
-                    {"fts_cfg": fts_cfg, "plain_text": plain_source, "q": cleaned_q},
-                )
-            ).scalar_one()
-            snippet = parse_headline_fragments(str(hl_raw or ""))
+    row_text_inputs = [
+        (row.title, row.raw_summary_slice, row.extracted_text_slice) for row in page_rows
+    ]
+    headline_inputs, lead_excerpts = await asyncio.to_thread(
+        _prepare_page_texts,
+        row_text_inputs,
+        need_headline=cleaned_q is not None,
+    )
 
+    snippets_by_row: list[list[list[SnippetFragment]]]
+    if cleaned_q is not None and headline_inputs:
+        hl_rows = (
+            await session.execute(
+                batched_headline_sql,
+                {"fts_cfg": fts_cfg, "texts": headline_inputs, "q": cleaned_q},
+            )
+        ).all()
+        raw_headlines: list[str | None] = [
+            str(cast_hl) if cast_hl is not None else None for _ord, cast_hl in hl_rows
+        ]
+        snippets_by_row = await asyncio.to_thread(_parse_headlines_batch, raw_headlines)
+    else:
+        snippets_by_row = [[] for _ in page_rows]
+
+    results: list[SearchResultRow] = []
+    for row, lead_excerpt, snippet in zip(page_rows, lead_excerpts, snippets_by_row, strict=True):
         results.append(
             SearchResultRow(
                 id=row.id,
@@ -371,10 +423,7 @@ async def search_items(
                 author=row.author,
                 published_at=row.published_at,
                 fetched_at=row.fetched_at,
-                lead_excerpt=derive_lead_excerpt(
-                    extracted_text=row.extracted_text_slice,
-                    raw_summary=row.raw_summary_slice,
-                ),
+                lead_excerpt=lead_excerpt,
                 extraction_status=row.extraction_status,
                 state=row.state,
                 is_starred=row.is_starred,

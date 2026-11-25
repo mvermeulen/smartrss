@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from tests.conftest import StubSafeHttpClient, make_rss_xml
 
 from smartrss.db.models import Feed, Item, SyncChange, SyncState
@@ -118,6 +118,7 @@ async def test_1b_t01a_gap_free_concurrent_commit_sync_seq_pull(
 
 async def test_1b_t01b_poll_feed_sorted_item_updates_and_concurrent_push_no_deadlock(
     api_env: dict[str, Any],
+    db_engine: AsyncEngine,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """poll_feed updates existing items in item.id ASC order; concurrent push never deadlocks."""
@@ -207,6 +208,23 @@ async def test_1b_t01b_poll_feed_sorted_item_updates_and_concurrent_push_no_dead
 
     device_id: uuid.UUID = api_env["device_id"]
 
+    updated_item_ids: list[uuid.UUID] = []
+
+    def _capture_update(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        if (
+            statement.lstrip().upper().startswith("UPDATE ITEMS SET TITLE")
+            and isinstance(parameters, dict)
+            and "id_1" in parameters
+        ):
+            updated_item_ids.append(parameters["id_1"])
+
     async def do_poll() -> None:
         outcome = await run_poll_feed(
             session_factory,
@@ -220,6 +238,7 @@ async def test_1b_t01b_poll_feed_sorted_item_updates_and_concurrent_push_no_dead
             resp = await sync_push(
                 sp,
                 device_id=device_id,
+                max_attempts=1,
                 request=SyncPushRequest(
                     mutations=[
                         ItemSetStateMutation(
@@ -241,7 +260,13 @@ async def test_1b_t01b_poll_feed_sorted_item_updates_and_concurrent_push_no_dead
             )
             assert all(r.outcome == "applied" for r in resp.results)
 
-    await asyncio.gather(do_poll(), do_push())
+    sa.event.listen(db_engine.sync_engine, "before_cursor_execute", _capture_update)
+    try:
+        await asyncio.gather(do_poll(), do_push())
+    finally:
+        sa.event.remove(db_engine.sync_engine, "before_cursor_execute", _capture_update)
+
+    assert updated_item_ids == sorted(updated_item_ids)
 
     # Verify item update sync_changes emitted in sorted id ASC order when poll updated them
     async with session_factory() as s:

@@ -157,9 +157,16 @@ async def import_opml_endpoint(
     now_iso = now.isoformat()
     default_poll = await _get_default_poll_interval(session)
 
-    # Load existing active categories by lower(name)
+    # Load existing active categories by lower(name) with FOR SHARE (§5.1 categories -> feeds; K-01)
     cat_rows = (
-        (await session.execute(sa.select(Category).where(Category.deleted_at.is_(None))))
+        (
+            await session.execute(
+                sa.select(Category)
+                .where(Category.deleted_at.is_(None))
+                .order_by(Category.id.asc())
+                .with_for_update(read=True)
+            )
+        )
         .scalars()
         .all()
     )
@@ -343,9 +350,9 @@ async def create_feed(
     if body.category_id is not None:
         cat = (
             await session.execute(
-                sa.select(Category.id).where(
-                    Category.id == body.category_id, Category.deleted_at.is_(None)
-                )
+                sa.select(Category.id)
+                .where(Category.id == body.category_id, Category.deleted_at.is_(None))
+                .with_for_update(read=True)
             )
         ).scalar_one_or_none()
         if cat is None:
@@ -470,13 +477,25 @@ async def update_feed(
     session: AsyncSession = Depends(get_db_session),
     ssrf_policy: SSRFPolicy = Depends(get_ssrf_policy),
 ) -> FeedResponse:
+    fields_set = body.model_fields_set
+    # Lock target category FOR SHARE *before* locking Feed FOR UPDATE (§5.1 order; K-01)
+    category_exists = True
+    if "category_id" in fields_set and body.category_id is not None:
+        cat = (
+            await session.execute(
+                sa.select(Category.id)
+                .where(Category.id == body.category_id, Category.deleted_at.is_(None))
+                .with_for_update(read=True)
+            )
+        ).scalar_one_or_none()
+        category_exists = cat is not None
+
     feed = (
         await session.execute(sa.select(Feed).where(Feed.id == feed_id).with_for_update())
     ).scalar_one_or_none()
     if feed is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
 
-    fields_set = body.model_fields_set
     now: datetime = (await session.execute(sa.select(sa.func.now()))).scalar_one()
     field_ts: dict[str, str] = dict(feed.field_updated_at or {})
     trigger_poll = False
@@ -534,19 +553,11 @@ async def update_feed(
             trigger_poll = True
 
     if "category_id" in fields_set:
-        if body.category_id is not None:
-            cat = (
-                await session.execute(
-                    sa.select(Category.id).where(
-                        Category.id == body.category_id, Category.deleted_at.is_(None)
-                    )
-                )
-            ).scalar_one_or_none()
-            if cat is None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Category not found",
-                )
+        if body.category_id is not None and not category_exists:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Category not found",
+            )
         feed.category_id = body.category_id
         _stamp_online_lww(field_ts, "category_id", now, feed.created_at)
 

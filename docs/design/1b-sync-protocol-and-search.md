@@ -843,6 +843,12 @@ In accordance with [development-process.md §4.2](../development-process.md#42-d
 - **Alembic revision ID length**: Alembic's default `alembic_version.version_num` column is `VARCHAR(32)`. Migration file `0002_milestone_1b_sync_and_search.py` therefore uses `revision = "0002_milestone_1b_sync_search"` (29 chars).
 - **`DELETE /api/v1/categories/{id}` lock order**: Locks affected child `feeds` via `SELECT ... ORDER BY id ASC FOR UPDATE` (honoring §5.1) and stamps `field_updated_at['category_id']` via the shared `compute_online_lww_timestamp()` helper rather than an unordered Core `UPDATE ... jsonb_set`.
 - **`SyncLogWriter.record()` `clock_timestamp()`**: Reads `sa.func.clock_timestamp()` in the same `SELECT current_seq ... FOR UPDATE` round-trip and passes that monotonic timestamp to `sync_state.updated_at` and all `sync_changes.changed_at` rows inserted in the batch (compatible with SQLAlchemy Core bulk `INSERT` parameter binding).
+- **Implementation-review hardening (`K-01`, `K-03`, `K-04`, `K-05`, `K-07`)**:
+  - Category active checks in `sync/push` step 3a, `POST /api/v1/feeds`, `PATCH /api/v1/feeds/{id}`, and OPML import acquire `FOR SHARE` (`ORDER BY id ASC`) **before** locking `feeds` (§5.1), preventing a concurrent soft-delete from leaving a feed attached to a deleted category (`K-01`).
+  - `GET /api/v1/search` offloads per-page HTML stripping/excerpting and headline fragment parsing to `asyncio.to_thread()`, caps HTML excerpt pre-slicing at `8,192` chars (`derive_lead_excerpt`), and executes a single batched `ts_headline` query via `unnest(CAST(:texts AS text[])) WITH ORDINALITY`; `rebuild_item_search_vector` / `rebuild_items_search_vectors_batch` similarly offload HTML stripping via `asyncio.to_thread()` (`K-03`, `L3`).
+  - Scoped `item_mark_bulk_read` `UPDATE` restricts its `WHERE` clause with `items.id = ANY(CAST(:prelocked_ids AS uuid[]))` to the §5.1 pre-locked candidate set (`K-04`).
+  - `sync_mutations.payload_sha256` canonicalizes `client_timestamp`/`older_than_ts` to UTC ISO-8601 and `feed_set_field(category_id)` UUID values to lowercase before hashing (`K-05`).
+  - `expire_items` stamps `expired_at`, `read_state_updated_at`, and `updated_at` with PostgreSQL `sa.func.now()` instead of Python `datetime.now(UTC)` (`K-07`, `C5`).
 
 ---
 

@@ -298,3 +298,85 @@ def test_summary_capping_lead_excerpt_payload_hash_and_status_transitions() -> N
     active_feed = SimpleNamespace(status="active", next_fetch_at=BASE_TIME)
     assert apply_feed_status_transition(active_feed, "muted", BASE_TIME) is False
     assert active_feed.status == "muted"
+
+
+def test_k05_payload_sha256_canonical_across_tz_and_uuid_case() -> None:
+    """K-05: Equivalent TZ offsets and UUID casing produce identical payload_sha256."""
+    from smartrss.sync.schemas import (
+        FeedSetFieldMutation,
+        ItemMarkBulkReadMutation,
+        ItemSetStateMutation,
+    )
+    from smartrss.sync.service import _mutation_payload_sha256
+
+    mid = uuid.uuid4()
+    item_id = uuid.uuid4()
+    feed_id = uuid.uuid4()
+    cat_uuid = uuid.UUID("a1b2c3d4-e5f6-4789-abcd-0123456789ef")
+
+    # 1. Equivalent timestamps: Z vs +01:00
+    m_utc = ItemSetStateMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T12:00:00Z",
+            "type": "item_set_state",
+            "item_id": str(item_id),
+            "state": "read",
+        }
+    )
+    m_plus1 = ItemSetStateMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T13:00:00+01:00",
+            "type": "item_set_state",
+            "item_id": str(item_id),
+            "state": "read",
+        }
+    )
+    assert _mutation_payload_sha256(m_utc) == _mutation_payload_sha256(m_plus1)
+
+    # 2. Equivalent older_than_ts offsets in item_mark_bulk_read
+    b_utc = ItemMarkBulkReadMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T12:00:00Z",
+            "type": "item_mark_bulk_read",
+            "scope": "items",
+            "item_ids": [str(item_id)],
+            "older_than_ts": "2026-11-20T00:00:00Z",
+        }
+    )
+    b_offset = ItemMarkBulkReadMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T07:00:00-05:00",
+            "type": "item_mark_bulk_read",
+            "scope": "items",
+            "item_ids": [str(item_id).upper()],
+            "older_than_ts": "2026-11-20T02:00:00+02:00",
+        }
+    )
+    assert _mutation_payload_sha256(b_utc) == _mutation_payload_sha256(b_offset)
+
+    # 3. Uppercase vs lowercase UUID string in feed_set_field(category_id)
+    f_lower = FeedSetFieldMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T12:00:00Z",
+            "type": "feed_set_field",
+            "feed_id": str(feed_id),
+            "field": "category_id",
+            "value": str(cat_uuid).lower(),
+        }
+    )
+    f_upper = FeedSetFieldMutation.model_validate(
+        {
+            "client_mutation_id": str(mid),
+            "client_timestamp": "2026-11-25T13:00:00+01:00",
+            "type": "feed_set_field",
+            "feed_id": str(feed_id).upper(),
+            "field": "category_id",
+            "value": str(cat_uuid).upper(),
+        }
+    )
+    assert _mutation_payload_sha256(f_lower) == _mutation_payload_sha256(f_upper)

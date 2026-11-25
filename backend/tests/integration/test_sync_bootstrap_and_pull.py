@@ -580,7 +580,7 @@ async def test_1b_t12_alembic_0002_backfill_and_downgrade_round_trip(
         finally:
             sync_eng.dispose()
 
-        # Upgrade to 0002 and verify backfills
+        # Upgrade to 0002 and verify backfills match smartrss search reindex exactly (K-06, 1b-T12)
         alembic_command.upgrade(cfg, "head")
         verify_eng = sa.create_engine(scratch_url)
         try:
@@ -589,6 +589,7 @@ async def test_1b_t12_alembic_0002_backfill_and_downgrade_round_trip(
                     sa.text(
                         """
                         SELECT ingest_sync_seq,
+                               search_vector::text AS sv_text,
                                search_vector @@ websearch_to_tsquery(
                                    'english', 'quantum'
                                ) AS m_title,
@@ -607,8 +608,30 @@ async def test_1b_t12_alembic_0002_backfill_and_downgrade_round_trip(
                 assert row.m_title is True
                 assert row.m_sum is True
                 assert row.m_script is False  # Python HTMLParser skipped <script> (P-14)
+                backfilled_sv_text: str = row.sv_text
+                assert backfilled_sv_text
         finally:
             verify_eng.dispose()
+
+        # Run reindex_all_items against scratch DB and verify exact tsvector equality (K-06)
+        from smartrss.db.engine import build_engine, build_sessionmaker
+        from smartrss.search.fts import reindex_all_items
+
+        scratch_async_eng = build_engine(scratch_url, strict_sync_guard=True)
+        scratch_sf = build_sessionmaker(scratch_async_eng, strict_sync_guard=True)
+        try:
+            reindexed_cnt = await reindex_all_items(scratch_sf, fts_language="english")
+            assert reindexed_cnt == 1
+            async with scratch_sf() as s_chk:
+                reindexed_sv_text = (
+                    await s_chk.execute(
+                        sa.text("SELECT search_vector::text FROM items WHERE id = :id"),
+                        {"id": item_id},
+                    )
+                ).scalar_one()
+            assert backfilled_sv_text == reindexed_sv_text
+        finally:
+            await scratch_async_eng.dispose()
 
         # Reversible downgrade to 0001 and back to head
         alembic_command.downgrade(cfg, "0001_milestone_1a_core")
