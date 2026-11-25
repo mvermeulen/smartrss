@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from tests.conftest import StubSafeHttpClient, make_rss_xml
@@ -159,6 +160,115 @@ async def test_k01_online_patch_and_post_feed_lock_category_for_share_before_fee
         assert captured[:2] == ["categories:FOR SHARE", "feeds:FOR UPDATE"]
     finally:
         event.remove(sync_eng, "before_cursor_execute", _capture_locks)
+
+
+async def test_k01_f1_opml_rejects_deleted_and_nonexistent_default_category_id(
+    api_env: dict[str, Any],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """K-01-F1: OPML import returns 422 on deleted or nonexistent default_category_id."""
+    client = api_env["client"]
+    del_cat_id = (await client.post("/api/v1/categories", json={"name": "DeletedOpmlCat"})).json()[
+        "id"
+    ]
+    r_del = await client.delete(f"/api/v1/categories/{del_cat_id}")
+    assert r_del.status_code == 204
+
+    # Seed an unsubscribed feed to verify it is NOT reactivated on 422
+    unsub_id = uuid.uuid4()
+    async with session_factory() as s:
+        s.add(
+            Feed(
+                id=unsub_id,
+                feed_url="https://opml-unsub.example.com/rss",
+                title="Unsub",
+                status="unsubscribed",
+            )
+        )
+        await s.flush()
+        await sync_log.record(s, [SyncEvent("feed", unsub_id, "upsert")])
+        await s.commit()
+
+    opml_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <opml version="2.0">
+      <body>
+        <outline type="rss" text="New Feed" xmlUrl="https://opml-new.example.com/rss" />
+        <outline type="rss" text="Unsub" xmlUrl="https://opml-unsub.example.com/rss" />
+      </body>
+    </opml>"""
+
+    # 1. Deleted default_category_id -> 422; no feed created or reactivated
+    r_deleted = await client.post(
+        "/api/v1/feeds/import-opml",
+        json={"opml_xml": opml_xml, "default_category_id": del_cat_id},
+    )
+    assert r_deleted.status_code == 422
+    assert r_deleted.json()["detail"] == "Category not found"
+
+    async with session_factory() as sv:
+        all_feeds = (await sv.execute(sa.select(Feed))).scalars().all()
+        assert len(all_feeds) == 1
+        assert all_feeds[0].id == unsub_id
+        assert all_feeds[0].status == "unsubscribed"
+        assert all_feeds[0].category_id is None
+
+    # 2. Nonexistent default_category_id -> 422 (never unhandled FK error)
+    r_missing = await client.post(
+        "/api/v1/feeds/import-opml",
+        json={"opml_xml": opml_xml, "default_category_id": str(uuid.uuid4())},
+    )
+    assert r_missing.status_code == 422
+    assert r_missing.json()["detail"] == "Category not found"
+
+    async with session_factory() as sv:
+        all_feeds = (await sv.execute(sa.select(Feed))).scalars().all()
+        assert len(all_feeds) == 1
+
+
+async def test_k01_f1_opml_locks_categories_for_share_before_feed_writes(
+    api_env: dict[str, Any],
+    db_engine: AsyncEngine,
+) -> None:
+    """K-01-F1: OPML import acquires FOR SHARE on categories before writing any feeds."""
+    client = api_env["client"]
+    cat_id = (await client.post("/api/v1/categories", json={"name": "ActiveOpmlCat"})).json()["id"]
+
+    opml_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <opml version="2.0">
+      <body>
+        <outline type="rss" text="OPML Lock Feed" xmlUrl="https://opml-lock.example.com/rss" />
+      </body>
+    </opml>"""
+
+    captured: list[str] = []
+
+    def _capture_opml_locks(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        upper = statement.lstrip().upper()
+        if "FROM CATEGORIES" in upper and "FOR SHARE" in upper:
+            captured.append("categories:FOR SHARE")
+        elif upper.startswith(("INSERT INTO FEEDS", "UPDATE FEEDS")):
+            captured.append("feeds:WRITE")
+
+    sync_eng = db_engine.sync_engine
+    event.listen(sync_eng, "before_cursor_execute", _capture_opml_locks)
+    try:
+        r_ok = await client.post(
+            "/api/v1/feeds/import-opml",
+            json={"opml_xml": opml_xml, "default_category_id": cat_id},
+        )
+        assert r_ok.status_code == 200
+        assert r_ok.json()["imported"] == 1
+    finally:
+        event.remove(sync_eng, "before_cursor_execute", _capture_opml_locks)
+
+    assert captured == ["categories:FOR SHARE", "feeds:WRITE"]
 
 
 async def test_k02_poll_feed_updates_matched_existing_items_in_strict_id_asc_order(

@@ -4,7 +4,7 @@
 - **Scope**: Committed branch `milestone/1b`, `main` (`c8aa6f7`) → `070b82c` (`feat(1b): implement sync engine, LWW conflict resolution, and PostgreSQL FTS search`). Covers migration `0002`, `sync/` (`schemas.py`, `service.py`), `domain/sync_merge.py`, `domain/fts_text.py`, `search/fts.py`, the new routes (`sync`, `search`, `settings`), changes to `feeds.py`, `categories.py`, `sync_log.py`, `poll_feed.py`, `extract_content.py`, `maintenance.py`, `cli.py` and `config.py`, all new tests, `scripts/check-critical-coverage.py`, and the doc updates. Checked against [`docs/design/1b-sync-protocol-and-search.md`](../design/1b-sync-protocol-and-search.md) (Approved), `data-model.md`, ADR `0004`, and [`review-checklist.md`](../review-checklist.md).
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `K-`
-- **Status**: `Addressed — verification found follow-ups (2026-11-25; K-01-F1 open)`
+- **Status**: `Addressed (2026-11-25) — awaiting verification (K-01-F1 addressed)`
 
 ## Review outcome
 
@@ -274,3 +274,38 @@ Show the revert evidence for each test.
 ### Residual risks for owner acceptance
 
 None beyond `K-01-F1`. If the owner prefers, they can accept `K-01-F1` as a pre-existing `1a` residual risk instead of fixing it before `Implementation Approved`.
+
+---
+
+## Follow-up Resolution (2026-11-25)
+
+All verification-pass follow-ups (`K-01-F1`) and drift notes have been addressed by the implementer; ready for final verification pass.
+
+### `K-01-F1` — OPML import `default_category_id` validation and `FOR SHARE` lock test
+
+- **Fix** ([`backend/src/smartrss/api/routes/feeds.py`](../../backend/src/smartrss/api/routes/feeds.py)):
+  - In `import_opml_endpoint` (lines 160–179), indexed `active_cat_ids: set[uuid.UUID] = {c.id for c in cat_rows}` from the `FOR SHARE`-locked active categories (`ORDER BY id ASC`) and added an upfront guard rejecting any missing or soft-deleted `body.default_category_id` with `422 "Category not found"` before creating or reactivating any feeds.
+- **Regression tests** ([`backend/tests/integration/test_sync_1b_review_regressions.py`](../../backend/tests/integration/test_sync_1b_review_regressions.py)):
+  1. `test_k01_f1_opml_rejects_deleted_and_nonexistent_default_category_id`:
+     - Soft-deleted `default_category_id` returns `422 "Category not found"`, creates zero new feeds, and leaves an existing unsubscribed feed un-reactivated (`is_subscribed=False`).
+     - Nonexistent `default_category_id` returns `422 "Category not found"` (no unhandled FK error).
+  2. `test_k01_f1_opml_locks_categories_for_share_before_feed_writes`:
+     - Attaches a `before_cursor_execute` SQL listener during OPML import and asserts `captured == ["categories:FOR SHARE", "feeds:WRITE"]`.
+- **Revert-and-fail proof**:
+  - Reverting the `body.default_category_id not in active_cat_ids` guard in `feeds.py` caused `test_k01_f1_opml_rejects_deleted_and_nonexistent_default_category_id` to **FAIL**; restoring the guard passed (`1 passed in 0.16s`).
+  - Reverting `.with_for_update(read=True)` on the OPML category query in `feeds.py` caused `test_k01_f1_opml_locks_categories_for_share_before_feed_writes` to **FAIL** (`AssertionError: assert ['feeds:WRITE'] == ['categories:FOR SHARE', 'feeds:WRITE']`); restoring it passed (`1 passed in 0.16s`).
+- **Coverage proof**:
+  - In the `make check` run below, `src/smartrss/api/routes/feeds.py` has zero uncovered lines or partial branches across lines 160–179 (`Missing` jumps from `150-151` to `231-252`).
+
+### Drift note resolved
+
+- Updated the status header in [`docs/design/1b-sync-protocol-and-search.md`](../design/1b-sync-protocol-and-search.md) to reflect `K-01`–`K-07` and `K-01-F1` addressed and awaiting verification.
+- Updated the existing `1b` implementation-review row in [`docs/README.md`](../README.md) (no duplicate rows).
+
+### Verification (`make check`)
+
+- `ruff check src tests alembic`: passed
+- `ruff format --check src tests alembic`: 83 files already formatted
+- `mypy src` (`strict = true`): Success — no issues found in 53 source files
+- `pytest --cov=smartrss --cov-branch --cov-fail-under=80`: **167 passed in 19.84s**, total coverage **91.16%**
+- `scripts/check-critical-coverage.py`: **16/16** critical modules ≥ 90% (`sync_merge.py` 100.00%, `url_canon.py` 100.00%, `expiration.py` 100.00%, `locks.py` 100.00%, `search/fts.py` 99.03%, `fts_text.py` 97.64%, `backoff.py` 97.47%, `expire_items.py` 96.67%, `sync_log.py` 95.93%, `queue.py` 95.12%, `sync/service.py` 94.53%, `extract/client.py` 92.98%, `security/auth.py` 92.48%, `safe_http.py` 91.79%, `poll_feed.py` 91.57%, `security/middleware.py` 90.80%).

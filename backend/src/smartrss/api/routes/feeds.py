@@ -171,6 +171,12 @@ async def import_opml_endpoint(
         .all()
     )
     cats_by_lower: dict[str, Category] = {c.name.lower(): c for c in cat_rows}
+    active_cat_ids: set[uuid.UUID] = {c.id for c in cat_rows}
+    if body.default_category_id is not None and body.default_category_id not in active_cat_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Category not found",
+        )
 
     # Load existing feeds by feed_url
     existing_feeds = (await session.execute(sa.select(Feed))).scalars().all()
