@@ -1,8 +1,8 @@
 # SmartRSS — Agent Rules & Project Guide
 
 ## Project Status
-> **Current Phase: Requirements & Design**
-> Do **not** write application code until the requirements, architecture, data model, ADRs, and target milestone's component design in `docs/` are marked **`Approved`** / **`Accepted`** by the project owner.
+> **Current Phase: Phase 1 Implementation (Milestone `1a` implemented & approved; `1b`–`1g` pending design approval)**
+> Do **not** write application code for a milestone until the requirements, architecture, data model, ADRs, and that milestone's component design in `docs/` are marked **`Approved`** / **`Accepted`** by the project owner.
 
 ## Overview
 **SmartRSS** is a self-hosted, distributed RSS reader system for a single user. A containerized backend server on the home LAN pre-fetches, persists, clusters, and curates feeds using local LLMs (`Ollama` / `llama.cpp`) to generate display and curation metadata (including selective mini-research on primary sources/PDFs), while local-first clients sync over home Wi-Fi, operate seamlessly when detached, and feed explicit user interactions back to evolve curation over time.

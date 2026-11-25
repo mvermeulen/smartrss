@@ -1,0 +1,105 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smartrss"
+version = "0.1.0"
+description = "SmartRSS self-hosted single-user RSS reader backend"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14.0,<2.0",
+    "defusedxml>=0.7.1,<1.0",
+    "fastapi>=0.115.0,<1.0",
+    "feedparser>=6.0.11,<7.0",
+    "httpcore>=1.0.7,<2.0",
+    "httpx>=0.28.0,<1.0",
+    "psycopg[binary]>=3.2.3,<4.0",
+    "pydantic>=2.10.0,<3.0",
+    "pydantic-settings>=2.7.0,<3.0",
+    "sqlalchemy[asyncio]>=2.0.36,<3.0",
+    "trafilatura>=2.0.0,<3.0",
+    "typer>=0.15.0,<1.0",
+    "uvicorn>=0.34.0,<1.0",
+]
+
+[project.scripts]
+smartrss = "smartrss.cli:app"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.122.0,<7.0",
+    "mypy>=1.14.0,<2.0",
+    "pytest>=8.3.4,<9.0",
+    "pytest-asyncio>=0.25.0,<1.0",
+    "pytest-cov>=6.0.0,<7.0",
+    "ruff>=0.8.6,<1.0",
+    "types-defusedxml>=0.7.0.20240218",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smartrss"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "alembic"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S"]
+ignore = [
+    "S101",  # assert allowed (especially in tests and invariants)
+    "S104",  # binding 0.0.0.0 in container
+    "B008",  # FastAPI Depends / Typer Option in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106", "S107", "S108", "S310", "S603", "S607"]
+"alembic/**/*.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "feedparser",
+    "feedparser.*",
+    "trafilatura",
+    "trafilatura.*",
+    "defusedxml",
+    "defusedxml.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+markers = [
+    "integration: tests requiring a real PostgreSQL database",
+    "boundary: boundary and subprocess isolation tests",
+    "live_llm: opt-in live LLM evaluation tests",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:feedparser",
+]
+
+[tool.coverage.run]
+source = ["smartrss"]
+branch = true
+concurrency = ["greenlet", "thread"]
+omit = ["src/smartrss/extract/runner.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

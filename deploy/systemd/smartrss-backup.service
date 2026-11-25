@@ -1,0 +1,9 @@
+[Unit]
+Description=SmartRSS nightly PostgreSQL backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/smartrss
+ExecStart=/usr/bin/make backup

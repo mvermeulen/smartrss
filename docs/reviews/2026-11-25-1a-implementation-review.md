@@ -3,7 +3,7 @@
 - **Date**: 2026-11-25
 - **Scope**: Uncommitted working tree on `main` after `25d7bae`: `backend/` (application code, Alembic migration, tests), `deploy/`, `scripts/`, `docker-compose.yml`, `Makefile`, `.env*.example`, `README.md`, and the `AGENTS.md` status change. Checked against [`docs/design/1a-backend-ingestion-and-security.md`](../design/1a-backend-ingestion-and-security.md) (Approved), `data-model.md`, ADRs `0003`, `0004`, `0006`, and [`development-process.md`](../development-process.md).
 - **Reviewer**: Claude Code (at the project owner's request)
-- **Status**: Open. Findings `I-01`–`I-24` are not yet addressed.
+- **Status**: Addressed; `1a` implementation **Approved** by project owner 2026-11-25 *(2026-11-25 — all findings `I-01`–`I-24` fixed with regression tests, `>= 90%` critical-module coverage gate enforced in `make check`, and docs synchronized).*
 
 ## Review outcome
 
@@ -190,3 +190,23 @@ This violates the "Keep docs synchronized … in the **same commit**" rule.
 - `make check` (2026-11-25): `ruff check`, `ruff format --check` and `mypy --strict` are clean. All **110 tests pass** (unit, boundary and real-Postgres integration against `db-test`). Total coverage is **84.13%**. The per-module figures are in `I-08`.
 - `I-01` was reproduced directly with the project venv: `feedparser.parse(<path>.encode())` returned the contents of a local XML file.
 - `I-02`–`I-05` were found by code reading; they have no reproducing test yet. Each fix should land with the regression test described above, per the regression policy in `development-process.md`.
+
+---
+
+## 6. Follow-up verification (2026-11-25)
+
+A second pass over the claimed resolutions found four residual gaps, now closed.
+
+- **`I-02` test did not exercise the fix.** The original regression test failed the 3rd session checkout, which hit the slot's *claim* path. The heartbeat-retry and slot-survival handlers stayed uncovered (`runner.py` coverage), so the test passed whether or not the fix was present.
+  - The test now monkeypatches `heartbeat_job` (fails twice), `complete_job` and `fail_job` (each fail once). The exception therefore escapes `execute_claimed_job` into the daemon slot loop.
+  - The test asserts that heartbeats keep renewing and that the single slot still runs the next job.
+  - Verified that it **fails** with the slot's `except Exception` handler removed and passes with it.
+- **`I-04` unexpected-failure path.** `record_poll_feed_unexpected_failure` did not apply the `feed_url` guard. An unhandled poll exception after a concurrent `PATCH feed_url` therefore still degraded the newly edited feed.
+  - `run_poll_feed` now wraps post-pre-check failures in `PollFeedUnexpectedError`, which carries the fetched `feed_url`.
+  - The runner passes it as `expected_feed_url` and enqueues a priority-10 repoll on mismatch.
+  - Two new regression tests cover this: one with a concurrent `PATCH`, and one without.
+- **`I-18` password still in argv.** `restore-drill.sh` passed `-e SMARTRSS_DRILL_DATABASE_URL=<url>` on the `docker compose run` command line. It now exports the variable and forwards it by name only.
+- **`I-09` duplicate index row.** `docs/README.md` listed this review twice (`Addressed` and stale `Open`). The stale row was removed.
+- **`I-08` documentation.** `scripts/check-critical-coverage.py` is now documented in `development-process.md` §2.2 and in the `1a` design (Makefile targets, repo layout, §12), including the rule to keep `CRITICAL_MODULES` in sync with each milestone's critical-module list.
+
+Known residual (accepted, low priority): `I-15`'s 900 KB UTF-8 budget leaves about 148 KB of headroom for JSON escaping. Pathological text made mostly of quotes, backslashes or control characters could still exceed the 1 MiB stdout cap and fall back to `fallback_rss`. The fallback is safe.

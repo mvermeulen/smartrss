@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Recorded Engineering Blog</title>
+    <link>https://eng.example.com</link>
+    <description>Sanitized RSS 2.0 fixture</description>
+    <item>
+      <title>PostgreSQL Advisory Locks</title>
+      <link>https://eng.example.com/posts/advisory-locks?utm_source=rss#top</link>
+      <guid>urn:eng:post-1</guid>
+      <pubDate>Tue, 24 Nov 2026 10:00:00 GMT</pubDate>
+      <description><![CDATA[<p>Using transaction-scoped and dedicated-connection session advisory locks.</p>]]></description>
+    </item>
+    <item>
+      <title>Relative Link Entry</title>
+      <link>/posts/relative-42</link>
+      <guid>urn:eng:post-2</guid>
+      <pubDate>Tue, 24 Nov 2026 09:00:00 GMT</pubDate>
+      <description><![CDATA[<p>Entry whose link must be resolved against Content-Location.</p>]]></description>
+    </item>
+  </channel>
+</rss>

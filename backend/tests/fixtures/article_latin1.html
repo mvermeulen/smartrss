@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="iso-8859-1">
+  <title>Caf&#233; Systems Notes</title>
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Caf&#233; Systems Notes</h1>
+      <p>Legacy ISO-8859-1 pages omit the HTTP Content-Type charset parameter and rely on
+      the HTML meta charset tag so characters like caf&#233;, na&#239;ve, and r&#233;sum&#233; decode cleanly
+      without mojibake when passed as raw bytes to trafilatura.</p>
+      <p>Passing raw bytes directly to the isolated extraction subprocess preserves the
+      document encoding metadata and avoids assuming UTF-8 when headers omit charset.</p>
+    </article>
+  </main>
+</body>
+</html>

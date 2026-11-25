@@ -1,6 +1,6 @@
 # Component Design 1a: Backend Foundation, Security, Polling & Extraction
 
-> **Status:** Approved *(2026-11-24, by project owner — after the [`1a` review](../reviews/2026-11-24-1a-component-design-review.md) verification pass; §13 residual risks accepted)*
+> **Status:** Approved & Implemented — implementation **Approved** by project owner 2026-11-25 *(Design approved 2026-11-24 after [`1a` review](../reviews/2026-11-24-1a-component-design-review.md); implemented & [code-review findings](../reviews/2026-11-25-1a-implementation-review.md) `I-01`–`I-24` addressed 2026-11-25)*
 > **Milestone:** `1a` — Backend Foundation, Auth, Polling & Extraction ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-FEED-01`–`06`, `FR-LLM-05` (cron/batch scheduler & CLI), `FR-STATE-01`–`02`, `NFR-SEC-01`, `NFR-SEC-02`, `NFR-SEC-03` (isolated HTML extraction), `NFR-OPS-01`
 > **Related ADRs:** [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), [ADR 0003](../decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)
@@ -66,7 +66,8 @@ smartrss/
 │       └── smartrss-backup.timer          # Example host systemd timer (03:15 daily)
 ├── scripts/
 │   ├── backup.sh                          # Nightly pg_dump -Fc (umask 077) + 14-day rotation + optional rsync
-│   └── restore-drill.sh                   # Automated restore + instance_epoch rotation verification
+│   ├── restore-drill.sh                   # Automated restore + instance_epoch rotation verification
+│   └── check-critical-coverage.py         # Per-module >= 90% coverage gate over coverage.json (run by `make test-cov`)
 └── backend/
     ├── Dockerfile                         # Multi-stage Python 3.12-slim image (shared by api & worker)
     ├── pyproject.toml                     # PEP 621 deps, ruff, mypy, pytest, coverage config, CLI entrypoint
@@ -128,7 +129,7 @@ smartrss/
 ```
 
 ### Standard `Makefile` Targets
-- `make check`: Runs `lint` (`ruff check`, `ruff format --check`) + `typecheck` (`mypy`) + `test-cov` (unit + boundary + real-Postgres integration tests with coverage gates).
+- `make check`: Runs `lint` (`ruff check`, `ruff format --check`) + `typecheck` (`mypy`) + `test-cov` (unit + boundary + real-Postgres integration tests with coverage gates: `--cov-fail-under=80` overall, then `scripts/check-critical-coverage.py` enforcing `>= 90%` on each §12 critical module).
 - `make test-unit`: Fast unit + boundary tests (no DB required).
 - `make test-int`: Starts `db-test` (`docker compose --profile test up -d db-test`) and runs integration tests.
 - `make up` / `make down`: Starts/stops the full Docker Compose stack.
@@ -169,7 +170,7 @@ smartrss/
 | `LAN_PORT` | `8080` | Exposed host port for `web`. |
 | `ALLOWED_HOSTS` | `localhost,localhost:8080,127.0.0.1,127.0.0.1:8080` | Comma-separated strict `Host` header allow-list (user adds e.g. `smartrss.lan:8080`, `192.168.1.50:8080`). |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:8080` | Strict CORS allow-list for Phase 1 `localhost` client origin + configured LAN origin. *(Vite dev origin `http://localhost:5173` lives in `.env.dev.example` only, never in production defaults.)* |
-| `SSRF_BLOCKED_CIDRS` | *(auto-includes Docker bridge subnet)* | Additional CIDRs to block beyond standard private/loopback/link-local/CGNAT/ULA/NAT64/6to4 ranges. |
+| `SSRF_BLOCKED_CIDRS` | *(empty; RFC1918 including default `172.16.0.0/12` Docker bridges always blocked)* | Additional CIDRs to block beyond standard private/loopback/link-local/CGNAT/ULA/NAT64/6to4 ranges (e.g., custom non-RFC1918 Docker bridges, home WAN IPv4 `/32`, or global IPv6 prefix). |
 | `WORKER_MODE` | `daemon` | `daemon` (continuous `worker` container) or `cron` (external host cron/systemd invoking `smartrss worker run-once`). Running both simultaneously is **unsupported** (`smartrss worker run` refuses to start when `WORKER_MODE=cron`). |
 | `COMPOSE_PROFILES` | `daemon` | Starts the continuous `worker` service. Set to empty for `WORKER_MODE=cron` so `docker compose up` does not start (and crash-loop) the daemon. |
 | `WORKER_IO_CONCURRENCY` | `4` | Concurrent I/O jobs (`poll_feed`, `extract_content`) per worker process. |
@@ -442,7 +443,8 @@ Fixed 64-bit integer constants with strict connection-pool safety:
      - If **collision**: keep original `feed_url`, set `health_state = 'broken'`, `last_error = f"Permanent redirect collides with existing feed {other.id}: {new_url}"` (never crash on `UNIQUE`), emit `feed` `upsert`, commit.
      - If **no collision**: record `new_feed_url = permanent_redirect_url` to apply in step 4.
 3. **Parse & Normalize (outside DB write tx)**:
-   - Parse bytes in-process with `feedparser.parse(body_bytes)` *(explicit design decision: input is already capped at 5 MB by `SafeHttpClient`, relying on Python's bundled Expat parser's built-in billion-laughs / entity-expansion protection with external entity resolution disabled)*.
+   - Parse bytes off the event loop via `await asyncio.to_thread(...)` calling `feedparser.parse(io.BytesIO(body_bytes), response_headers={"content-location": final_url, "content-type": content_type})` — **never** passing raw `bytes`/`str` directly to `feedparser.parse()` (which treats path-like inputs as local files). Input is already capped at 5 MB by `SafeHttpClient`, relying on Python's bundled Expat parser's built-in billion-laughs / entity-expansion protection with external entity resolution disabled.
+   - Multi-row item inserts execute in **500-row chunks** inside the same transaction so large full-archive feeds never exceed PostgreSQL's 65,535 bind-parameter limit.
    - Capture feed-level metadata (`feed_title`, `feed_site_url`).
    - For each entry:
      - Extract `raw_url` (reject/skip entries with non-HTTP(S) link or missing link+title), compute `canonical_url` via `domain/url_canon.py`.
@@ -540,7 +542,7 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 | `GET /api/v1/feeds` | List feeds (optional `?status=&health_state=`) | Includes health & config fields. |
 | `POST /api/v1/feeds` | Subscribe to a feed URL | Validates URL via `SSRFPolicy` before saving; initializes `title` from optional input (stamping `field_updated_at['title']` when the user supplied one, so the poller never overwrites it) or else from the URL hostname/path (unstamped, so the poller fills in the feed's own title), and `poll_interval_minutes` from `app_settings`; if `feed_url` exists as `unsubscribed`, reactivates (`status='active'`, stamps `field_updated_at['status']`, clears `etag`/`last_modified`, resets `health_state='healthy'`, `consecutive_errors=0`, `last_error=NULL`, `next_fetch_at=now()`, `initial_backfill_done=FALSE`); enqueues immediate `poll_feed` (priority `10`, `bump_existing=True`). |
 | `GET /api/v1/feeds/health` | Feed Health dashboard summary | Returns feeds sorted by severity (`gone`, `broken`, `degraded`, `healthy`) with error counts & staleness. |
-| `POST /api/v1/feeds/import-opml` | Import OPML 2.0 subscriptions | JSON body `{opml_xml}` parsed with **`defusedxml`**; creates missing categories, subscribes/reactivates feeds (OPML `title`/`text` attributes are treated as user-chosen names and stamp `field_updated_at['title']`; clearing `etag`/`last_modified` on reactivation, all starting with `initial_backfill_done=FALSE`, reading default poll interval from `app_settings`), enqueues `poll_feed` jobs; returns `{imported, reactivated, skipped_duplicates, rejected_invalid}`. |
+| `POST /api/v1/feeds/import-opml` | Import OPML 2.0 subscriptions | JSON body `{opml_xml}` parsed with **`defusedxml`** (iterative traversal capped at depth 32); validates URL syntax and literal IPs without blocking serial DNS (full DNS/IP pinning runs at fetch time in `SafeHttpClient`), strips non-HTTP(S) `htmlUrl` (`site_url`), creates missing categories, subscribes/reactivates feeds (OPML `title`/`text` attributes are treated as user-chosen names and stamp `field_updated_at['title']`; clearing `etag`/`last_modified` on reactivation, all starting with `initial_backfill_done=FALSE`, reading default poll interval from `app_settings`), enqueues `poll_feed` jobs; returns `{imported, reactivated, skipped_duplicates, rejected_invalid}`. |
 | `GET /api/v1/feeds/export-opml` | Export active/paused/muted subscriptions | Returns `application/xml` OPML 2.0 grouped by category. |
 | `GET /api/v1/feeds/{id}` | Get single feed | |
 | `PATCH /api/v1/feeds/{id}` | Update feed config (`feed_url`, `title`, `status`, `category_id`, `poll_interval_minutes`, `expiration_days_override`, `fetch_full_text`, `research_policy`, `curation_instructions`) | Updates per-field `field_updated_at` for structured fields (including `'title'`, which prevents `poll_feed` from overwriting user-renamed titles); enforces optimistic `expected_config_version` (`409 Conflict`) and increments `config_version` **only** when `curation_instructions` changes. On `feed_url` edit: validates via `SSRFPolicy` (`422`), checks uniqueness (`409 Conflict` on collision), clears `etag`/`last_modified`, resets `health_state='healthy'`, `consecutive_errors=0`, `last_error=NULL`, `next_fetch_at=now()`, `initial_backfill_done=FALSE` (backfill cap protects inbox while deduplicating existing items), and enqueues immediate `poll_feed` (priority `10`, `bump_existing=True`). Emits `feed` `upsert`. |
@@ -560,7 +562,7 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 - `smartrss worker run-once [--stage all|poll|extract|expire|maintenance] [--feed <id>] [--force-poll] [--max-duration <sec, default 1800>] [--json]`
 - `smartrss settings get` / `smartrss settings set <key> <value>` (`backfill_cap`, `default_expiration_days`, `default_poll_interval_minutes`; validated, stamps `updated_at`, emits `app_settings` `upsert` via `SyncLogWriter` using `APP_SETTINGS_ENTITY_ID`; the only `1a` way to change `FR-FEED-05`'s configurable cap until the settings UI/API in `1b`/`1c`)
 - `smartrss db migrate` (runs `alembic upgrade head`)
-- `smartrss db rotate-epoch --database-url <url>` *(explicit `--database-url` or `--dbname` required so drills can never accidentally rotate production's epoch; generates new `sync_state.instance_epoch` UUID)*
+- `smartrss db rotate-epoch (--database-url <url> | --database-url-env <ENV_VAR>)` *(explicit target URL required via flag or env var — `--database-url-env` avoids exposing passwords in process argv — so drills can never accidentally rotate production's epoch; generates new `sync_state.instance_epoch` UUID)*
 
 ---
 
@@ -585,7 +587,10 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 ### 11.3 Automated Restore Drill (`scripts/restore-drill.sh` / `make restore-drill`)
 1. Takes a fresh dump (or uses latest in `BACKUP_DIR`).
 2. Creates a clean temporary database `smartrss_restore_drill` inside `db` (or `db-test`), runs `pg_restore --no-owner --clean --if-exists`.
-3. Captures `old_epoch` from `sync_state`, invokes `smartrss db rotate-epoch --database-url <drill_db_url>` explicitly targeting `smartrss_restore_drill`, asserts `new_epoch != old_epoch`, verifies production `sync_state.instance_epoch` is untouched, verifies Alembic head matches, and verifies expected table row counts (`feeds`, `items`, `devices`).
+3. Captures `old_epoch` from `sync_state`, then invokes `smartrss db rotate-epoch --database-url-env SMARTRSS_DRILL_DATABASE_URL` explicitly targeting `smartrss_restore_drill`.
+   - The drill URL contains the DB password, so it is only exported into the script's environment and forwarded to the container with `docker compose run -e SMARTRSS_DRILL_DATABASE_URL` (name only, no `=value`). It never appears in any process argv.
+   - It then asserts `new_epoch != old_epoch`, verifies that production `sync_state.instance_epoch` is untouched, and verifies that the Alembic head matches.
+   - It verifies the `feeds`/`items`/`devices` row counts. When the drill takes a fresh dump, the counts must match production exactly. With an older dump, the drill fails if production is non-empty but the restore is empty.
 4. Drops the temporary drill database and exits `0`.
 5. *(Note: The architecture's full end-to-end drill check—"confirms paired clients cleanly resync without losing pending outbox mutations"—is deferred to milestones **`1b`/`1c`** once the `/api/v1/sync/*` endpoints and client outbox exist.)*
 
@@ -593,7 +598,7 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 
 ## 12. Verification & Test Plan (`1a` Exit Criteria)
 
-Per [development-process.md §2](../development-process.md#2-testing-standards), target **>= 80%** overall backend coverage and **>= 90%** line/branch coverage on critical core modules: `db/sync_log.py`, `security/safe_http.py`, `security/auth.py`, `security/middleware.py`, `domain/url_canon.py`, `domain/backoff.py`, `domain/expiration.py`, `extract/client.py`, `jobs/queue.py`, `jobs/locks.py`, `worker/stages/poll_feed.py`, and `worker/stages/expire_items.py`.
+Per [development-process.md §2](../development-process.md#2-testing-standards), target **>= 80%** overall backend coverage and **>= 90%** line/branch coverage on critical core modules: `db/sync_log.py`, `security/safe_http.py`, `security/auth.py`, `security/middleware.py`, `domain/url_canon.py`, `domain/backoff.py`, `domain/expiration.py`, `extract/client.py`, `jobs/queue.py`, `jobs/locks.py`, `worker/stages/poll_feed.py`, and `worker/stages/expire_items.py`. This exact list is enforced by `CRITICAL_MODULES` in [`scripts/check-critical-coverage.py`](../../scripts/check-critical-coverage.py), invoked by `make test-cov` after `pytest` writes `coverage.json` (see [development-process.md §2.2](../development-process.md#22-coverage-expectations)); keep the two in sync.
 
 ### 12.1 Automated Test Matrix
 | Test Suite | Key Cases Verified |

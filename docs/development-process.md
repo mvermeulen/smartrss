@@ -35,6 +35,12 @@ Testing is an integral part of every code change, not an optional verification s
 - **Target Coverage**:
   - **Backend overall**: **>= 80%** line coverage (`pytest --cov`).
   - **Critical core modules** (sync watermark & reconciliation, per-field LWW merge, expiration policy, job queue & lease reclaim, URL canonicalization/dedup, SSRF `SafeHttpClient`, mini-research guardrails, LLM schema validation): **>= 90%** line/branch coverage.
+- **Enforcement** (`make test-cov`, part of `make check`):
+  - The overall gate is `pytest --cov-fail-under=80`.
+  - The per-module critical gate is [`scripts/check-critical-coverage.py`](../scripts/check-critical-coverage.py). It reads the `coverage.json` written by `pytest --cov-report=json` and fails (exit `1`) if any module in its `CRITICAL_MODULES` list is below `MIN_CRITICAL_PCT` (`90`), or is missing from the report.
+  - The percentage is `coverage.py`'s `percent_covered`, which combines lines and branches under `--cov-branch`.
+  - Run it manually with `python3 scripts/check-critical-coverage.py backend/coverage.json` after `pytest --cov=smartrss --cov-branch --cov-report=json:coverage.json` in `backend/`.
+  - **Maintaining the list**: when a milestone adds or renames a critical module (as listed in that milestone's component design §"Verification & Test Plan"), update `CRITICAL_MODULES` in the **same commit**. Never lower `MIN_CRITICAL_PCT` or drop a module to make the gate pass; add meaningful tests instead.
   - **Frontend core logic** (Dexie local store, sync engine, outbox/rollback handling, detached search, HTML sanitization): **>= 80%** line coverage.
 - **Quality Over Vanity Metrics**:
   - Do **not** write low-value tests that merely assert mock call counts or test framework boilerplate to inflate numbers.

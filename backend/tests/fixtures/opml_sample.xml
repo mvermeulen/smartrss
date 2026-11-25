@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>SmartRSS Test Fixture</title>
+  </head>
+  <body>
+    <outline text="Systems" title="Systems">
+      <outline type="rss" text="Alpha Systems" title="Alpha Systems" xmlUrl="https://alpha.example.com/rss" htmlUrl="https://alpha.example.com"/>
+      <outline type="rss" text="XSS Site URL" title="XSS Site URL" xmlUrl="https://beta.example.com/rss" htmlUrl="javascript:alert(1)"/>
+      <outline type="rss" text="Private Literal IP" title="Private Literal IP" xmlUrl="http://192.168.1.1/rss"/>
+    </outline>
+  </body>
+</opml>
