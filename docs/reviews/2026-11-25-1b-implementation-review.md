@@ -4,7 +4,7 @@
 - **Scope**: Committed branch `milestone/1b`, `main` (`c8aa6f7`) → `070b82c` (`feat(1b): implement sync engine, LWW conflict resolution, and PostgreSQL FTS search`). Covers migration `0002`, `sync/` (`schemas.py`, `service.py`), `domain/sync_merge.py`, `domain/fts_text.py`, `search/fts.py`, the new routes (`sync`, `search`, `settings`), changes to `feeds.py`, `categories.py`, `sync_log.py`, `poll_feed.py`, `extract_content.py`, `maintenance.py`, `cli.py` and `config.py`, all new tests, `scripts/check-critical-coverage.py`, and the doc updates. Checked against [`docs/design/1b-sync-protocol-and-search.md`](../design/1b-sync-protocol-and-search.md) (Approved), `data-model.md`, ADR `0004`, and [`review-checklist.md`](../review-checklist.md).
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `K-`
-- **Status**: `Addressed (2026-11-25) — awaiting verification`
+- **Status**: `Addressed — verification found follow-ups (2026-11-25; K-01-F1 open)`
 
 ## Review outcome
 
@@ -201,3 +201,76 @@ All 7 findings (`K-01`–`K-07`, including both nits and the pre-existing `1a` c
 - `ruff check`, `ruff format --check`, `mypy src` (`strict = true`): all clean (53 source files, 83 files formatted).
 - `pytest`: **165 passed**, total branch+line coverage **91.12%** (gate ≥ 80%).
 - Critical-module coverage gate: **16/16 modules ≥ 90%** (`sync_merge.py` 100.00%, `search/fts.py` 99.03%, `fts_text.py` 97.64%, `expire_items.py` 96.67%, `sync_log.py` 95.93%, `sync/service.py` 94.53%, `poll_feed.py` 91.57%; lowest overall `security/middleware.py` 90.80%).
+
+---
+
+## Verification pass (2026-11-25)
+
+- **Verifier**: Claude Code (fresh session), against `2e7aadb` (`fix(1b): address implementation review findings (K-01–K-07)`).
+- **Result**: 6 ✅ resolved, 1 ⚠️ partially resolved (`K-01`). One follow-up, `K-01-F1` (Minor). Status stays **`Addressed — verification found follow-ups`**.
+
+### `make check`
+
+Green on `2e7aadb`. The numbers match the resolution notes exactly:
+
+```text
+============================= 165 passed in 19.50s =============================
+Required test coverage of 80% reached. Total coverage: 91.12%
+  [OK  ] src/smartrss/domain/sync_merge.py              100.00%
+  [OK  ] src/smartrss/search/fts.py                      99.03%
+  [OK  ] src/smartrss/domain/fts_text.py                 97.64%
+  [OK  ] src/smartrss/worker/stages/expire_items.py      96.67%
+  [OK  ] src/smartrss/db/sync_log.py                     95.93%
+  [OK  ] src/smartrss/sync/service.py                    94.53%
+  [OK  ] src/smartrss/worker/stages/poll_feed.py         91.57%
+  (16/16 critical modules ≥ 90 %; lowest security/middleware.py 90.80 %)
+```
+
+### Findings
+
+Every revert below was done on a scratchpad copy of the file. Each file was restored and checked with `diff`, and `git status` was clean afterwards.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `K-01` | ⚠️ partial | **Push step 3a:** `FOR SHARE` is present (`sync/service.py:637`). Removing it makes `test_k01_category_delete_race_never_leaves_feed_on_deleted_category` **fail**; restoring it makes the test pass. **`POST`/`PATCH /feeds`:** the category is locked `FOR SHARE` before the feed `FOR UPDATE` (`feeds.py:350-361`, `480-496`). The lock order is asserted by `test_k01_online_patch_and_post_feed_lock_category_for_share_before_feed`. The online `DELETE /categories` path locks the category `FOR UPDATE` before the child feeds, so after the push commits it sees the new `category_id` and clears it. **Gaps:** see `K-01-F1`. The OPML `FOR SHARE` lock has no test: with it removed, the full suite still passes (165/165). The OPML `default_category_id` sibling path is never validated, so it attaches feeds to deleted categories without any race (reproduced). |
+| `K-02` | ✅ | Patched in `matched_existing.sort(..., reverse=True)` (`poll_feed.py:760`). Result: `test_k02_poll_feed_updates_matched_existing_items_in_strict_id_asc_order` **fails**, and the upgraded `test_1b_t01b_…` **fails 3/3** (it was 5/5 *pass* in the original review). Restored: both pass. |
+| `K-03` | ✅ | Text preparation, headline parsing and vector-param building go through `asyncio.to_thread`. There is one batched `unnest … WITH ORDINALITY` `ts_headline` query, and `derive_lead_excerpt` pre-slices at 8,192 characters. Replacing the search-path `to_thread` with a direct call makes `test_k03_search_batches_headlines_and_offloads_text_prep_to_thread` **fail**; restoring it makes the test pass. `fts.py` coverage is 99.03 % (only line 179 is missed). |
+| `K-04` | ✅ | `items.id = ANY(CAST(:prelocked_ids AS uuid[]))` is added to the scoped `UPDATE` (`sync/service.py:1100-1106`). The set is `scoped_candidates_by_idx[idx] ∪ explicit_item_ids`, and all of those rows are locked in `id ASC` order in step 3c. Mutations rejected on epoch or category return before the `UPDATE`. An empty set short-circuits to `applied, 0`. Disabling the `ANY` filter makes `test_k04_scoped_bulk_read_update_restricted_to_prelocked_candidates` **fail**; restoring it makes the test pass. |
+| `K-05` | ✅ | `client_timestamp`, `older_than_ts` and the `category_id` UUID are canonicalized before hashing. I removed each of the three normalizations separately; `test_k05_payload_sha256_canonical_across_tz_and_uuid_case` **fails** in all three cases and passes after each restore. The other `feed_set_field` values are typed by the schema, so `model_dump` already gives a canonical form. |
+| `K-06` | ✅ | `test_1b_t12_…` now saves `search_vector::text` right after `upgrade head`, runs `reindex_all_items` against the scratch DB, and asserts the two are equal (`test_sync_bootstrap_and_pull.py:583-632`). I checked the code but did not revert it (Nit). The implementer's revert evidence is recorded in §7. |
+| `K-07` | ✅ | `expired_at`, `read_state_updated_at` and `updated_at` use `sa.func.now()` (`expire_items.py:66-68`). Switching only `read_state_updated_at` back to `datetime.now(UTC)` makes `test_k07_expire_items_uses_db_clock_not_python_clock` **fail**; restoring it makes the test pass. |
+
+### Follow-ups
+
+#### K-01-F1 (Minor) — OPML import attaches feeds to a soft-deleted category through the unvalidated `default_category_id`, and the OPML `FOR SHARE` lock has no test
+`import_opml_endpoint` (`backend/src/smartrss/api/routes/feeds.py:205`) assigns `category_id = body.default_category_id` to new and reactivated feeds without checking that the category exists or is active. This code dates from `1a`, but it is a sibling path of `K-01`, and the resolution lists OPML import as fixed.
+
+- **Reproduced.** I used a temporary test, deleted afterwards. Create a category, `DELETE` it, then call `POST /api/v1/feeds/import-opml` with `default_category_id` set to that category. The response is `200 {"imported": 1, …}` and the new feed's `category_id` points to the soft-deleted category. This is exactly the `K-01` end state, and it needs no race.
+- **Second case.** A nonexistent `default_category_id` fails on the foreign key and comes back as an unhandled exception, not a `422`.
+- **No test for the lock.** With `.with_for_update(read=True)` removed from the OPML category load, the full suite still passes (165/165).
+
+**Expected fix:**
+- Check `body.default_category_id` against the `FOR SHARE`-locked active category rows that are already loaded (index them by `id`). If it is missing or deleted, return `422 "Category not found"` before creating any rows.
+
+**Regression tests:**
+1. A deleted `default_category_id` returns `422`, and no feed is created or reactivated.
+2. A nonexistent `default_category_id` returns `422`.
+3. A lock-order capture test for OPML, like the `K-01` online test, asserting that `categories … FOR SHARE` runs before any feed write. It must fail with the `FOR SHARE` removed.
+
+Show the revert evidence for each test.
+
+### Repo-wide drift checks
+
+- **`docs/README.md`.** No duplicate rows. The `1b` implementation-review row is updated by this pass.
+- **`CRITICAL_MODULES`.** The list matches design §10/§11 (the 12 `1a` modules plus `sync_merge.py`, `fts_text.py`, `sync/service.py` and `search/fts.py`). All 16 pass.
+- **Untracked files.** None. Only ignored caches are present (`.coverage`, `.hypothesis/`, `.mypy_cache/`, `.pytest_cache/`, `.ruff_cache/`).
+- **Note (no ID).** The status header in `docs/design/1b-sync-protocol-and-search.md` still says "awaiting Claude Code implementation review". Update it along with `K-01-F1`, for example to "implementation review findings addressed; verification follow-up `K-01-F1` open".
+
+### Observations (no action required)
+
+- `derive_lead_excerpt` now strips only the first 8,192 HTML characters. A summary that starts with more than 8 KB of non-text markup (inline `<style>`/`<svg>`/base64 `<img>`) gets an empty `lead_excerpt` where it used to get one. This is the trade-off the review suggested, and `extracted_text` replaces it once extraction succeeds.
+- The `K-05` change alters `payload_sha256` for non-UTC timestamps. This is harmless because `1b` has not been deployed, so no stored `sync_mutations` rows exist to compare against.
+
+### Residual risks for owner acceptance
+
+None beyond `K-01-F1`. If the owner prefers, they can accept `K-01-F1` as a pre-existing `1a` residual risk instead of fixing it before `Implementation Approved`.
