@@ -15,6 +15,7 @@ SmartRSS follows a **spec-first, test-integrated, docs-synchronized** workflow:
 3. **Verify Locally**: Run `make check` (linting, type-checking, unit + real-Postgres integration tests, coverage gates) before considering a task done. *(No GitHub Actions CI is required; local verification gates are mandatory on every change.)*
 4. **Sync Documentation**: Update affected design docs, schemas, ADRs, and `AGENTS.md` in the **same change** as the code.
 5. **Small, Focused Commits**: Keep commits cohesive (feature + its tests + its doc updates together) with clear commit messages describing *why* as well as *what*.
+6. **Milestone Branches**: Implement each milestone on a `milestone/<id>` branch so reviews target a committed diff. Merge to `main` only after the owner sets `Implementation Approved` (§4.1, §7). Doc-only changes (designs, reviews, process) may go directly to `main`.
 
 ---
 
@@ -52,6 +53,8 @@ Testing is an integral part of every code change, not an optional verification s
   1. Write a test that reproduces the exact bug and verify it **fails** before the fix.
   2. Apply the fix and verify the new test **passes** along with the existing suite.
   3. Name or comment the test clearly so future maintainers understand the failure mode it guards against.
+  4. **Prove it** (required when the fix was written before the test, which is the usual case for review findings): temporarily revert or disable the fix, run the test, confirm it **fails for the expected reason**, restore the fix, and confirm it passes. Then check that the coverage report shows the fixed lines as covered. A test that passes with and without the fix does not count. *(`1a` lesson: the first `I-02` test failed a different code path and passed either way.)*
+  5. **Record the evidence** in the review resolution or commit message, e.g. ``I-02: test_i02_… — reverted slot `except Exception`, test failed (slot died); restored, passed; runner.py:659-667 covered``.
 - **Real-World Feed/Document Quirks**: Whenever a real RSS feed, webpage, PDF, or LLM response triggers an unexpected edge case, add a sanitized minimal fixture to the test suite as a permanent regression case.
 
 ### 2.4 Non-Negotiable Invariant Test Matrix
@@ -92,6 +95,18 @@ Documentation is a **first-class deliverable**, kept continuously synchronized w
 - **Who approves**: The project owner explicitly reviews and approves specs and ADRs.
 - **How approval is recorded**: Updating the document status to **`Approved`** (in the doc header and [docs/README.md](README.md)) and ADR status from `Proposed` to **`Accepted`** in a git commit.
 - Component designs in `docs/design/` are approved milestone-by-milestone (`1a`, `1b`, …) before implementing each milestone.
+- **Milestone lifecycle** (recorded in the component design header and its [docs/README.md](README.md) / [design/README.md](design/README.md) rows):
+
+  | Status | Meaning | Set by |
+  | :--- | :--- | :--- |
+  | `Draft` | Design being written | Author |
+  | `In Design Review` | Design review open in `docs/reviews/` | Author / reviewer |
+  | `Approved` | Design review `Verified`; coding may start | **Project owner only** |
+  | `Implemented` | Code, tests, and docs complete; `make check` green | Implementer |
+  | `In Implementation Review` | Implementation review open | Implementer / reviewer |
+  | `Implementation Approved` | Implementation review `Verified`; milestone done; next milestone's coding may start | **Project owner only** |
+
+- Agents never set `Approved` or `Implementation Approved` on their own initiative; they do so only when the owner explicitly says to, in the same commit that records it.
 
 ### 4.2 Docs-in-the-Same-Change Rule
 Whenever a code change alters any of the following, update the corresponding docs in the **same commit**:
@@ -124,3 +139,56 @@ Before marking any implementation task complete (or committing), verify:
 - [ ] Local verification (`make check` / coverage gates) passes cleanly.
 - [ ] Affected docs (`docs/requirements.md`, `docs/architecture.md`, `docs/data-model.md`, `docs/design/*`, `docs/decisions/*`, `docs/README.md`) are updated in the same commit.
 - [ ] Any new convention, guardrail, or lesson learned from user feedback is reflected in `AGENTS.md`, `docs/development-process.md`, or `.agents/skills/`.
+- [ ] Each regression test has recorded "fails with the fix reverted" evidence (§2.3).
+- [ ] Status changes appear in the doc header **and** the `docs/README.md` index, with no stale or duplicate rows.
+- [ ] For milestone completion: implementation review exists, is `Verified`, and residual risks are owner-accepted (§7).
+
+---
+
+## 7. Review Gates
+
+Reviews are a required, recorded part of every milestone, not an optional extra. In `1a`, the design review found 6 blockers that `Approved`-ready prose hid. The implementation review found a security blocker (`I-01`) after `make check` passed. Each verification pass then found that some "Addressed" claims were incomplete (`N-01`–`N-11`; the `I-02`/`I-04`/`I-18`/`I-09` follow-ups).
+
+### 7.1 When reviews happen
+| Gate | Input | Must reach `Verified` before |
+| :--- | :--- | :--- |
+| **Design review** | Component design `Draft` (plus touched requirements, data model, ADRs) | Owner sets design `Approved` |
+| **Implementation review** | The milestone's code, tests, migrations, scripts, and doc diff (ideally a committed branch diff, not an uncommitted tree) | Owner sets `Implementation Approved` |
+| **Ad-hoc review** *(optional)* | Large refactor, security-boundary change, new ADR | Merge of that change |
+
+### 7.2 Review document format
+- **File**: `docs/reviews/YYYY-MM-DD-<scope>-<design|implementation>-review.md`. Add a row to the [docs/README.md](README.md) index with status `Open`, and update that same row afterwards (never add a second row).
+- **Header**: date, scope (paths plus base commit), specs checked against, reviewer (agent/model or person), and status.
+- **Finding IDs**: one letter prefix per review, unique across the repo (used so far: `R`, `Q`, `B`, `M`, `S`, `A`, `N`, `T`, `I`). Number findings sequentially and never renumber them.
+- **Severity**:
+  | Severity | Meaning | Before approval |
+  | :--- | :--- | :--- |
+  | **Blocker** | Security hole, data loss/corruption, or broken core invariant | Must be fixed |
+  | **Major** | Incorrect behavior under realistic conditions, missing required test/gate, spec drift | Must be fixed or owner-accepted |
+  | **Minor** | Edge case, hardening, or maintainability issue with limited impact | Fix or track |
+  | **Nit** | Style or cleanup | Optional |
+- **Each finding**: location (`path:line`), the problem, a concrete failure scenario or impact, and a suggested fix, including the regression test to add.
+- **Required sections**: outcome summary (what is solid plus the overall recommendation), findings by severity, verification performed (`make check` result, reproductions), and, once resolved, **Resolutions** (per finding: fix, test name, §2.3 evidence) and **Accepted residual risks** (owner-acknowledged).
+
+### 7.3 Review status lifecycle
+`Open` → `Addressed` (implementer claims every finding is resolved, with evidence) → `Verified` (a separate verification pass confirms it) → the owner approves the design or implementation.
+- **Who does what**: the reviewer (**Claude Code**) writes the review (`Open`). The implementer (**Antigravity**) fixes the findings, records resolutions and evidence, and sets `Addressed`. The reviewer runs the verification pass and sets `Verified`. The project owner approves.
+- **Separate verification pass**: run by the reviewer in a fresh session, never by the agent that wrote the fixes. Check every finding, not a sample:
+  - Re-read the fix.
+  - Re-run the revert-the-fix check for Blocker/Major regression tests.
+  - Confirm that the fix's lines are covered.
+  - Confirm that the docs and index rows are updated.
+  - Run `make check`.
+- Anything the verification pass finds is appended to the same review as a new "Verification pass" section, using a new prefix (as `N-` was for `A-`) or as follow-ups. Resolve those before moving to `Verified`.
+
+### 7.4 Reviewer focus
+Beyond spec conformance, reviewers walk the recurring failure-class checklist in [`docs/review-checklist.md`](review-checklist.md). It covers untrusted input into libraries, stale reads across I/O, loop survival, lease ownership, DB limits, secrets in argv, event-loop blocking, encoding, and doc drift. Implementers self-check against the same list before requesting review. When a new class of bug is found, add it to that checklist.
+
+### 7.5 Roles & skills
+| Role | Agent | Skills |
+| :--- | :--- | :--- |
+| Designer / implementer | **Antigravity** | [`.agents/skills/prepare-for-review`](../.agents/skills/prepare-for-review/SKILL.md), [`.agents/skills/address-review-findings`](../.agents/skills/address-review-findings/SKILL.md) |
+| Reviewer / verifier | **Claude Code** | [`.claude/skills/design-review`](../.claude/skills/design-review/SKILL.md), [`.claude/skills/implementation-review`](../.claude/skills/implementation-review/SKILL.md), [`.claude/skills/verify-review-resolution`](../.claude/skills/verify-review-resolution/SKILL.md) |
+| Approver | Project owner | — |
+
+**Hand-off**: the implementer runs `prepare-for-review`, then the owner asks Claude Code to review. The implementer runs `address-review-findings`, then the owner asks Claude Code to verify. The owner approves.
