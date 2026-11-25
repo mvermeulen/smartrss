@@ -5,7 +5,7 @@
 - **Specs checked against**: `requirements.md`, `data-model.md`, `architecture.md`, ADRs `0002`, `0004`, `0006`, `development-process.md` §2.4 and §7, `review-checklist.md`, `1a-backend-ingestion-and-security.md`
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `P` (`P-01`–`P-17`)
-- **Status**: `Addressed (2026-11-25) — awaiting verification`
+- **Status**: `Addressed (2026-11-25) — awaiting verification (follow-up P-11-F1 addressed)` (2026-11-25: 16 ✅, 1 ⚠️ → `P-11-F1`)
 
 ## Review outcome
 
@@ -325,3 +325,79 @@ All 17 findings (`P-01`–`P-17`) and 4 owner decisions (`Q-1`–`Q-4`) have bee
 - **Verification note (poll_feed `ingest_sync_seq` mapping)**: Incorporated the reviewer's §5 note directly into `1b` §5.3 so `poll_feed` explicitly zips `all_events` with `seqs` filtered to `inserted_ids` rather than indexing by position.
 
 *No application code was modified in this design-review pass (per `AGENTS.md`, `1b` implementation starts only after `1b` design approval).*
+
+---
+
+## 8. Verification pass (2026-11-25)
+
+- **Verifier**: Claude Code (Claude Opus 5.5), fresh pass over commit `53f0dfe`.
+- **Method**: Re-read the revised design end-to-end against every finding, independently re-ran the implementer's "verified" claims, and checked for doc drift. This is a design-only pass with no application code, so there are no regression tests to revert.
+- **`make check`**: green. 131 passed; total coverage 88.42%; every critical module meets the ≥ 90% gate. No code has changed since `1a`, so this is the expected baseline.
+
+### Independently re-checked claims
+| Claim | Re-check | Result |
+| :--- | :--- | :--- |
+| `CAST(:p AS type)` binds in `sa.text()` (`P-07`) | Compiled the §5.3/§8.1 SQL shape with SQLAlchemy 2.1.9 | ✅ binds `fts_cfg`, `ids`, `seqs`, `x` |
+| No `:param::type` left in design | `grep -nE ':[a-z_]+::'` | ✅ none |
+| `querytree(tsq) = 'T'` for negation-only queries (`P-13`) | pg16: `-foo`, `-foo -bar`, `-"hello world"`, `foo OR -bar` → `T`; `foo -bar`, `foo` → `'foo'`; `the and`, `!!!` → `numnode = 0` | ✅ matches §8.2 |
+| Quoted `chr(4)` `FragmentDelimiter` (`P-15`) | pg16 with an article containing a literal `…` | ✅ fragments split only on `\x04`; spaces kept; article `…` untouched |
+| Old `B-0x`/`M-0x` IDs removed (`P-16`) | `grep` | ✅ none remain |
+| Checklist classes `C7`, `D5` added | `docs/review-checklist.md:30,51` | ✅ |
+
+### Verdicts
+| Finding | Sev | Verdict | Evidence |
+| :--- | :--- | :--- | :--- |
+| `P-01` | Major | ✅ | §6.5 items 2 and 4 use two tiers per `Q-2`. `scope='items'` uses LWW over `unread`/`read`, consistent with the single-item comparator, including the equal-timestamp rank. The scoped carve-out is documented, and §2 `1b-D04` no longer over-claims. `1b-T02(b)` adds service-level real-PG permutations and `1b-T06` the two-order regression. |
+| `P-02` | Major | ✅ | §6.6 `compute_online_lww_timestamp()` reads the DB clock and is strictly monotonic. It covers `PATCH`, `POST` reactivation, and category delete (SQL `GREATEST`). `1b-T07(b)` replays the fast-laptop scenario in both arrival orders. |
+| `P-03` | Major | ✅ | §6.4 removes `watermark` from the push response and adds a normative cursor rule. `1b-T04(c)` covers it. |
+| `P-04` | Minor | ✅ | §5.1 hierarchy is extended (`jobs`, `app_settings`). §5.4 is reordered so `app_settings` comes first and `sync_state` last. `poll_feed` sorts `matched_existing`, covered by `1b-T01(b)`. *Observation, no follow-up*: `poll_feed` still interleaves `extract_content` `enqueue_job` between item updates, but push only enqueues `poll_feed:feed:*` rows, so the two never contend on the same `jobs` rows and no cycle is possible. |
+| `P-05` | Minor | ✅ | §6.7 retries 3× on `40P01`/`40001`/`23505`(`sync_mutations_pkey`), then returns `503` + `Retry-After`. `1b-T05(b)` covers it. |
+| `P-06` | Minor | ✅ | `poll_interval_minutes` is added to `FEED_SYNCED_COLUMNS`. `last_*_at` are removed from `SyncFeedDTO` and §11 lists the `data-model.md` change. `1b-T07(d)` covers it. |
+| `P-07` | Minor | ✅ | See re-check table. |
+| `P-08` | Minor | ✅ | `LEFT(...)` projections in bootstrap and pull, slim push snapshots, and `SearchItemDTO` without `raw_summary`. `1b-T08(b)` asserts responses stay `< 512 KB`. |
+| `P-09` | Minor | ✅ | Caps of 5,000 total `item_ids` (`422`) and 2 MiB body (`413`). The 20k `scope='all'` benchmark is `1b-T08(c)`. |
+| `P-10` | Minor | ✅ | Header now maps `FR-STATE-03`/`FR-STATE-04` (partial). |
+| `P-11` | Minor | ⚠️ | The journal is normative (§6.2 step 5) and `1b-T09` is extended. Replaying scoped bulk reads across an epoch change is unsafe, though; see `P-11-F1`. |
+| `P-12` | Minor | ✅ | Normative client rule in §6.2 step 3 and §6.3. `1b-T04(b)` covers it. |
+| `P-13` | Minor | ✅ | See re-check table. Covered by `1b-T10`. |
+| `P-14` | Nit | ✅ | §4.3 uses the Python builder plus `FTS_LANGUAGE` from env, and documents the `MIN(seq)` note. `1b-T12` covers it. |
+| `P-15` | Nit | ✅ | See re-check table. `list[list[SnippetFragment]]`. |
+| `P-16` | Nit | ✅ | Renamed to `1b-D0x`/`1b-T0x`. |
+| `P-17` | Nit | ✅ | Search auth (§8.2), display-only cache rule, `payload_sha256` (§4.1, §6.7, `1b-T05(a)`), and `null` → `422` on settings (§7). |
+
+**Counts**: 16 ✅, 1 ⚠️, 0 ❌.
+
+### Follow-ups
+#### `P-11-F1` (Minor) — Scoped bulk-read bounds from the old epoch mark unseen post-restore items read on replay
+**Location**: §6.2 step 5, §6.5 item 4, `1b-T09`.
+
+`up_to_sync_seq` lives in the *old* epoch's sequence space. A restore rewinds `current_seq`, so items ingested after the restore receive seqs that a pre-restore bound already covers. The per-item guard `effective_ts >= read_state_updated_at` protects items fetched after the user's action, but not items fetched between the restore and the action.
+
+**Scenario**:
+1. Client goes offline at cursor `W = 1000`.
+2. At 10:00 the server is restored to `current_seq = 900` and the epoch rotates.
+3. At 10:05 a poll ingests items with seqs 901–950 (`fetched_at` 10:05).
+4. At 11:00 the user, still offline, taps "Mark all read" (`up_to_sync_seq = 1000`).
+5. On reconnect, `pull` returns `epoch_mismatch` → re-bootstrap → outbox flush. Items 901–950 are marked `read` although the client never saw them.
+
+This violates `FR-STATE-03` / `data-model.md` §5.2 ("never marks unseen items"). The normative 48h replay journal widens exposure, because it re-pushes acknowledged scoped bulk reads after every restore. The same holds for the pending outbox (ADR 0004), so the issue predates `1b`, but `1b` is now the normative contract.
+
+**Expected fix**:
+- Scoped `item_mark_bulk_read` (`all`/`feed`/`category`) carries the client's `epoch`. If it differs from the current `instance_epoch`, the server returns `rejected`, `reason = "epoch_mismatch"`, and does nothing.
+- The `1c` client either drops these mutations on replay or rewrites them as `scope='items'` over the item IDs it knew pre-restore.
+- `scope='items'` and single-field mutations stay epoch-agnostic.
+- Add the scenario above to `1b-T09`.
+- Note the rule in the §11 ADR 0004 alignment line.
+
+### Residual risks for owner acceptance
+- `P-01` / `Q-2`: the scoped bulk mark-read non-commuting carve-out (already owner-decided; restated here for the approval record).
+- `expired` exclusion in `scope='items'`: a deliberate carve-out (§6.5 item 2).
+
+### Status
+`Addressed — verification found follow-ups` (`P-11-F1`). Hand back to Antigravity (`address-review-findings`). Once `P-11-F1` is addressed, the reviewer re-checks only that item.
+
+---
+
+## 9. Follow-up Resolutions (2026-11-25)
+
+- **P-11-F1** — Fixed. Added required `epoch: UUID` to scoped `item_mark_bulk_read` (`all`/`feed`/`category`) and left `scope='items'` and single-field mutations epoch-agnostic (`1b` §2 `1b-D05`, §6.4 table, §6.5 item 4, §6.7 steps 1/3/4). On push, the server checks `mutation.epoch == sync_state.instance_epoch` (read without `FOR UPDATE` in step 1, preserving §5.1 lock ordering) and immediately returns `outcome = "rejected", reason = "epoch_mismatch", affected_count = None` with zero item updates on mismatch. Updated the normative `1c`/Phase 2 restore protocol (§6.2 step 5) so clients drop or rewrite old-epoch scoped bulk reads as chunked `scope='items'` over pre-restore known IDs before overwriting local state. Added the exact `W = 1000 → restore 900 → post-restore poll 901..950 → offline bulk read` regression to `1b-T09` and recorded the rule in §11 (`ADR 0004` / `data-model.md` §5.2 alignment).
