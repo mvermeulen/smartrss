@@ -4,7 +4,7 @@
 - **Scope**: Committed branch `milestone/1c`, `main` (`c1a56f0`) → `7566002` (`feat(1c): implement local-first Ubuntu reader UI, offline shell, runner & E2E suite`). Covers `client-runner/`, `frontend/` (sync engine, outbox, reconciliation, lock, probe, Dexie schema, API client and normalizer, sanitizer, URL safety, Service Worker, search, UI components), `deploy/` (Nginx, systemd, desktop), `scripts/` (`install-client.sh`, `check-prereqs.sh`, `check-frontend-coverage.mjs`), `Makefile`, `docker-compose.yml`, the CORS default in `config.py`, the E2E suite, and doc updates. Checked against [`docs/design/1c-client-ui-and-offline-shell.md`](../design/1c-client-ui-and-offline-shell.md) (Approved), `data-model.md` §6.2, ADRs `0002`/`0004`/`0005`/`0006`, and [`review-checklist.md`](../review-checklist.md).
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `V-`
-- **Status**: `Addressed (2026-11-25, pass 2) — awaiting verification`
+- **Status**: `Verified (2026-11-25)` — `1c` **Implementation Approved** by the project owner (2026-11-25)
 
 ## Review outcome
 
@@ -465,3 +465,46 @@ Each fix was disabled with a minimal edit, one path at a time. The **full** vite
 - **Backend**: `167 passed` (total `91%`, all 16 critical modules `>= 90%`; `ruff` + `mypy` clean).
 - **Localhost Runner**: `32 passed`, `smartrss_client_runner.py` `94.87%` (`>= 90%` gate OK).
 - **Frontend Core**: `eslint` + `prettier` + `tsc --noEmit` clean; **`55 passed`** (6 test files); all 6 critical modules `>= 90%` and all 5 core modules `>= 80%` passed.
+
+---
+
+## Final verification pass (2026-11-25)
+
+- **Verifier**: Claude Code (fix commit `03f2746`, `481d64d` → `03f2746`; tests and docs only, no production-code changes)
+- **Result**: both follow-ups ✅ resolved. All findings `V-01`–`V-10` and follow-ups `V-03-F1`, `V-07-F1` are resolved.
+
+### `make check` (on `03f2746`)
+
+```text
+backend:  167 passed in 19.64s — Total coverage: 91.21% — all 16 critical core modules >= 90%
+runner:    32 passed in 1.55s  — smartrss_client_runner.py 94.87%
+frontend: eslint + prettier + tsc clean; vitest 55 passed; all 6 critical (>= 90%) and 5 core (>= 80%) gates passed
+EXIT 0
+```
+
+These counts match the pass-2 resolution notes (55 frontend tests; the pass-1 typo is corrected).
+
+### Findings
+
+| ID | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `V-03-F1` | ✅ | `test_v03_f1_in_tab_running_guard_avoids_second_lock_and_drains_enqueued_work` holds push #1 in flight, enqueues *without* `notifyOutboxEnqueued()` (so only the guard sets `dirty`), and asserts zero `sync_lock` reads on the second `triggerSync()`. **Revert check:** deleted the `if (this.running)` guard; the full vitest suite **fails** on this test. Restored; green. 5/5 repeated runs pass (not flaky). |
+| `V-07-F1` | ✅ | The timer callback now calls `self.shutdown()` when the handler is missing, and the assertion runs in the main thread. **Revert check:** replaced the `SIGTERM` registration with `pass`; the full runner suite **fails** quickly, with both `test_v07_runner_sigterm_graceful_shutdown` and `test_v07_runner_main_signal_shutdown_inprocess` failing and no hang. Restored; 32 passed. |
+
+All restores were confirmed with `cmp`; `git status` was clean afterwards.
+
+### Residual risk
+
+- **`forceFullResync()` lock and fencing.** This is pre-existing and user-initiated. At the owner's direction it is scheduled as a carry-forward into milestone `1d`, recorded in `docs/design/README.md` item 4 and `1c` §11. It must be listed among `1d`'s design-review inputs.
+
+### Repo-wide drift checks
+
+- `docs/README.md`: one `1c` implementation-review row, updated in place.
+- `docs/design/README.md`, the `1c` design header and `AGENTS.md` consistently say "Implemented — In Implementation Review". These are left for the owner's approval commit (§4.1).
+- No untracked files.
+
+**Status:** `Verified (2026-11-25)`. Ready for the project owner's `Implementation Approved` decision.
+
+## Owner decision (2026-11-25)
+
+The project owner approved the `1c` implementation (**Implementation Approved**, 2026-11-25). `SyncEngine.forceFullResync()` lock and fencing is carried forward into milestone `1d`.
