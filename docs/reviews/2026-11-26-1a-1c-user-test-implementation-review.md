@@ -26,7 +26,9 @@ The findings so far:
 - a misleading `items_polled` counter name (`E-06`);
 - a CORS preflight on every API call from the client (`E-07`);
 - an **owner-requested** change: record `304 Not Modified` polls separately (`E-08`);
-- **owner feedback** asking for a one-command first-time server setup (`E-09`). This is future design work and doesn't block `1c`.
+- **owner feedback** asking for a one-command first-time server setup (`E-09`). This is future design work and doesn't block `1c`;
+- feed URL validation that accepted a pasted Markdown link (`E-10`), caught live;
+- **owner feedback** that exporting the feed list is hard to find, plus no headless or backup export (`E-11`). The UI button exists, so this is discoverability and the gaps around it.
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
 
@@ -36,7 +38,7 @@ The findings so far:
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
-| Minor | `E-02`, `E-03`, `E-04`, `E-08` (owner-requested), `E-09` (owner-requested, future design) |
+| Minor | `E-02`, `E-03`, `E-04`, `E-10`, `E-08` (owner-requested), `E-09` (owner-requested, future design), `E-11` (owner-requested) |
 | Nit | `E-05`, `E-06`, `E-07` |
 
 ---
@@ -125,7 +127,28 @@ The production image is pinned to `python:3.12-slim`, so this only affects devel
 
 **Impact:** anyone installing a client on a second machine, the main use of that command, fails on the first command. They then edit the wrong config path or look in the wrong directory.
 
-**Suggested fix:** either implement `--api-origin` in `install-client.sh` (write or replace `SMARTRSS_API_ORIGIN` in `config.env`, validated like the runner does) or change the README to "edit `config.env`, then `systemctl --user restart smartrss-client`". Fix the path, the swap description, the Node version, and the status line. Per §4.2, include this in the same commit as any script change.
+**Suggested fix (`E-04`):** either implement `--api-origin` in `install-client.sh` (write or replace `SMARTRSS_API_ORIGIN` in `config.env`, validated like the runner does) or change the README to "edit `config.env`, then `systemctl --user restart smartrss-client`". Fix the path, the swap description, the Node version, and the status line. Per §4.2, include this in the same commit as any script change.
+
+### E-10 — Feed URL validation accepts a pasted Markdown link
+
+**Where:** `backend/src/smartrss/api/routes/feeds.py:84-88` (`_validate_feed_url`): it strips whitespace, then checks only the scheme, host and port (`policy.validate_url`) and resolves the host. The path, query and fragment aren't checked. This is used by `POST /api/v1/feeds`, `PATCH /api/v1/feeds/{id}` (feed URL edits), and presumably OPML import.
+
+**What happened (soak, 04:27):** the owner added Latent Space in the UI by pasting a Markdown link. The API returned `201` and stored:
+
+```
+feed_url = https://www.latent.space/feed](https://www.latent.space/feed
+```
+
+The owner noticed it and corrected it with a `PATCH` at 04:29:56 (`field_updated_at['feed_url']` stamped) before the 04:30 cron run, so the bad URL was never polled. If it had been, the server would have requested the literal path `/feed](https://www.latent.space/feed`. The likely result is a 404 or HTML response, `consecutive_errors` going up, and the feed ending up `degraded` / `broken` with an unclear error message.
+
+**Impact:** copy and paste from Markdown, chat or note apps is a normal way to add feeds. `]`, `(`, `)` and unescaped spaces make a URL invalid by RFC 3986 (a `]` is only allowed in an IPv6 host literal), and a second `scheme://` inside the path is almost always a paste error.
+
+**Suggested fix:**
+
+- Reject, with `422` and a clear message, any URL whose path, query or fragment contains unescaped characters that RFC 3986 doesn't allow (space, `<>"{}|\^\``, and `[` / `]` outside the host). Also reject a URL with an embedded second `http(s)://`.
+- Optionally, in the UI only, pull the URL out of an obvious Markdown `[text](url)` or `<url>` paste before submitting, and show the cleaned value.
+- Apply the same check on all three paths (create, PATCH, OPML import) and keep it shared with `SSRFPolicy.validate_url` so they can't drift apart.
+- **Regression tests:** an API test for each path where the exact soak string gets `422`; a positive test for valid percent-encoded paths (`%5D`) and query strings; and a frontend test for the paste clean-up if it's added.
 
 ---
 
@@ -226,7 +249,26 @@ The line used for this test is:
 
 **Placement:** add a requirement, for example a new `NFR-OPS-02 Guided first-time install`, or extend `NFR-OPS-01` with a criterion such as "fresh Ubuntu LTS host → paired UI with feeds in one command plus a pairing paste". Then design it in a component spec. It's mostly scripts and docs with no data-model impact, so the owner may schedule it alongside `1d` rather than after `1g`.
 
-**Tests (when designed):** a scripted fresh-install E2E in a clean VM or container-in-container runner. Re-running `setup` is a no-op that preserves `.env` and data. Prerequisite failure messages for each missing prerequisite, including no daemon access. A pairing code is printed and works.
+**Tests (for `E-09`, when designed):** a scripted fresh-install E2E in a clean VM or container-in-container runner. Re-running `setup` is a no-op that preserves `.env` and data. Prerequisite failure messages for each missing prerequisite, including no daemon access. A pairing code is printed and works.
+
+### E-11 — Exporting the feed list is hard to find, and there's no headless export (owner feedback, 2026-11-26)
+
+**Severity:** Minor (owner-requested enhancement; mostly UX and docs).
+
+**Owner feedback:** *"It would be nice to be able to export the list of feeds."*
+
+**What already exists:** `GET /api/v1/feeds/export-opml` (`feeds.py:309`, returns `200 application/xml`, checked during the soak). The **Feeds & OPML** view also has an **Export OPML** button (`frontend/src/components/feeds/FeedManagerView.tsx:170-201`, `data-testid="export-opml-btn"`) that downloads `smartrss-feeds.opml`, as `1c` §596 and `1c-T14` specify. So the feature is there, but the owner didn't find it while using that same view to add 5 feeds. That makes it a discoverability gap, and it reveals some gaps around it:
+
+1. **Labelling and discoverability.** "OPML" means nothing to someone who wants "my list of feeds". The button doesn't say what it exports or that the file works in other readers.
+2. **No headless export.** Without a paired browser there's no `smartrss feeds export-opml` CLI, so a script or the server host needs a bearer token and `curl`. This is the same gap as §3a Q-1 and `E-09` step 6.
+3. **No export alongside backups.** `NFR-OPS-01` lists "OPML/config export" next to the nightly `pg_dump`, but `scripts/backup.sh` writes only the dump. Nothing human-readable or portable is kept unless someone exports by hand. The README never mentions OPML.
+
+**Suggested change (designer to evaluate):**
+
+- **UI:** relabel to something like **"Export feed list (OPML)"**, with a one-line hint: "Download all subscriptions with their categories; importable into SmartRSS or any RSS reader." Put Import and Export together at the top of the Feeds view, and optionally add an export entry under Settings. Optional extra formats: a plain list of URLs (`.txt`) or JSON with per-feed settings (poll interval, full-text, curation instructions). OPML can't carry those settings, so JSON is needed for a full config backup.
+- **CLI:** `smartrss feeds export-opml [--output FILE]` (and `import-opml FILE`), run in-container like `pair create`, so no token is needed. It reuses the existing `export_opml` domain function.
+- **Backups:** have `scripts/backup.sh` also write `smartrss-feeds-<timestamp>.opml` (mode `0600`, same rotation) next to each dump, and document it in the README backup section. Check this against the `NFR-OPS-01` wording.
+- **Tests:** a CLI test that its output round-trips through `import-opml` (no duplicates, categories kept); a backup-script test that the OPML file exists with the right mode and rotation; and an updated `1c-T14` selector or label assertion if the button is relabelled.
 
 ---
 
@@ -234,6 +276,8 @@ The line used for this test is:
 
 - **Q-1 — No CLI for feed management.** Setup without the UI needed `pair create`, a `curl` exchange for a bearer token, then `POST /api/v1/feeds`. A `smartrss feeds add|list|import-opml` CLI (running in-container, as `pair create` does) would make headless setup and scripting easier. Is that wanted for a later milestone?
 - **A `304 Not Modified` poll can't be told apart from a `200` poll.** Both return `PollFeedOutcome(metric_status="ok")` (`poll_feed.py:379`, `:479`), and `stage_metrics.status` only allows `ok` / `failed` / `skipped`, so the soak test can't confirm from the database that conditional GET is in use. Replaying the stored validators by hand returned `304` for Ars Technica and `200` for the others, which is consistent with their content having changed. BBC sends neither `ETag` nor `Last-Modified`, so it is always fully re-downloaded and relies on de-duplication alone (no duplicates so far). **Owner decision (2026-11-26): yes, record 304s separately → `E-08`.**
+- **Large first-subscribe archives.** The Hugging Face blog feed returned 917 entries on its first poll (the 04:30 run ingested 987 items in 61 s). 10 are `unread` and 907 are stored as `expired` permanently (the permanent historical log). That is per spec and fine at this scale, but feeds that publish their whole archive will dominate storage and FTS size over time. Should backfill keep only the newest `K` entries beyond the unread cap (say 100), or is the permanent log meant to be complete?
+- **Permanent redirects work.** TLDR (`tldrnewsletter.com/rss`) moved on its own to `tldr.tech/api/rss/tech` with no user stamp on `field_updated_at['feed_url']`, as `1a` specifies for 301/308.
 - **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
 
 ## 4. Verification performed
