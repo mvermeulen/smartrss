@@ -5,7 +5,7 @@
 - **Specs checked against**: `requirements.md` (§4.5–§4.7, §5, §6 `1c` row), `data-model.md` §6.2, `architecture.md`, ADRs `0002`, `0004`, `0005`, `0006`, `development-process.md` §2 and §7, `review-checklist.md`, `1a-backend-ingestion-and-security.md` §4, §6, §10, `1b-sync-protocol-and-search.md` §6–§8
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `U` (`U-01`–`U-21`)
-- **Status**: `Addressed (2026-11-25) — awaiting verification`
+- **Status**: `Addressed (2026-11-25) — awaiting verification` *(follow-ups `U-04-F1`, `U-05-F1`, `U-08-F1`, `U-09-F1`, `U-17-F1` addressed)*
 
 ## Review outcome
 
@@ -358,3 +358,126 @@ All 6 Majors (`U-01`–`U-06`), 12 Minors (`U-07`–`U-18`), and 3 Nits (`U-19`�
 
 ### Verification (`make check`)
 - `make check` passed cleanly on `milestone/1c`: `167 passed`, total backend coverage `91.14%`, all 16 critical core modules `>= 90%` (lowest: `src/smartrss/security/middleware.py` at `90.80%`). *(Design-only diff; `1c` frontend/runner implementation begins only after owner design approval.)*
+
+---
+
+## 8. Verification pass (2026-11-25)
+
+- **Verifier**: Claude Code (Claude Opus 5.5), fresh session
+- **Scope**: commit `0ba1cda` (`docs(1c): address design review findings …`): `docs/design/1c-client-ui-and-offline-shell.md`, `docs/data-model.md` §6.2, `docs/development-process.md` §2.2, `docs/review-checklist.md` §7 (`B1`–`B4`), `docs/design/README.md`, `docs/README.md`
+- **Method**: This is a design-only change, so there is no fix to revert. For each finding I re-read the revised design sections and checked that the fix covers the root cause on every path (pull, push outcome, quarantine, bootstrap, eviction, re-pair, restore). I checked that a matrix test row covers it, and that the companion docs agree. Where the fix depends on existing backend behavior, I checked that behavior against the code (`U-17-F1` below).
+- **`make check`**: green. `167 passed`, total backend coverage `91.14%`, and all 16 critical modules `>= 90%` (lowest is `security/middleware.py` at `90.80%`). These numbers match the resolution notes exactly. No frontend or runner code exists yet, so the new frontend gates are not exercised.
+
+### Verdicts
+
+| ID | Sev | Verdict | Evidence |
+| :--- | :--- | :--- | :--- |
+| `U-01` | Major | ✅ Resolved | §5.1 and §6.4 `items_base`/`feeds_base` are written only by `bootstrap`, `pull` and `current_entity` merges. The display is the pure `applyOutboxToItem`/`applyOutboxToFeed`, and the unified recompute (§6.4 step 5) also covers quarantine (§6.4 step 4) and eviction (evaluated on display rows). The scoped bulk overlay uses `captured_item_ids` only. `1c-T03` (a)/(b)/(c) add the property test plus both regressions. `data-model.md` §6.2 and checklist `B1` are synced. |
+| `U-02` | Major | ✅ Resolved | The `in_flight` status is removed from §5.1. Push reads all rows (§6.4 step 1). Pull, overlay and eviction use **all** outbox rows (§5.3, §6.5). `attempts`/`last_error` appear in the Inspector. `1c-T04` (a) covers crash and re-send. |
+| `U-03` | Major | ✅ Resolved | `starred_num: 0 \| 1` with `[starred_num+effective_date]` (§5.1, §10.2 Starred filter); `1c-T03` (d); checklist `B2`. *(Wording nit: a boolean key path is silently left out of the index on `put`, and `DataError` comes from **querying** with a boolean. The fix is unaffected.)* |
+| `U-04` | Major | ⚠️ Partial → `U-04-F1` | Systematic `422` now halts without rollback, Retry exists, and `1c-T04` (c) covers both cases. However, the halt rule also traps genuine poison pills **permanently** (see follow-up). |
+| `U-05` | Major | ⚠️ Partial → `U-05-F1` | `uuid.ts` fallback ✅. Lease-lock fallback ✅ as a mechanism, `1c-T06` (d) and `1c-T15` (a) ✅, checklist `B3` ✅. The lease has no fencing, though, so a throttled heartbeat lets two tabs act as holder at once. |
+| `U-06` | Major | ✅ Resolved | §6.3: two-phase staging (`bootstrap_meta`/`bootstrap_items`, at most 500 rows per transaction), a `committing` phase that can resume after a crash, a 1,000-row chunked swap with `bootstrap_gen` activation, and old rows kept readable until activation. Restore clears stale checkpoints (§6.6 step 3). There is a working-set envelope (§5.1), and `1c-T05` (a) covers fail-and-resume. |
+| `U-07` | Minor | ✅ Resolved | `api/normalize.ts` `toCanonicalIso()` runs at the client boundary, including nested `field_updated_at`, and is applied on bootstrap, pull and push (§6.3–§6.5). `1c-T03` (e) covers all three server formats. |
+| `U-08` | Minor | ⚠️ Partial → `U-08-F1` | The `origin_confirm` state sends zero `Authorization` headers ✅, and the `/sw.js` origin tag plus `cache:'reload'` refreshes the cached CSP ✅. But the sequencing between the two prompts leaves sync CSP-blocked and mislabelled. |
+| `U-09` | Minor | ⚠️ Partial → `U-09-F1` | The `dirty` flag plus the pre-release `outbox.count()` re-check narrows the window, but does not close it. |
+| `U-10` | Minor | ✅ Resolved | §6.4 `applied` journals chunked `scope='items'` rewrites (≤ 5,000), and §6.6 promotes the journal on both `epoch_mismatch` and `cursor_ahead`. `1c-T05` (b); `data-model.md` §6.2 synced. |
+| `U-11` | Minor | ✅ Resolved | §6.7: fresh IDs for `outbox` and `replay_journal` in one transaction on re-pair. I checked that it is safe: replaying the same value at the same timestamp gives `superseded`, which raises no notification, and a scoped bulk is protected by the `effective_ts >= read_state_updated_at` guard. `1c-T06` (b). |
+| `U-12` | Minor | ✅ Resolved | `target_absent` enqueue (§6.4, §8.1); superseded and rejected results go to the Search view; Dexie stays untouched (`P-17`). If a pull delivers the item while it is still pending, the out-of-window guard keeps it because the outbox protects it. `1c-T08`. |
+| `U-13` | Minor | ✅ Resolved | §9.2 is a single DOMPurify pass with `RETURN_DOM_FRAGMENT`, an `uponSanitizeElement` image placeholder, and `replaceChildren()`. `dangerouslySetInnerHTML` is banned everywhere (§4.2). `resolveSafeHttpUrl` handles relative links (§9.1), `noscript` is forbidden, and `extracted_text` is plain text only. `1c-T02` adds mXSS fixtures; checklist `B4`. |
+| `U-14` | Minor | ✅ Resolved | Navigations are cache-first and updates are user-gated (§7.1–§7.2); there is a `versionchange` guard from v1 (§5.2). `1c-T06` (f), `1c-T10` (c). |
+| `U-15` | Minor | ✅ Resolved | `1c-T01`–`T15` now cover every listed gap: the timed 500-mutation flush, the non-localhost topology and Nginx fallback (`T15`), the negative CSP proof (`T12`), the scoped overlay, journal pruning, the SW update, and the runner encodings. |
+| `U-16` | Minor | ✅ Resolved | The port is `4180` everywhere. The remaining `4173` mentions are deliberate (Vite preview). `design/README.md` is updated. |
+| `U-17` | Minor | ⚠️ Partial → `U-17-F1` | The `no-cors` follow-up detects a CORS-origin misconfiguration ✅. It cannot detect `ALLOWED_HOSTS` misconfiguration, because the probe targets `/api/v1/health`, which is exempt from the `Host` check (verified below). |
+| `U-18` | Minor | ✅ Resolved | §4.3 `install-client.sh` (local build / `--from-dist` / `--from-docker`, atomic `dist.prev`, `--rollback`, config left alone if present, `WantedBy=default.target`), plus `check-prereqs.sh --mode client`. |
+| `U-19` | Nit | ✅ Resolved | §4.2 states the CSSOM vs attribute distinction correctly and allows an audited carve-out for a virtual list. |
+| `U-20` | Nit | ✅ Resolved | The `effective_date` indexes are listed, the unmeasured claims are replaced by the `1c-T07` benchmark, and the stemming note is in §8.2. |
+| `U-21` | Nit | ✅ Resolved | Ordering clause removed (§6.6); Sign Out revokes the device first (§9.3); diff-only `EditFeedModal` (§10.3, `1c-T14`). |
+
+**Totals**: 16 ✅, 5 ⚠️, 0 ❌.
+
+### Follow-ups
+
+#### U-04-F1 (Major) — A lone poison pill, or two in opposite halves, stops sync for good with no way out
+**Location**: §6.4 step 4 ("standalone `422`/`400` with no succeeding sibling … **halt immediately**"; "If **both** halves fail … halt"), §10.5 (the Outbox Inspector has no action for *pending* rows).
+
+The new rule treats "no sibling succeeded" as version skew, so a genuinely malformed mutation is quarantined only when it shares a batch with a good one. Two common cases never meet that condition:
+- **Lone mutation**: with the 250 ms debounce, single-keystroke batches of one mutation are the norm. If that one mutation is malformed, the client halts in `sync_error`. Every retry (backoff, manual, reload) sends the same head row, gets `422` and halts again, so the outbox can never drain.
+- **Two poison pills**: one bad mutation in each half of a 10-row batch gives "both halves fail", which also halts permanently.
+
+The banner advises "update or reload the app", which does not help when the app is already current. This is the head-of-line blocking that `1c-D08` was meant to prevent (checklist L1).
+
+**Expected fix**:
+1. Propagate a `skewDisproven` flag through the whole bisection. Any `200` earlier in this cycle proves the server accepts this build's payloads, so later single-row failures can be quarantined, still capped by `MAX_QUARANTINES_PER_CYCLE`.
+2. When a cycle halts with no evidence either way, let the user break the deadlock. The Outbox Inspector should show the head row's `last_error` and offer **"Move to quarantine"** (which recomputes from the base, so no data is lost and Retry stays available).
+
+**Tests (`1c-T04`)**: (a) a single-row outbox whose only mutation gets `422` halts, then the manual quarantine unblocks later mutations; (b) a 10-row batch with bad rows at positions 2 and 7 quarantines exactly those two once a sibling `200` proves skew is not the cause.
+
+#### U-05-F1 (Minor) — The IndexedDB lease lock has no fencing, so throttled tabs can both hold it
+**Location**: §6.2 lease lock (15 s TTL, 5 s heartbeat).
+
+Chrome throttles timers in background tabs, and with intensive throttling chained timers can fire as rarely as once per minute. A fallback tab that started a cycle while visible and was then hidden can miss renewals. Another tab then reclaims the lease while the first one is still pushing or pulling. Server idempotency limits the damage, but both tabs write the cursor and apply push outcomes at the same time, and the cursor can move backward. That costs only duplicate pulls, not lost changes, but the lock no longer means what the design says it does.
+
+**Expected fix**: Give each acquisition a fencing token, for example a counter incremented on every acquire. Inside each Dexie `rw` transaction that writes `client_meta['sync']`, `outbox` or `*_base`, re-read `sync_lock` and abort the cycle if `owner_tab_id` or the token has changed. Alternatively, renew the lease at each step of the cycle rather than only on a timer.
+
+**Test (`1c-T06` (d))**: Freeze tab A's heartbeat with fake timers, let tab B reclaim the lease, and assert that tab A's next write aborts.
+
+#### U-08-F1 (Minor) — After the origin is confirmed, sync is CSP-blocked and shows as `detached` until the separate SW update is also accepted
+**Location**: §6.2 origin guard, §7.2 user-gated `SKIP_WAITING`, §6.2 probe.
+
+When `SMARTRSS_API_ORIGIN` changes, the new `/sw.js` installs and waits for the user. The page is still served by the old SW's cached `/index.html`, whose CSP pins `connect-src` to the **old** origin. If the user confirms the `OriginChangeBanner` first, the `auth.api_origin` update succeeds but every request to the new origin is CSP-blocked. The `no-cors` follow-up is blocked too, so the probe reports `detached`, which is misleading. Sync resumes only when the user also notices and clicks the separate "Update available" bar.
+
+**Expected fix**: Make confirming the origin activate the waiting worker (`SKIP_WAITING`) and reload in one step. If no waiting worker exists yet, wait for `updatefound`. Alternatively, show the origin confirmation only once the page is running under a CSP that allows the new origin. A cheap check: try `fetch(new_origin + '/api/v1/health', {mode:'no-cors'})` and catch a `securitypolicyviolation`.
+
+**Test**: Extend `1c-T06` (a) or add a Playwright case: change the runner origin, confirm, and assert that sync reaches `online` without a second prompt.
+
+#### U-09-F1 (Minor) — A wake-up can still be lost between the holder's final check and the lock release
+**Location**: §6.2 no-lost-wakeup protocol.
+
+The holder checks `dirty || outbox.count() > 0` and then returns from the lock callback. An `outbox_enqueued` message that arrives after that check and before the release sets `dirty` on a tab that no longer acts on it. The enqueuing tab already skipped, because the lock was busy. The window is small, and the delay is bounded by the 60 s timer (unbounded if every tab is hidden).
+
+**Expected fix**: When the `ifAvailable` attempt fails, the skipping tab also queues **one** blocking `navigator.locks.request(...)` (or a lease-lock retry), deduplicated so at most one waiter exists per tab. That request runs right after the holder releases and drains the outbox if it is non-empty. Alternatively, every tab re-checks `outbox.count()` when it receives the holder's `sync_complete` broadcast.
+
+**Test (`1c-T06` (c))**: Inject the enqueue *after* the pre-release check and before the release, then assert that a push follows without advancing the 60 s timer.
+
+#### U-17-F1 (Minor) — The probe cannot detect `ALLOWED_HOSTS` misconfiguration, because `/api/v1/health` is exempt from the `Host` check
+**Location**: §6.2 probe, §6.1 `misconfigured`, §10.1 pairing hint. Backend: `security/middleware.py:53` exempts `GET /api/v1/health`.
+
+**Verified** with the real `create_app()`: `ALLOWED_HOSTS=localhost:8080`, request `Host: smartrss.lan:8080`, `Origin: http://localhost:4180` (allowed):
+- `/api/v1/health` passes the `Host` check and returns `access-control-allow-origin: http://localhost:4180`. The status was `503` only because there was no database. The probe can read the response, so the server looks **reachable**.
+- `/api/v1/devices` returns `400`, and the response has **no** `access-control-allow-origin` header, so the browser raises a `TypeError`.
+
+So when a LAN hostname is missing from `ALLOWED_HOSTS`, the most likely setup mistake, the client cycles probe OK → `syncing` → `TypeError` → `detached` → probe OK, with no `misconfigured` hint. The `U-17` finding cited both CORS and `Host`; only the CORS case is fixed.
+
+**Expected fix**: Point the probe at an endpoint that is **not** exempt from the `Host` check and needs no token, for example an unauthenticated `GET /api/v1/devices`. A readable `401` means CORS and `Host` are both fine. A `TypeError` followed by a resolving `no-cors` fetch means `misconfigured`. Alternatively, classify a `TypeError` on an authenticated request immediately after a successful health probe as `misconfigured` (`Host`). Keep `/health` for liveness only.
+
+**Test (`1c-T06` (e))**: Stub a readable `200` from health, a `TypeError` from the authenticated call and a resolving `no-cors` fetch, and assert `misconfigured`. Optionally add a `1c-T15` case with the API hostname left out of `ALLOWED_HOSTS`.
+
+### Editorial nits (no follow-up needed; fix while addressing the above)
+- §3.1 `check-frontend-coverage.mjs` comment says "critical 5"; §12.1 lists **6** critical modules.
+- §6.5 calls `applyOutboxToItem(data, outboxForItem, active_gen)` with three arguments; §6.4 defines it with two. Choose one signature, for example carry `bootstrap_gen` on the base row.
+- Checklist `B2` and §5.1: say that booleans are *left out of the index* on write and that *querying* with a boolean throws `DataError`.
+
+### Drift checks
+- `docs/README.md`: one `1c` design review row, no duplicates. `docs/design/README.md`: `1c` row still `In Design Review` (correct) and the port is updated. The design header status, the review status and the index row all agree.
+- `CRITICAL_MODULES`: unchanged; the 16 backend modules match `1a` §12 and `1b` §10.1. The frontend gate script does not exist yet (it arrives with implementation).
+- No untracked files in the tree except this verification edit.
+
+### Status
+Five follow-ups remain: `U-04-F1` (Major), and `U-05-F1`, `U-08-F1`, `U-09-F1`, `U-17-F1` (Minor). The status stays **`Addressed — verification found follow-ups`**. Handed back to Antigravity (`address-review-findings`). No residual risks currently need owner acceptance. If the owner prefers to accept `U-05-F1` (impact limited to the connected-only fallback) or `U-09-F1` (bounded by the 60 s timer) instead of fixing them, they should be recorded as accepted residual risks.
+
+---
+
+## 9. Follow-up Resolutions (Addressed 2026-11-25)
+
+All five verification follow-ups (`U-04-F1`, `U-05-F1`, `U-08-F1`, `U-09-F1`, `U-17-F1`) and all three editorial nits are fixed in [`docs/design/1c-client-ui-and-offline-shell.md`](../design/1c-client-ui-and-offline-shell.md) and [`docs/review-checklist.md`](../review-checklist.md):
+
+- **U-04-F1 (Major)** — Fixed (`1c` §6.4 step 4, §10.5, `1c-T04`). Replaced sibling-only quarantine gating with a cycle-wide `skewDisproven` flag (set `true` on any HTTP `200` in the cycle). When both halves of a split fail with `422`/`400` and `skewDisproven === false`, the engine probes up to `min(len, MAX_QUARANTINES_PER_CYCLE + 1)` (= 4) individual rows stopping at the first `200` (proving `skewDisproven = true` and bisecting/quarantining pills such as positions 2 and 7 in a 10-row batch, capped at 3/cycle; whereas 4 consecutive `422` probes with zero `200`s halt in `sync_error` with zero quarantines/rollbacks). For a lone `422` mutation with no disproving `200`, the Outbox Inspector displays `last_error` on pending rows and adds a manual **"Move to quarantine"** action (recomputing from `*_base` and unblocking subsequent rows while preserving **Retry**). Updated `1c-T04` (c) to test systematic `422`, pills at positions 2 & 7, lone `422` + manual quarantine, and Retry.
+- **U-05-F1 (Minor)** — Fixed (`1c` §5.1 `client_meta['sync_lock']`, §6.2, `1c-T06` (d)). Added a monotonically incrementing `fencing_token` to `client_meta['sync_lock']`. Every sync-cycle Dexie `rw` write transaction calls `assertAndRenewLock(tx, owner_tab_id, fencing_token)` inside that same transaction: if `owner_tab_id` or `fencing_token` changed, it throws `SyncLockLostError` aborting the transaction atomically; otherwise it renews `expires_at` inline so active cycles survive throttled background timers. Added fake-timer lease-reclaim abort test to `1c-T06` (d).
+- **U-08-F1 (Minor)** — Fixed (`1c` §6.2, `1c-T06` (a)). Confirming `OriginChangeBanner` now updates `auth.api_origin` AND immediately activates the waiting Service Worker (`SKIP_WAITING` → `controllerchange` → single reload, or `reg.update()` up to 5 s if not yet waiting) in one step, so the page reloads under the new `/index.html`'s updated `connect-src` CSP and transitions directly to `online` without a second prompt or CSP-blocked `detached` state. Updated `1c-T06` (a).
+- **U-09-F1 (Minor)** — Fixed (`1c` §6.2, `1c-T06` (c)). Added a deduplicated single waiter (`waiterPending` per tab) when `ifAvailable: true` sees the lock busy: under `navigator.locks`, queues one blocking `navigator.locks.request("smartrss-sync-cycle", ...)` that runs immediately on holder release; under the lease-lock fallback, sets `recheckOnSyncComplete = true` triggered by the holder's post-release `sync_complete` broadcast. Closes the post-check/pre-release window even when all tabs are hidden. Updated `1c-T06` (c).
+- **U-17-F1 (Minor)** — Fixed (`1c` §6.2, `1c-T06` (e), `1c-T15` (c)). Added Step 2 to `sync/probe.ts`: after `GET /api/v1/health` succeeds (verifying liveness & `CORS_ALLOW_ORIGINS`), probe unauthenticated `GET /api/v1/devices` (verified against `deps.py:53`: hits `HostAllowListMiddleware` + `CORSMiddleware` and immediately returns `401` with zero DB queries). A readable `401` confirms both `ALLOWED_HOSTS` and `CORS_ALLOW_ORIGINS`; a `TypeError` (CORS-less `400` from `HostAllowListMiddleware`) immediately classifies as **`misconfigured`** with the `ALLOWED_HOSTS` fix hint. Updated `1c-T06` (e) and added `1c-T15` (c).
+- **Editorial nits** — Fixed: (1) `1c` §3.1 `check-frontend-coverage.mjs` comment updated from `critical 5` to `critical 6` (matching §12.1); (2) `1c` §6.4 & §6.5 standardized on 2-argument `applyOutboxToItem(baseRow, outboxForItem)` carrying `bootstrap_gen` on `LocalItemBaseRecord`; (3) `1c` §5.1 and `docs/review-checklist.md` `B2` now accurately state that IndexedDB silently omits boolean key paths on write and throws `DataError` when querying with a boolean.
+
+### Verification (`make check`)
+- `make check` passed cleanly on `milestone/1c`: `167 passed`, total backend coverage `91.18%`, all 16 critical core modules `>= 90%` (lowest: `src/smartrss/security/middleware.py` at `90.80%`).
