@@ -1,0 +1,178 @@
+# User-Test Review — Milestones `1a`–`1c` on a Live Deployment
+
+- **Date**: 2026-11-26 (opened; observation still in progress)
+- **Scope**: `main` at `87bba29` (Merge PR #2, `milestone/1c`), deployed with `make up` / `make migrate` on a single Ubuntu 26.04 host. Five live feeds, worker in `WORKER_MODE=cron` driven by a host crontab every 15 minutes, a UI paired through the localhost runner (`make install-client`, `http://localhost:4180`), and the LAN `web` container (`http://localhost:8080`). This covers the running system, the setup scripts and README, and the SSRF HTTP stack. It is not a full code re-review.
+- **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
+- **Reviewer**: Claude Code (at the project owner's request)
+- **Finding prefix**: `E-`
+- **Status**: `Open` — more findings may be appended as the soak test continues (see §4)
+
+## Review outcome
+
+The stack came up cleanly from a fresh clone, and the core pipeline works end to end on real feeds:
+
+- **`make check` is green** on Python 3.12.16 / Node 22: 167 backend tests at 91.1% coverage, the critical-module ≥ 90% gate, the runner at 94.9%, and the frontend gates.
+- **Ingestion.** The first `run-once` polled all 5 feeds, ingested 112 items, and extracted 48 articles in about 56 s. The backfill cap behaved as specified (`FR-FEED-05`, `1a` §5): exactly 10 newest items per feed are `unread` and the rest are archived as `expired` with `expired_at = fetched_at`.
+- **Cron mode.** `docker compose run --rm -T worker smartrss worker run-once --json` from the host crontab works. The first scheduled run (02:30) exited `0` with nothing due.
+- **Sync.** After pairing in the browser: bootstrap, a pull every 60 s, and two `item_set_state` pushes were applied (`sync_mutations.status = applied`). The client cursor advanced from 172 to 173 to 174, matching `sync_state.current_seq`.
+
+The findings so far:
+
+- **one Major**, reproduced in the running `api` container: `SafeHttpClient`'s per-IP connect fallback is dead code, and raw `httpcore` exceptions escape the client unmapped (`E-01`). The boundary tests miss it because their fake backend raises `OSError`, which the real backend never does.
+- an unpinned Python version that makes the whole suite error on a host with Python 3.14 (`E-02`);
+- a prerequisite check that passes without Docker daemon access (`E-03`);
+- README drift in the client-install section (`E-04`);
+- a cron-mode documentation nit (`E-05`).
+
+**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05` is optional.
+
+| Severity | Findings |
+| :--- | :--- |
+| Blocker | — |
+| Major | `E-01` |
+| Minor | `E-02`, `E-03`, `E-04` |
+| Nit | `E-05` |
+
+---
+
+## 1. Major
+
+### E-01 — `SafeNetworkBackend` never fails over to the next validated IP, and `SafeTransport` leaks raw `httpcore` exceptions (checklist: mock at the real boundary)
+
+**Where:**
+
+- `backend/src/smartrss/security/safe_http.py:236-249`: `SafeNetworkBackend.connect_tcp` loops over the validated IPs and catches only `OSError`.
+- `backend/src/smartrss/security/safe_http.py:306`: `SafeTransport.handle_async_request` calls `self._pool.handle_async_request()` with no exception mapping.
+- `backend/src/smartrss/worker/stages/poll_feed.py:357` and `backend/src/smartrss/worker/stages/extract_content.py:176` catch `SafeHttpError | httpx.HTTPError | TimeoutError | OSError`.
+- `backend/tests/boundary/test_safe_http_boundary.py:349-400`: the failover tests use a fake inner backend that raises `OSError("connection refused")`.
+
+**What happens:** `httpcore.AnyIOBackend.connect_tcp` (the production inner backend) wraps socket errors in `map_exceptions({TimeoutError: httpcore.ConnectTimeout, OSError: httpcore.ConnectError, …})`. It therefore raises `httpcore.ConnectError` / `httpcore.ConnectTimeout`, never `OSError`. As a result:
+
+1. **No failover.** The first unreachable address raises out of the loop immediately. The remaining validated IPs are never tried, and the `SSRFConnectionError` at line 247 is unreachable in production.
+2. **Unmapped exceptions.** `httpx.HTTPTransport` normally converts `httpcore.*` into `httpx.*` (`map_httpcore_exceptions`), but `SafeTransport` replaces that transport and does not do this. `httpcore.ConnectError`, `ConnectTimeout`, `ReadTimeout`, `RemoteProtocolError` and similar errors therefore escape `SafeHttpClient.fetch()`. They are not `SafeHttpError`, `httpx.HTTPError` or `OSError`, so the typed handlers in `poll_feed` and `extract_content` miss them. They then go to the worker's catch-all (`runner.py:249`, `logger.exception("Unhandled error in job …")`), which logs a full ERROR traceback. In `--json` mode, logging isn't configured, so the traceback goes straight to stderr and ends up mixed into the cron log. Job retry and feed-error recording still happen through the catch-all hooks, so health and backoff are not lost.
+
+**Reproduction** (in the running `api` container; the container has no IPv6 address apart from loopback):
+
+```python
+# resolver returns [unreachable IPv6, lwn.net's real IPv4], like a dual-stack host whose AAAA sorts first
+policy = SSRFPolicy(resolver=lambda h, p: [ip("2001:4860:4860::8888"), ip(real_v4)])
+await SafeHttpClient(policy).fetch("https://lwn.net/headlines/rss")
+# → UNMAPPED: httpcore.ConnectError All connection attempts failed
+# Control (IPv4 only): 200
+```
+
+This was also seen live: the first `run-once` printed `httpcore.ConnectError: All connection attempts failed` before its JSON summary. That was an `extract_content` job for `news.ycombinator.com/item?id=50649864`, which succeeded on attempt 2.
+
+**Impact:** a feed or article host with several A/AAAA records fails whenever its first address is unreachable. Examples are a dual-stack host when the Docker bridge has no IPv6, or one dead node in a round-robin. Those feeds degrade instead of working. glibc's RFC 6724 ordering usually puts IPv4 first when there is no IPv6 source address, which hides the problem most of the time. Transient network errors are also logged as unhandled crashes.
+
+**Suggested fix:**
+
+- In `connect_tcp`, catch `(OSError, httpcore.ConnectError, httpcore.ConnectTimeout)` per IP and continue. Keep `SSRFConnectionError` as the final error, chained from the last exception.
+- In `SafeTransport.handle_async_request`, and in `_PinnedStream` iteration/close, map `httpcore` exceptions the way httpx does. Either reuse httpx's mapping, or translate them into `SafeHttpError` subclasses such as `SSRFConnectionError` or a new `SafeHttpTimeoutError`, so that `fetch()` only raises the documented hierarchy.
+- **Regression tests** (each must fail with the fix reverted, §2.3):
+  - (a) boundary failover where the fake inner backend raises **`httpcore.ConnectError`** for the first IP. Better still, wrap the real `AnyIOBackend` and point it at a closed local port with a test-only permissive policy. Assert that the second IP is used.
+  - (b) an all-IPs-fail test asserting `SSRFConnectionError` with the real exception type;
+  - (c) a `fetch()` test asserting that a `ReadTimeout` / `RemoteProtocolError` from the pool comes out as a `SafeHttpError` subclass;
+  - (d) a `poll_feed` / `extract_content` test showing that a connect failure takes the typed path (`_record_feed_poll_error` / `TransientExtractionError`) and not the "Unhandled error" path.
+- **Checklist:** add a failure class saying that fakes at a library boundary must raise the exception types the real dependency raises.
+
+---
+
+## 2. Minor
+
+### E-02 — No Python version pin, so on a host with Python 3.14 every backend test errors
+
+**Where:** `backend/pyproject.toml` (`requires-python = ">=3.12"`, `filterwarnings = ["error", …]`). There is no `backend/.python-version`. `scripts/check-prereqs.sh:44-55` only checks `python3 >= 3.12`.
+
+**What happens:** Ubuntu 26.04 ships Python 3.14. A plain `uv sync` / `uv run` picks the host interpreter. Under 3.14, pytest-asyncio calls `asyncio.get_event_loop_policy()`, which is deprecated in 3.14, and `filterwarnings = error` makes that fatal:
+
+```
+$ uv run --python 3.14 --directory backend pytest tests/unit tests/boundary
+E   DeprecationWarning: 'asyncio.get_event_loop_policy' is deprecated and slated for removal in Python 3.16
+107 errors in 1.71s
+```
+
+The production image is pinned to `python:3.12-slim`, so this only affects developer hosts. It does mean the first `make check` on a stock 26.04 machine fails in a confusing way. In this session it was avoided only by forcing `uv sync --python 3.12`.
+
+**Suggested fix:** add `backend/.python-version` containing `3.12`, which `uv` honours and installs on demand. Optionally bound `requires-python = ">=3.12,<3.14"` until the suite is clean on 3.14. Longer term, upgrade pytest-asyncio or set a targeted `ignore::DeprecationWarning:pytest_asyncio` filter. Update `check-prereqs.sh` / the README to say that `uv` provisions the interpreter.
+
+### E-03 — `check-prereqs.sh` passes without Docker daemon access
+
+**Where:** `scripts/check-prereqs.sh:67-74` (`check_docker`) checks only `command -v docker` and `docker compose version`. Both succeed without daemon access.
+
+**What happens:** right after `apt install docker.io`, the user isn't in the `docker` group yet, or the session predates the group change. `make check` then passes the prereq step and fails later in `db-test-up` with `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`. On Ubuntu 26.04, `sg` is gone and `newgrp` is only in `util-linux-extra`, which isn't installed by default, so the usual workaround isn't available either. The user had to reboot.
+
+**Suggested fix:** in `check_docker`, also run `docker info >/dev/null 2>&1`. If it fails, print a hint such as: `sudo usermod -aG docker $USER`, then log out and in (or `sudo apt install util-linux-extra && newgrp docker`). Add a test case to the prereq script's test, if there is one.
+
+### E-04 — README client-install section has drifted from `install-client.sh`
+
+**Where:** `README.md:5`, `:109`, `:111`, `:122`
+
+| README says | Actual |
+| :--- | :--- |
+| `make install-client INSTALL_CLIENT_ARGS="--api-origin http://<server-lan-ip>:8080"` (`:109`) | `scripts/install-client.sh` rejects the flag: `Unknown option: --api-origin`, exit `2` (reproduced). The origin is set with `SMARTRSS_API_ORIGIN` in `~/.config/smartrss-client/config.env` (`install-client.sh:111-116`). |
+| Installs into `~/.local/share/smartrss-client/` with an "atomic symlink switch" (`:111`) | Installs into `~/.local/share/smartrss/` (`install-client.sh:11`) using `mv` directory swaps. There is no symlink. |
+| "Node.js 20+" (`:122`) | `check-prereqs.sh:57-66` requires Node ≥ 22. |
+| `1c` is "In Implementation Review" (`:5`) | `1c` is `Implementation Approved` (2026-11-25). |
+
+**Impact:** anyone installing a client on a second machine, the main use of that command, fails on the first command. They then edit the wrong config path or look in the wrong directory.
+
+**Suggested fix:** either implement `--api-origin` in `install-client.sh` (write or replace `SMARTRSS_API_ORIGIN` in `config.env`, validated like the runner does) or change the README to "edit `config.env`, then `systemctl --user restart smartrss-client`". Fix the path, the swap description, the Node version, and the status line. Per §4.2, include this in the same commit as any script change.
+
+---
+
+## 3. Nit
+
+### E-05 — The cron-mode example is minimal
+
+**Where:** `README.md` "Worker Execution Modes".
+
+The example `docker compose run --rm worker smartrss worker run-once --stage all --json` works, but there are gaps for an unattended crontab:
+
+- it has no `-T`, which matters with no TTY under cron;
+- it has no log redirect;
+- `--max-duration` defaults to `1800` s, longer than a typical 15-minute cadence. Overlap is safe because of leases and advisory locks, but stacked containers are wasteful.
+
+The line used for this test is:
+
+```cron
+*/15 * * * * cd /path/to/smartrss && /usr/bin/flock -n ~/.local/state/smartrss/worker.lock /usr/bin/docker compose run --rm -T worker smartrss worker run-once --stage all --max-duration 840 --json >> ~/.local/state/smartrss/worker.log 2>&1
+```
+
+**Suggested fix:** document a complete line like this one (or a `deploy/systemd/smartrss-worker.{service,timer}` pair, like the backup units). Note that `--json` mode leaves logging unconfigured, so stderr warnings and tracebacks are mixed in with the JSON lines (see `E-01`).
+
+---
+
+## 3a. Owner questions / observations (not findings)
+
+- **Q-1 — No CLI for feed management.** Setup without the UI needed `pair create`, a `curl` exchange for a bearer token, then `POST /api/v1/feeds`. A `smartrss feeds add|list|import-opml` CLI (running in-container, as `pair create` does) would make headless setup and scripting easier. Is that wanted for a later milestone?
+- **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
+
+## 4. Verification performed
+
+- `make check` on `87bba29`: **pass** (Python 3.12.16 via `uv`, Node 22.22.1, Docker 29.1.3).
+- `make up` + `make migrate` (migrations `0001`, `0002`), `GET /api/v1/health` → `{"status":"ok","db":"ok"}`.
+- 5 feeds added through `POST /api/v1/feeds` (all `201`): Hacker News front page, Ars Technica, LWN, Simon Willison's Weblog, BBC World.
+- Manual `run-once`: `status=partial exit=2`, 112 polled, 48 extracted, 1 failed (`E-01`), 1 deferred. Later DB state: all 50 `extract_content` jobs `done`, 0 dead-lettered.
+- Cron run 02:30: `completed`, exit `0`.
+- Sync traced through API logs and the `sync_changes` / `sync_mutations` / `sync_state` tables (see the Review outcome section).
+- Reproductions: `E-01` (script run in the `api` container, plus an IPv4-only control), `E-02` (suite under 3.14), `E-04` (`install-client.sh --api-origin`).
+- **Ruled out:** the `instance_epoch` value is random (`gen_random_uuid()`); the pre-pairing `401`s on `GET /api/v1/devices` are the intentional `ALLOWED_HOSTS` probe (`frontend/src/sync/probe.ts:87`, `U-17-F1`); CORS preflight responses carry `access-control-max-age: 600`.
+
+### Soak-test checklist (to append results)
+
+- [ ] Steady-state polls at each feed's 60-minute interval; conditional GET (`ETag` / `Last-Modified` → `304`) on unchanged feeds
+- [ ] No duplicate items across polls (GUID / canonical-URL dedupe); updated entries handled
+- [ ] Feed health stays `healthy`; any `degraded` or `broken` transitions explained
+- [ ] `worker.log`: no `failed` runs; investigate any tracebacks
+- [ ] Client: offline reload, reconnect, star/read round-trip across the localhost runner and the LAN `web` client
+- [ ] `retention_cleanup` daily run; `pipeline_runs` / `stage_metrics` growth
+- [ ] `make backup` and `make restore-drill` against the live data
+
+## Resolutions
+
+*(To be filled in by the implementer.)*
+
+## Accepted residual risks
+
+*(None yet.)*
