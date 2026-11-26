@@ -25,6 +25,7 @@ from smartrss.db.models import (
     Job,
     PipelineRun,
     StageMetric,
+    SyncMutation,
 )
 from smartrss.db.sync_log import SyncEvent, bypass_sync_guard, sync_log
 from smartrss.search.fts import reindex_all_items
@@ -431,7 +432,13 @@ async def cmd_query_state(_args: argparse.Namespace) -> dict[str, Any]:
             feeds = (await session.execute(sa.select(Feed))).scalars().all()
             jobs = (await session.execute(sa.select(Job))).scalars().all()
             devices = (await session.execute(sa.select(Device))).scalars().all()
+            sync_mutation_count = int(
+                (
+                    await session.execute(sa.select(sa.func.count()).select_from(SyncMutation))
+                ).scalar_one()
+            )
             return {
+                "sync_mutation_count": sync_mutation_count,
                 "items": {
                     str(i.id): {"state": i.state, "is_starred": i.is_starred, "title": i.title}
                     for i in items

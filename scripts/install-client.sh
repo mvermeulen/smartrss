@@ -84,8 +84,15 @@ case "$SOURCE_MODE" in
     ;;
   docker)
     "$REPO_ROOT/scripts/check-prereqs.sh" --mode server
-    docker compose -f "$REPO_ROOT/docker-compose.yml" build web
-    CID="$(docker create smartrss-web:latest 2>/dev/null || docker compose -f "$REPO_ROOT/docker-compose.yml" create web | tail -n1)"
+    COMPOSE_ARGS=(-f "$REPO_ROOT/docker-compose.yml")
+    export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-smartrss-client-build-placeholder}"
+    docker compose "${COMPOSE_ARGS[@]}" build web
+    docker compose "${COMPOSE_ARGS[@]}" create --no-deps web
+    CID="$(docker compose "${COMPOSE_ARGS[@]}" ps -a -q web | head -n1)"
+    if [[ -z "$CID" ]]; then
+      echo "ERROR: Failed to resolve created web container ID for --from-docker." >&2
+      exit 1
+    fi
     trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
     docker cp "$CID:/usr/share/nginx/html/." "$SHARE_DIR/dist.new/"
     ;;

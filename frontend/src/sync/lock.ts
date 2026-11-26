@@ -12,7 +12,7 @@ import type { SmartRSSDB, SyncLockMeta } from "../db/schema";
 import { uuidv4 } from "../security/uuid";
 
 export const SYNC_LOCK_NAME = "smartrss-sync-cycle";
-export const LEASE_TTL_MS = 20_000; // > 15s push timeout (review §10 note 2)
+export const LEASE_TTL_MS = 25_000; // > 20s bootstrap timeout & 15s push/pull timeout (U-05-F1, V-08)
 export const LEASE_HEARTBEAT_MS = 5_000;
 
 export class SyncLockLostError extends Error {
@@ -110,7 +110,8 @@ export async function withSyncLock<T>(
     const existingRow = await db.client_meta.get("sync_lock");
     const existing = existingRow?.value as SyncLockMeta | null | undefined;
     const currentNow = now();
-    if (existing && existing.expires_at > currentNow && existing.owner_tab_id !== tabId) {
+    // Any live lease — even held by the same tabId — is busy (V-03, checklist B5)
+    if (existing && existing.expires_at > currentNow) {
       acquiredToken = null;
       return;
     }

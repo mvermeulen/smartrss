@@ -28,7 +28,7 @@ Milestone `1c` delivers the Phase 1 Ubuntu laptop local-first reader SPA, its fi
 3. **Docker `web` Fallback & Tooling Integration**:
    - Multi-stage `frontend/Dockerfile` (`node:22-alpine` → `nginx:1.27-alpine`) wired into `docker-compose.yml` `web` service with updated `deploy/nginx/nginx.conf` + `deploy/nginx/security-headers.conf` serving the compiled SPA as a **full connected reading & mutation LAN fallback** (`Q-2`, ADR 0005).
    - Default `CORS_ALLOW_ORIGINS` updated in `.env.example`, `docker-compose.yml`, and `backend/src/smartrss/config.py` from `http://localhost:8080` to `http://localhost:8080,http://localhost:4180`.
-   - Preflight dependency checker (`scripts/check-prereqs.sh --mode dev|server|client|e2e`, `Q-4`), `Makefile` targets (`frontend-lint`, `frontend-typecheck`, `frontend-test-cov`, `runner-test`, `frontend-e2e`, `install-client`), and two-tier frontend coverage gate (`scripts/check-frontend-coverage.mjs`: `>= 90%` on 6 critical sync/security modules, `>= 80%` on 4 other core modules, `Q-1`).
+   - Preflight dependency checker (`scripts/check-prereqs.sh --mode dev|server|client|e2e`, `Q-4`), `Makefile` targets (`frontend-lint`, `frontend-typecheck`, `frontend-test-cov`, `runner-test`, `test-e2e`, `install-client`), and two-tier frontend coverage gate (`scripts/check-frontend-coverage.mjs`: `>= 90%` on 6 critical sync/security modules, `>= 80%` on 5 other core store/search/normalizer modules, `Q-1`/`V-07`).
 
 ### Explicitly Out of Scope for `1c`
 - Backend DB schema migrations or new API endpoints (all needed endpoints already exist from `1a` and `1b`).
@@ -90,12 +90,10 @@ smartrss/
 │   ├── public/
 │   │   ├── manifest.webmanifest
 │   │   └── icons/
-│   │       ├── icon-192.png
-│   │       ├── icon-512.png
 │   │       └── icon.svg
 │   └── src/
 │       ├── main.tsx
-│       ├── App.tsx
+│       ├── App.tsx                        # Top-level app shell integrating SyncEngine, Dexie live queries & search effects
 │       ├── styles/app.css                 # Tailwind v4 `@import "tailwindcss";` + light/dark CSS tokens + prose rules
 │       ├── types/
 │       │   ├── api.ts                     # Exact TS mirrors of 1a/1b REST & system schemas
@@ -110,41 +108,38 @@ smartrss/
 │       │   └── clientMeta.ts              # Atomic meta/auth/cursor helpers + persistence request
 │       ├── api/
 │       │   ├── normalize.ts               # toCanonicalIso() & recursive DTO timestamp normalizer (U-07, D6)
-│       │   └── client.ts                  # Typed fetch client (Bearer auth, strict CORS-safe headers, timeouts, typed errors)
+│       │   └── client.ts                  # Typed fetch client (Bearer auth, strict CORS-safe headers, timeouts covering body reads, typed errors)
 │       ├── sync/
-│       │   ├── lock.ts                    # withSyncLock(): navigator.locks + IndexedDB lease lock fallback (U-05)
-│       │   ├── probe.ts                   # /api/v1/health reachability + no-cors misconfiguration detector (U-17)
+│       │   ├── lock.ts                    # withSyncLock(): navigator.locks + non-reentrant fenced IndexedDB lease lock fallback (U-05, V-03)
+│       │   ├── probe.ts                   # /api/v1/health reachability + no-cors & ALLOWED_HOSTS misconfiguration detector (U-17, U-17-F1)
 │       │   ├── reconciliation.ts          # Pure base ⊕ outbox recompute, pull apply, eviction, epoch_mismatch/cursor_ahead rewrite, clock drift (U-01, U-10)
-│       │   ├── outbox.ts                  # Optimistic enqueue (incl. target_absent U-12), FIFO chunking, skew-safe bisection (U-04), 48h replay journal, fresh-ID re-pair (U-11)
+│       │   ├── outbox.ts                  # Optimistic enqueue (incl. target_absent U-12), O(n) FIFO chunking, skew-safe bisection (U-04), 48h replay journal, fresh-ID re-pair (U-11)
 │       │   └── engine.ts                  # Lock-serialized coordinator, BroadcastChannel + pre-release dirty re-check (U-09), streaming bootstrap (U-06), push/pull loop
 │       ├── search/
 │       │   ├── queryParser.ts             # Pure websearch-compatible parser ("phrase", -negation, negation-only error)
 │       │   └── localSearch.ts             # MiniSearch weighted index + structured XSS-safe SnippetFragment[][] generator
 │       ├── sw/
-│       │   ├── sw.ts                      # Minimal auditable Service Worker (cache-first assets & navigate; bypass /api/* & /client-config.json)
+│       │   ├── sw.ts                      # Minimal auditable Service Worker (strict fail-fast precache, origin-tag cache keying, cache-first assets & navigate; bypass /api/* & /client-config.json)
 │       │   └── register.ts                # Registration & user-gated update banner hook (skips gracefully on insecure origins)
 │       ├── hooks/
-│       │   ├── useSyncEngine.ts
-│       │   ├── useReaderItems.ts
-│       │   ├── useSearch.ts
 │       │   ├── useKeyboardShortcuts.ts
 │       │   └── useStoragePersistence.ts
 │       ├── components/
-│       │   ├── layout/                    # TopBar, AlertStrip, AppShell
-│       │   ├── auth/                      # PairingScreen, AuthRevokedBanner, OriginChangeBanner
-│       │   ├── reader/                    # Sidebar, ItemList, ItemRow, ReadingPane, SafeHtml, SnippetText, BulkReadMenu, SmartMetadataCard
-│       │   ├── feeds/                     # FeedManagerView, AddFeedModal, EditFeedModal, ConflictDiffDialog, CategoryManager, OpmlPanel
-│       │   ├── health/                    # SystemHealthView, StageMetricsTable, FeedCostTable, PipelineRunsTable, FeedHealthTable, DeadLetterTable
-│       │   ├── settings/                  # SettingsDevicesView, AppSettingsForm, DevicesPanel, OutboxInspector
-│       │   └── common/                    # StatusPill, ConfirmDialog, ToastStack, ShortcutsModal
+│       │   ├── layout/                    # TopBar, AlertStrip (origin-change, auth-revoked, misconfigured, clock-drift, SW update, toasts)
+│       │   ├── auth/                      # PairingScreen
+│       │   ├── reader/                    # Sidebar, ItemList (incl. bulk-read menu & item rows), ReadingPane (incl. 1d-1g metadata slots), SafeHtml, SnippetText
+│       │   ├── feeds/                     # FeedManagerView (categories, add/edit feed diff-only PATCH, 409 conflict diff dialog, OPML import/export)
+│       │   ├── health/                    # SystemHealthView (overview, 24h/7d/30d stage metrics, feed cost, pipeline runs, feed health, dead-letter queue)
+│       │   ├── settings/                  # SettingsDevicesView (global app settings, pairing code generator, devices table, outbox inspector)
+│       │   └── common/                    # StatusPill, ConfirmDialog, ShortcutsModal
 │       └── test/
 │           ├── unit/                      # Vitest + fake-indexeddb + fast-check specs
 │           ├── fixtures/                  # Hostile XSS & mXSS HTML fixtures, recorded sync/search/metrics payloads
 │           └── e2e/                       # Playwright E2E specs (localhost:4180 + Nginx smartrss.test:8080)
 └── scripts/
     ├── check-prereqs.sh                   # Preflight dependency checker (--mode dev|server|client|e2e) with exact install hints (Q-4)
-    ├── install-client.sh                  # Idempotent laptop runner installer/updater/rollback (U-18)
-    └── check-frontend-coverage.mjs        # Two-tier coverage gate (>= 90% critical 6, >= 80% remaining 4 core modules; Q-1)
+    ├── install-client.sh                  # Idempotent laptop runner installer/updater/rollback (U-18, V-09)
+    └── check-frontend-coverage.mjs        # Two-tier coverage gate (>= 90% critical 6, >= 80% 5 core store/search/normalizer modules; Q-1, V-07)
 ```
 
 ### 3.2 Environment, Preflight Checks, CORS & Build Tooling (`Q-4`)
@@ -169,7 +164,7 @@ smartrss/
   - `make frontend-lint`: `npm --prefix frontend run lint` (ESLint + Prettier check)
   - `make frontend-typecheck`: `npm --prefix frontend run typecheck` (`tsc --noEmit`)
   - `make frontend-test-cov`: `npm --prefix frontend run test:cov && node scripts/check-frontend-coverage.mjs frontend/coverage/coverage-summary.json`
-  - `make runner-test`: `uv run --directory backend pytest ../client-runner/tests --cov=../client-runner/smartrss_client_runner --cov-branch --cov-fail-under=90`
+  - `make runner-test`: `PYTHONPATH=client-runner uv run --directory backend pytest ../client-runner/tests --cov=smartrss_client_runner --cov-branch --cov-fail-under=90`
   - `make test-e2e`: runs `./scripts/check-prereqs.sh --mode e2e`, starts `db-test`, launches an ephemeral FastAPI instance + `smartrss_client_runner.py` (and Nginx `web` fallback project), and runs `npm --prefix frontend run test:e2e`.
   - `make install-client`: runs `./scripts/install-client.sh` (supports `INSTALL_CLIENT_ARGS="--from-docker"` or `--rollback`).
   - `make check`: Runs `check-prereqs`, backend (`lint`, `typecheck`, `test-cov`), `runner-test`, and frontend (`frontend-lint`, `frontend-typecheck`, `frontend-test-cov`).
@@ -329,8 +324,8 @@ stateDiagram-v2
 - **Cross-Tab Sync Lock with Fencing (`sync/lock.ts`, `U-05`, `U-05-F1`)**:
   - Secure context (`navigator.locks` present): `navigator.locks.request("smartrss-sync-cycle", { ifAvailable: true }, ...)`.
   - Insecure HTTP fallback (`navigator.locks` absent, e.g. `http://smartrss.lan:8080`): **fenced** atomic Dexie `rw` lease lock on `client_meta['sync_lock']` (`{ owner_tab_id, fencing_token, acquired_at, expires_at }`):
-    - Each acquisition atomically increments `fencing_token = (prev?.fencing_token ?? 0) + 1` inside a Dexie `rw` transaction (succeeding only if absent or `prev.expires_at < Date.now()`), with a `15,000 ms` TTL and `5,000 ms` heartbeat timer.
-    - **Mandatory fencing + step renewal (`U-05-F1`)**: Every Dexie `rw` write transaction executed during a sync cycle (`bootstrap_meta`/`bootstrap_items` commit, `items_base`/`feeds_base`/`items`/`feeds`, `outbox` outcome removal, `client_meta['sync']` cursor advance) calls `assertAndRenewLock(tx, owner_tab_id, fencing_token)` inside that **same** Dexie transaction. If `sync_lock.owner_tab_id !== owner_tab_id || sync_lock.fencing_token !== fencing_token`, it throws `SyncLockLostError` (aborting the IndexedDB transaction atomically with zero partial writes and exiting the sync cycle immediately). Otherwise it refreshes `expires_at = Date.now() + 15_000` inline so active cycles survive background timer throttling. Released in `finally` (fenced by `fencing_token`) and on `pagehide`.
+    - Each acquisition atomically increments `fencing_token = (prev?.fencing_token ?? 0) + 1` inside a Dexie `rw` transaction (succeeding only if absent or `prev.expires_at <= now()` — treating any live lease as busy even for the same `owner_tab_id`, `V-03`), with a **`25,000 ms` TTL** (`> 20,000 ms` longest bootstrap request timeout and `> 15,000 ms` push/pull timeout, `U-05-F1`/`V-08`) and `5,000 ms` heartbeat timer plus pre-fetch `renewBeforeIo()`.
+    - **Mandatory fencing + step renewal (`U-05-F1`)**: Every Dexie `rw` write transaction executed during a sync cycle (`bootstrap_meta`/`bootstrap_items` commit, `items_base`/`feeds_base`/`items`/`feeds`, `outbox` outcome removal, `client_meta['sync']` cursor/clock-drift writes) calls `assertAndRenewInTx()` inside that **same** Dexie transaction. If `sync_lock.owner_tab_id !== owner_tab_id || sync_lock.fencing_token !== fencing_token`, it throws `SyncLockLostError` (aborting the IndexedDB transaction atomically with zero partial writes and exiting the sync cycle immediately). Otherwise it refreshes `expires_at = now() + 25_000` inline so active cycles survive background timer throttling. Released in `finally` (fenced by `fencing_token`) and on `pagehide`.
 - **No-Lost-Wakeup Protocol (`U-09`, `U-09-F1`)**:
   - **Fast path (lock holder)**: The active lock holder tracks `dirty = false` (set `true` on `BroadcastChannel('smartrss-sync')` `outbox_enqueued` or local enqueue) and re-checks `dirty || (await db.outbox.count()) > 0` before releasing (capped at `MAX_DRAIN_LOOPS = 5`), then releases the lock and broadcasts `sync_complete` **after** release.
   - **Gap-closing waiter (`U-09-F1`)**: When a tab's `ifAvailable: true` attempt sees the lock busy (including the narrow window between the holder's final check and lock release), it broadcasts `outbox_enqueued` AND schedules **at most one** deduplicated follow-up waiter (`waiterPending` flag per tab):
@@ -651,11 +646,13 @@ Cross-checked against [docs/review-checklist.md](../review-checklist.md):
   - `src/sync/reconciliation.ts`
   - `src/sync/outbox.ts`
   - `src/sync/engine.ts`
-- **Frontend Core Store & Search Modules (`>= 80%` line & branch coverage)** enforced by `scripts/check-frontend-coverage.mjs`:
+- **Frontend Core Store, Boundary Normalizer & Search Modules (`>= 80%` line & branch coverage)** enforced by `scripts/check-frontend-coverage.mjs`:
   - `src/db/schema.ts`
   - `src/db/clientMeta.ts`
+  - `src/api/normalize.ts` *(added per `V-07` to gate the `U-07`/`D6` canonical timestamp & UUID boundary)*
   - `src/search/queryParser.ts`
   - `src/search/localSearch.ts`
+- **Coverage Scope Note (`V-07`)**: `frontend/vitest.config.ts` scopes the Vitest v8 coverage report to the non-UI core directories (`src/{security,db,api,sync,search}/**/*.ts`), so the reported Vitest summary percentage reflects core client logic rather than React presentation code. React components (`src/components/**`, `src/App.tsx`), hooks (`src/hooks/**`), and the Service Worker (`src/sw/**`) are verified end-to-end by the Playwright suite (`1c-T09`–`1c-T15`) plus the Service Worker precache unit regression test (`V-06`).
 - **Localhost Runner (`>= 90%` line & branch coverage)** enforced by `make runner-test`:
   - `client-runner/smartrss_client_runner.py`
 - **Backend Critical Core Modules (`>= 90%`)**: All 16 existing `1a`/`1b` modules remain enforced in `scripts/check-critical-coverage.py`.

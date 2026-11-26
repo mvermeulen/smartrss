@@ -186,16 +186,10 @@ def resolve_static_path(dist_root: Path, raw_url_path: str) -> tuple[Path | None
 
 def cache_control_for_path(url_path: str, resolved_file: Path, dist_root: Path) -> str:
     """Return Cache-Control value per 1c §4.1 cache matrix."""
+    del url_path  # Cache policy depends on the resolved file under dist_root
     rel_posix = resolved_file.relative_to(dist_root).as_posix()
     if rel_posix.startswith("assets/"):
         return "public, max-age=31536000, immutable"
-    if rel_posix in ("index.html", "sw.js", "manifest.webmanifest") or url_path in (
-        "/",
-        "/index.html",
-        "/sw.js",
-        "/manifest.webmanifest",
-    ):
-        return "no-cache"
     return "no-cache"
 
 
@@ -345,7 +339,9 @@ class SmartRSSClientHandler(BaseHTTPRequestHandler):
         body = resolved.read_bytes()
         rel_posix = resolved.relative_to(self.server.dist_root).as_posix()
         if rel_posix == "sw.js":
-            body = body + f"\n// smartrss-origin-tag:{self.server.origin_tag}\n".encode()
+            prefix = f'self.__SMARTRSS_ORIGIN_TAG__="{self.server.origin_tag}";\n'.encode()
+            suffix = f"\n// smartrss-origin-tag:{self.server.origin_tag}\n".encode()
+            body = prefix + body + suffix
 
         mime = SAFE_MIME_TYPES.get(resolved.suffix.lower(), "application/octet-stream")
         cache_control = cache_control_for_path(clean_path, resolved, self.server.dist_root)

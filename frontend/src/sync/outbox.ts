@@ -4,7 +4,7 @@
  */
 
 import { ApiHttpError, ApiNetworkError, type SmartRSSApiClient } from "../api/client";
-import { getSyncMeta } from "../db/clientMeta";
+import { getSyncMeta, setSyncMeta } from "../db/clientMeta";
 import type { FailedMutationRow, OutboxRow, ReplayJournalRow, SmartRSSDB } from "../db/schema";
 import { uuidv4 } from "../security/uuid";
 import type {
@@ -42,6 +42,7 @@ export interface PushObserverCallbacks {
     snapshot: SyncPushItemSnapshot | null,
   ) => void;
   onItemsChanged?: (itemIds: string[]) => void;
+  now?: () => number;
 }
 
 export type FlushOutcome =
@@ -51,6 +52,7 @@ export type FlushOutcome =
   | { status: "sync_error"; message: string; retryAfterSeconds?: number | null };
 
 const textEncoder = new TextEncoder();
+const PUSH_WRAPPER_UTF8_BYTES = textEncoder.encode('{"mutations":[]}').byteLength;
 
 export function measurePushUtf8Bytes(mutations: readonly SyncMutationInput[]): number {
   return textEncoder.encode(JSON.stringify({ mutations })).byteLength;
@@ -59,13 +61,14 @@ export function measurePushUtf8Bytes(mutations: readonly SyncMutationInput[]): n
 /**
  * Pack pending outbox rows into a single FIFO batch respecting all 3 server caps:
  * <= 500 mutations, <= 5,000 explicit item_ids, <= 1.5 MiB UTF-8 serialized JSON (S6, P-09).
+ * Runs in O(n) by tracking running UTF-8 byte length incrementally (V-10).
  */
 export function packOutboxBatch(
   rows: readonly OutboxRow[],
   maxBytes = MAX_BATCH_UTF8_BYTES,
 ): OutboxRow[] {
   const batch: OutboxRow[] = [];
-  const payloads: SyncMutationInput[] = [];
+  let runningBytes = PUSH_WRAPPER_UTF8_BYTES;
   let explicitIds = 0;
 
   for (const row of rows) {
@@ -83,13 +86,14 @@ export function packOutboxBatch(
       break;
     }
 
-    const candidatePayloads = [...payloads, row.payload];
-    if (batch.length > 0 && measurePushUtf8Bytes(candidatePayloads) > maxBytes) {
+    const rowBytes = textEncoder.encode(JSON.stringify(row.payload)).byteLength;
+    const nextBytes = runningBytes + (batch.length > 0 ? 1 : 0) + rowBytes;
+    if (batch.length > 0 && nextBytes > maxBytes) {
       break;
     }
 
     batch.push(row);
-    payloads.push(row.payload);
+    runningBytes = nextBytes;
     explicitIds += addedIds;
   }
 
@@ -406,14 +410,15 @@ async function applyPushSuccessBatch(
   response: SyncPushResponse,
   lock: LockHandle,
   callbacks: PushObserverCallbacks,
-): Promise<void> {
-  const driftMs = computeClockDriftMs(response.server_now);
-  callbacks.onServerNow?.(response.server_now, driftMs);
+): Promise<{ processedCount: number; missingRows: OutboxRow[] }> {
+  const nowMs = callbacks.now ? callbacks.now() : Date.now();
+  const driftMs = computeClockDriftMs(response.server_now, nowMs);
 
   const byId = new Map<string, OutboxRow>();
   for (const row of batch) {
     byId.set(row.client_mutation_id, row);
   }
+  const seenIds = new Set<string>();
 
   const affectedItemIds = new Set<string>();
   const affectedFeedIds = new Set<string>();
@@ -438,11 +443,20 @@ async function applyPushSuccessBatch(
     async () => {
       await lock.assertAndRenewInTx();
 
+      // Persist clock drift atomically inside this fenced transaction (V-04)
+      const syncMeta = await getSyncMeta(db);
+      await setSyncMeta(db, {
+        ...syncMeta,
+        last_server_now: response.server_now,
+        clock_drift_ms: driftMs,
+      });
+
       for (const res of response.results) {
         const row = byId.get(res.client_mutation_id);
         if (!row) {
           continue;
         }
+        seenIds.add(res.client_mutation_id);
         const targets = collectEntityTargets(row);
         for (const id of targets.itemIds) affectedItemIds.add(id);
         for (const id of targets.feedIds) affectedFeedIds.add(id);
@@ -558,12 +572,16 @@ async function applyPushSuccessBatch(
     },
   );
 
+  callbacks.onServerNow?.(response.server_now, driftMs);
   for (const upd of archiveUpdates) {
     callbacks.onArchiveMutationResolved?.(upd.itemId, upd.outcome, upd.snapshot);
   }
   if (affectedItemIds.size > 0) {
     callbacks.onItemsChanged?.(Array.from(affectedItemIds));
   }
+
+  const missingRows = batch.filter((row) => !seenIds.has(row.client_mutation_id));
+  return { processedCount: seenIds.size, missingRows };
 }
 
 async function quarantineRowInTx(
@@ -779,13 +797,25 @@ export async function flushOutbox(
     return null;
   };
 
+  const applyAndCheckResults = async (
+    rows: readonly OutboxRow[],
+    response: SyncPushResponse,
+  ): Promise<FlushOutcome | null> => {
+    const applied = await applyPushSuccessBatch(db, rows, response, lock, callbacks);
+    flushedCount += applied.processedCount;
+    if (applied.missingRows.length > 0) {
+      const msg = `Server push response omitted ${applied.missingRows.length} mutation result(s).`;
+      await recordBatchAttemptFailure(db, applied.missingRows, msg, lock);
+      return { status: "sync_error", message: msg };
+    }
+    return null;
+  };
+
   const flushSubBatch = async (subBatch: readonly OutboxRow[]): Promise<FlushOutcome | null> => {
     const attempt = await sendRows(subBatch);
     if (attempt.ok) {
       skewDisproven = true;
-      await applyPushSuccessBatch(db, subBatch, attempt.response, lock, callbacks);
-      flushedCount += subBatch.length;
-      return null;
+      return applyAndCheckResults(subBatch, attempt.response);
     }
     if (attempt.kind === "terminal") {
       return attempt.outcome;
@@ -807,8 +837,8 @@ export async function flushOutbox(
     }
     if (leftAttempt.ok) {
       skewDisproven = true;
-      await applyPushSuccessBatch(db, left, leftAttempt.response, lock, callbacks);
-      flushedCount += left.length;
+      const err = await applyAndCheckResults(left, leftAttempt.response);
+      if (err) return err;
       return flushSubBatch(right);
     }
 
@@ -818,8 +848,8 @@ export async function flushOutbox(
     }
     if (rightAttempt.ok) {
       skewDisproven = true;
-      await applyPushSuccessBatch(db, right, rightAttempt.response, lock, callbacks);
-      flushedCount += right.length;
+      const err = await applyAndCheckResults(right, rightAttempt.response);
+      if (err) return err;
       return flushSubBatch(left);
     }
 
@@ -838,8 +868,8 @@ export async function flushOutbox(
         }
         if (probeRes.ok) {
           skewDisproven = true;
-          await applyPushSuccessBatch(db, [probeRow], probeRes.response, lock, callbacks);
-          flushedCount += 1;
+          const err = await applyAndCheckResults([probeRow], probeRes.response);
+          if (err) return err;
           remaining = remaining.filter((r) => r.client_mutation_id !== probeRow.client_mutation_id);
           break;
         }
@@ -872,16 +902,32 @@ export async function flushOutbox(
     return flushSubBatch(right);
   };
 
-  while (true) {
+  // Bounded outer loop with progress guard (V-02)
+  const initialCount = await db.outbox.count();
+  const maxIterations = Math.max(
+    4,
+    Math.ceil(initialCount / MAX_BATCH_MUTATIONS) + MAX_QUARANTINES_PER_CYCLE + 4,
+  );
+  let iterations = 0;
+
+  while (iterations < maxIterations) {
     const allPending = await db.outbox.orderBy("local_seq").toArray();
     if (allPending.length === 0) {
       break;
     }
     const batch = packOutboxBatch(allPending);
+    const beforeTotal = flushedCount + quarantinedCount;
     const haltOutcome = await flushSubBatch(batch);
     if (haltOutcome) {
       return haltOutcome;
     }
+    if (flushedCount + quarantinedCount <= beforeTotal) {
+      return {
+        status: "sync_error",
+        message: "Sync push made no progress while flushing pending outbox.",
+      };
+    }
+    iterations += 1;
   }
 
   return { status: "ok", flushedCount, quarantinedCount };

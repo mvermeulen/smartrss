@@ -259,7 +259,52 @@ export function App() {
   const isSearchActive = searchQuery.trim().length > 0;
   const isExpiredArchiveView = scope.kind === "smart" && scope.smart === "expired";
 
-  // Execute Connected Archive Search (or Expired view) when online; Detached MiniSearch when offline
+  const useLocalSearch = !isOnline || localSearchForced;
+
+  // Detached / forced local MiniSearch effect (re-runs when local cached items change)
+  useEffect(() => {
+    if ((!isSearchActive && !isExpiredArchiveView) || !useLocalSearch) {
+      return;
+    }
+    setSearchLoading(false);
+    try {
+      const searchIndex = searchIndexRef.current;
+      if (!searchIndex) {
+        setArchiveResults([]);
+        return;
+      }
+      const res = searchIndex.search({
+        q: isSearchActive ? searchQuery : "",
+        state: isExpiredArchiveView ? "expired" : null,
+        feed_id: scope.kind === "feed" ? scope.feedId : null,
+        category_id: scope.kind === "category" ? scope.categoryId : null,
+        feedCategoryMap,
+        sort: isSearchActive ? "relevance" : "newest",
+        limit: 100,
+      });
+      setArchiveResults(res.results);
+      setSearchError(null);
+    } catch (err) {
+      setArchiveResults([]);
+      setSearchError(
+        err instanceof NegationOnlyQueryError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
+    }
+  }, [
+    feedCategoryMap,
+    isExpiredArchiveView,
+    isSearchActive,
+    items,
+    scope,
+    searchQuery,
+    useLocalSearch,
+  ]);
+
+  // Connected full-archive FTS effect (does NOT depend on `items` so background syncs never re-fire search, V-10)
   useEffect(() => {
     if (!isSearchActive && !isExpiredArchiveView) {
       setArchiveResults([]);
@@ -267,41 +312,9 @@ export function App() {
       setSearchLoading(false);
       return;
     }
-
-    const useLocal = !isOnline || localSearchForced;
-    if (useLocal) {
-      setSearchLoading(false);
-      try {
-        const searchIndex = searchIndexRef.current;
-        if (!searchIndex) {
-          setArchiveResults([]);
-          return;
-        }
-        const res = searchIndex.search({
-          q: isSearchActive ? searchQuery : "",
-          state: isExpiredArchiveView ? "expired" : null,
-          feed_id: scope.kind === "feed" ? scope.feedId : null,
-          category_id: scope.kind === "category" ? scope.categoryId : null,
-          feedCategoryMap,
-          sort: isSearchActive ? "relevance" : "newest",
-          limit: 100,
-        });
-        setArchiveResults(res.results);
-        setSearchError(null);
-      } catch (err) {
-        setArchiveResults([]);
-        setSearchError(
-          err instanceof NegationOnlyQueryError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : String(err),
-        );
-      }
+    if (useLocalSearch || !apiClient) {
       return;
     }
-
-    if (!apiClient) return;
     let cancelled = false;
     setSearchLoading(true);
     setSearchError(null);
@@ -340,17 +353,7 @@ export function App() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [
-    apiClient,
-    feedCategoryMap,
-    isExpiredArchiveView,
-    isOnline,
-    isSearchActive,
-    localSearchForced,
-    scope,
-    searchQuery,
-    items, // re-run local search if local items mutate
-  ]);
+  }, [apiClient, isExpiredArchiveView, isSearchActive, scope, searchQuery, useLocalSearch]);
 
   // Build sorted, filtered item list entries
   const listEntries: DisplayListEntry[] = useMemo(() => {

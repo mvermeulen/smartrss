@@ -222,7 +222,7 @@ test.describe("1c-T09, 1c-T10, 1c-T11: Reader, Detached Offline Reload, 500-Muta
 
     // --- 1c-T10 (b): Timed 500-mutation flush from offline outbox completes in < 5.0 s (NFR-SYNC-02) ---
     await page.context().setOffline(true);
-    await page.evaluate(async (itemIds: string[]) => {
+    const expectedStarredByItem = await page.evaluate(async (itemIds: string[]) => {
       const openReq = indexedDB.open("smartrss_v1");
       const idb = await new Promise<IDBDatabase>((resolve, reject) => {
         openReq.onsuccess = () => resolve(openReq.result);
@@ -230,21 +230,29 @@ test.describe("1c-T09, 1c-T10, 1c-T11: Reader, Detached Offline Reload, 500-Muta
       });
       const tx = idb.transaction("outbox", "readwrite");
       const store = tx.objectStore("outbox");
-      const nowIso = new Date().toISOString();
+      const baseMs = Date.now() + 1_000;
+      const expected: Record<string, boolean> = {};
       for (let i = 0; i < 500; i++) {
         const targetId = itemIds[i % itemIds.length]!;
         const mutId = crypto.randomUUID().toLowerCase();
+        // Distinct monotonic timestamps per item so final write deterministically wins LWW
+        const tsIso = new Date(baseMs + i * 10).toISOString();
+        const isStarred = i % 2 === 0;
+        expected[targetId] = isStarred;
         store.add({
           client_mutation_id: mutId,
-          type: "item_set_starred",
+          created_at: tsIso,
           payload: {
             type: "item_set_starred",
             client_mutation_id: mutId,
-            client_timestamp: nowIso,
+            client_timestamp: tsIso,
             item_id: targetId,
-            is_starred: i % 2 === 0,
+            is_starred: isStarred,
           },
-          created_at: nowIso,
+          entity_key: `item:${targetId}`,
+          target_absent: false,
+          captured_item_ids: null,
+          display_label: isStarred ? "Star item" : "Unstar item",
           attempts: 0,
           last_error: null,
         });
@@ -254,6 +262,7 @@ test.describe("1c-T09, 1c-T10, 1c-T11: Reader, Detached Offline Reload, 500-Muta
         tx.onerror = () => reject(tx.error);
       });
       idb.close();
+      return expected;
     }, seed.item_ids);
 
     await page.context().setOffline(false);
@@ -279,6 +288,13 @@ test.describe("1c-T09, 1c-T10, 1c-T11: Reader, Detached Offline Reload, 500-Muta
     );
     const flushMs = Date.now() - t0;
     expect(flushMs).toBeLessThan(5_000);
+
+    // V-07(5): Verify all 500 mutations persisted in PostgreSQL and final is_starred matches last write
+    const dbAfter500 = queryDbState();
+    expect(dbAfter500.sync_mutation_count).toBeGreaterThanOrEqual(500);
+    for (const [id, wantStarred] of Object.entries(expectedStarredByItem)) {
+      expect(dbAfter500.items[id]?.is_starred).toBe(wantStarred);
+    }
 
     // --- 1c-T10 (c): Serving updated /sw.js triggers "Update available — Reload" banner and activates ---
     const swPath = path.join(tmpDist!, "sw.js");

@@ -244,3 +244,233 @@ def test_cli_rejects_invalid_config(tmp_path: Path) -> None:
     assert runner.main(["--dist-dir", str(tmp_path), "--api-origin", "bad://x;evil"]) == 2
     # Bad port -> exit 2
     assert runner.main(["--dist-dir", str(tmp_path), "--port", "80"]) == 2
+
+
+def test_v07_runner_sigterm_graceful_shutdown(sample_dist: Path) -> None:
+    """L2: runner handles SIGTERM cleanly, exits 0 within 2s, and releases its bound port."""
+    import os
+    import signal
+    import socket
+    import subprocess
+    import time
+
+    # Pick an ephemeral free port on 127.0.0.1
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    script = Path(__file__).resolve().parents[1] / "smartrss_client_runner.py"
+    proc = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            str(script),
+            "--port",
+            str(port),
+            "--dist-dir",
+            str(sample_dist),
+            "--api-origin",
+            "http://192.168.1.50:8080",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=os.environ.copy(),
+    )
+    try:
+        # Wait for runner to accept requests
+        deadline = time.monotonic() + 5.0
+        ready = False
+        while time.monotonic() < deadline:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                try:
+                    conn.request(
+                        "GET", "/client-config.json", headers={"Host": f"localhost:{port}"}
+                    )
+                    resp = conn.getresponse()
+                    resp.read()
+                    if resp.status == 200:
+                        ready = True
+                        break
+                finally:
+                    conn.close()
+            except OSError:
+                time.sleep(0.05)
+        assert ready, "Runner did not become ready in time"
+
+        t0 = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=2.0)
+        elapsed = time.monotonic() - t0
+        assert rc == 0
+        assert elapsed < 2.0
+
+        # Confirm the TCP port is released and immediately bindable
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check_sock:
+            check_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            check_sock.bind(("127.0.0.1", port))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+def test_v07_runner_main_signal_shutdown_inprocess(
+    sample_dist: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In-process coverage of main() signal handler, serve_forever, and server_close."""
+    import signal
+
+    registered: dict[int, object] = {}
+
+    def fake_signal(sig: int, handler: object) -> None:
+        registered[sig] = handler
+
+    monkeypatch.setattr(signal, "signal", fake_signal)
+
+    orig_serve = runner.SmartRSSClientServer.serve_forever
+
+    def serve_then_trigger_sigterm(
+        self: runner.SmartRSSClientServer, *args: object, **kwargs: object
+    ) -> None:
+        def trigger() -> None:
+            handler = registered.get(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        threading.Timer(0.05, trigger).start()
+        orig_serve(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner.SmartRSSClientServer, "serve_forever", serve_then_trigger_sigterm)
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+
+    rc = runner.main(
+        [
+            "--port",
+            str(free_port),
+            "--dist-dir",
+            str(sample_dist),
+            "--api-origin",
+            "http://192.168.1.50:8080",
+        ]
+    )
+    assert rc == 0
+    assert signal.SIGTERM in registered
+    assert signal.SIGINT in registered
+
+
+def test_v09_install_client_from_docker_outside_smartrss_dir(tmp_path: Path) -> None:
+    """V-09: install-client.sh --from-docker works regardless of checkout directory name."""
+    import os
+    import shutil
+    import stat
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[2]
+    alt_checkout = tmp_path / "smartrss-custom-checkout"
+    (alt_checkout / "scripts").mkdir(parents=True)
+    (alt_checkout / "client-runner").mkdir(parents=True)
+    (alt_checkout / "deploy" / "systemd").mkdir(parents=True)
+    (alt_checkout / "deploy" / "desktop").mkdir(parents=True)
+
+    shutil.copy2(
+        repo_root / "scripts" / "install-client.sh", alt_checkout / "scripts" / "install-client.sh"
+    )
+    shutil.copy2(repo_root / "docker-compose.yml", alt_checkout / "docker-compose.yml")
+    shutil.copy2(
+        repo_root / "client-runner" / "smartrss_client_runner.py",
+        alt_checkout / "client-runner" / "smartrss_client_runner.py",
+    )
+    shutil.copy2(
+        repo_root / "deploy" / "systemd" / "smartrss-client.service",
+        alt_checkout / "deploy" / "systemd" / "smartrss-client.service",
+    )
+    shutil.copy2(
+        repo_root / "deploy" / "systemd" / "smartrss-client.env.example",
+        alt_checkout / "deploy" / "systemd" / "smartrss-client.env.example",
+    )
+    shutil.copy2(
+        repo_root / "deploy" / "desktop" / "smartrss.desktop",
+        alt_checkout / "deploy" / "desktop" / "smartrss.desktop",
+    )
+
+    # Stub check-prereqs.sh to succeed
+    prereqs = alt_checkout / "scripts" / "check-prereqs.sh"
+    prereqs.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    prereqs.chmod(prereqs.stat().st_mode | stat.S_IXUSR)
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+
+    # Stub docker recording all commands and simulating compose build/create/ps/cp/rm
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+echo "docker $*" >> "{docker_log}"
+if [[ "$1" == "compose" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == "-q" ]]; then
+      echo "cid-alt-web-123"
+      exit 0
+    fi
+  done
+  exit 0
+fi
+if [[ "$1" == "cp" ]]; then
+  dest="$3"
+  mkdir -p "$dest"
+  echo "<html>from-docker</html>" > "$dest/index.html"
+  exit 0
+fi
+if [[ "$1" == "rm" ]]; then
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_systemctl.chmod(fake_systemctl.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["XDG_DATA_HOME"] = str(tmp_path / "xdg-data")
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg-config")
+
+    bash_bin = shutil.which("bash") or "/bin/bash"
+    res = subprocess.run(  # noqa: S603
+        [bash_bin, str(alt_checkout / "scripts" / "install-client.sh"), "--from-docker"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, (
+        f"install-client.sh failed:\nSTDOUT:{res.stdout}\nSTDERR:{res.stderr}"
+    )
+
+    calls = docker_log.read_text(encoding="utf-8").splitlines()
+    assert any("compose" in c and "build web" in c for c in calls)
+    assert any("compose" in c and "create --no-deps web" in c for c in calls)
+    assert any("compose" in c and "ps -a -q web" in c for c in calls)
+    assert any(c.startswith("docker cp cid-alt-web-123:/usr/share/nginx/html/.") for c in calls)
+    assert any(c == "docker rm -f cid-alt-web-123" for c in calls)
+    assert not any("smartrss-web:latest" in c for c in calls)
+    installed_index = tmp_path / "xdg-data" / "smartrss" / "dist" / "index.html"
+    assert installed_index.read_text(encoding="utf-8").strip() == "<html>from-docker</html>"
+
+
+def test_v10_sw_origin_tag_sets_global_variable(live_server: runner.SmartRSSClientServer) -> None:
+    """V-10: /sw.js prepends self.__SMARTRSS_ORIGIN_TAG__ matching the runner's origin_tag."""
+    status, _, body = _request(live_server, "GET", "/sw.js")
+    assert status == 200
+    expected_prefix = f'self.__SMARTRSS_ORIGIN_TAG__="{live_server.origin_tag}";\n'.encode()
+    assert body.startswith(expected_prefix)

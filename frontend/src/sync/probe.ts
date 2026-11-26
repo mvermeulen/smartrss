@@ -41,9 +41,10 @@ async function timedFetch(
 
 export async function probeServerReachability(
   apiOrigin: string,
-  fetchImpl: typeof fetch = globalThis.fetch,
+  fetchImpl?: typeof fetch,
   timeoutMs = 3_000,
 ): Promise<ProbeOutcome> {
+  const doFetch: typeof fetch = fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
   const base = apiOrigin.replace(/\/+$/, "");
   const healthUrl = `${base}/api/v1/health`;
   const hostCheckUrl = `${base}/api/v1/devices`;
@@ -52,19 +53,26 @@ export async function probeServerReachability(
   let healthOk = false;
   try {
     const healthRes = await timedFetch(
-      fetchImpl,
+      doFetch,
       healthUrl,
       { method: "GET", headers: { Accept: "application/json" } },
       timeoutMs,
     );
     healthOk = healthRes.ok;
+    void healthRes.body?.cancel?.().catch(() => undefined);
   } catch (err) {
     // AbortError = real timeout -> detached; TypeError could be offline OR CORS rejection
     if (err instanceof DOMException && err.name === "AbortError") {
       return { status: "detached" };
     }
     try {
-      await timedFetch(fetchImpl, healthUrl, { method: "GET", mode: "no-cors" }, timeoutMs);
+      const noCorsRes = await timedFetch(
+        doFetch,
+        healthUrl,
+        { method: "GET", mode: "no-cors" },
+        timeoutMs,
+      );
+      void noCorsRes.body?.cancel?.().catch(() => undefined);
       return {
         status: "misconfigured",
         cause: "cors",
@@ -79,11 +87,12 @@ export async function probeServerReachability(
   // Step 2: ALLOWED_HOSTS check via unauthenticated GET /api/v1/devices (U-17-F1)
   try {
     const devicesRes = await timedFetch(
-      fetchImpl,
+      doFetch,
       hostCheckUrl,
       { method: "GET", headers: { Accept: "application/json" } },
       timeoutMs,
     );
+    void devicesRes.body?.cancel?.().catch(() => undefined);
     // Readable 401 (expected without Bearer token) or 200 proves Host + CORS are valid
     if (devicesRes.status === 401 || devicesRes.ok) {
       return { status: "reachable", healthOk };

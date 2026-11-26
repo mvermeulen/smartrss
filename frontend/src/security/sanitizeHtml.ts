@@ -146,6 +146,7 @@ export function sanitizeFeedHtmlToFragment(
 
   // Use a fresh isolated DOMPurify instance per call so hooks carry call-scoped baseUrl cleanly
   const purify = createDOMPurify(window);
+  const trustedPlaceholders = new WeakSet<Element>();
 
   purify.addHook("uponSanitizeElement", (node) => {
     if (node.nodeType !== 1) {
@@ -162,6 +163,7 @@ export function sanitizeFeedHtmlToFragment(
         baseUrl,
       );
       if (placeholder && el.parentNode) {
+        trustedPlaceholders.add(placeholder);
         el.parentNode.replaceChild(placeholder, el);
       } else if (el.parentNode) {
         el.parentNode.removeChild(el);
@@ -178,6 +180,7 @@ export function sanitizeFeedHtmlToFragment(
           )
         : null;
       if (placeholder && el.parentNode) {
+        trustedPlaceholders.add(placeholder);
         el.parentNode.replaceChild(placeholder, el);
       } else if (el.parentNode) {
         el.parentNode.removeChild(el);
@@ -191,11 +194,9 @@ export function sanitizeFeedHtmlToFragment(
     }
     const el = node as Element;
 
-    // Strip any untrusted class except our own blocked-image marker
-    if (el.hasAttribute("class")) {
-      if (el.getAttribute("class") !== "srss-blocked-img") {
-        el.removeAttribute("class");
-      }
+    // Strip any untrusted class except nodes created by our blocked-image hook (V-10)
+    if (el.hasAttribute("class") && !trustedPlaceholders.has(el)) {
+      el.removeAttribute("class");
     }
 
     if (el.tagName.toUpperCase() === "A") {

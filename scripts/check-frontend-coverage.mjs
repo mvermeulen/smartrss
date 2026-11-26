@@ -24,6 +24,7 @@ const CRITICAL_90 = [
 const CORE_80 = [
   "src/db/schema.ts",
   "src/db/clientMeta.ts",
+  "src/api/normalize.ts",
   "src/search/queryParser.ts",
   "src/search/localSearch.ts",
 ];

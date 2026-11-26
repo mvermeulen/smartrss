@@ -190,57 +190,72 @@ export class SmartRSSApiClient {
 
     const controller = new AbortController();
     const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
     try {
-      response = await this.fetchImpl(this.url(path), {
-        method,
-        headers,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-        credentials: "omit",
-        cache: "no-store",
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const isAbort = err instanceof DOMException && err.name === "AbortError";
-      throw new ApiNetworkError(
-        isAbort ? `Request timed out after ${timeoutMs}ms` : String(err),
-        isAbort,
-      );
+      let response: Response;
+      try {
+        response = await this.fetchImpl(this.url(path), {
+          method,
+          headers,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          credentials: "omit",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+      } catch (err) {
+        const isAbort = err instanceof DOMException && err.name === "AbortError";
+        throw new ApiNetworkError(
+          isAbort ? `Request timed out after ${timeoutMs}ms` : String(err),
+          isAbort,
+        );
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
+      }
+
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      if (!response.ok) {
+        let detail: unknown = null;
+        let msg = `HTTP ${response.status}`;
+        try {
+          const errJson = (await response.json()) as { detail?: unknown };
+          detail = errJson.detail ?? errJson;
+          if (typeof detail === "string") {
+            msg = detail;
+          } else if (
+            detail &&
+            typeof detail === "object" &&
+            "message" in detail &&
+            typeof (detail as { message: unknown }).message === "string"
+          ) {
+            msg = (detail as { message: string }).message;
+          }
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            throw new ApiNetworkError(`Request timed out after ${timeoutMs}ms`, true);
+          }
+          // Non-JSON error response
+        }
+        throw new ApiHttpError(response.status, msg, detail, retryAfter);
+      }
+
+      try {
+        if (accept === "application/xml") {
+          return (await response.text()) as T;
+        }
+        return (await response.json()) as T;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          throw new ApiNetworkError(`Request timed out after ${timeoutMs}ms`, true);
+        }
+        throw new ApiHttpError(
+          502,
+          `Invalid ${accept === "application/xml" ? "XML" : "JSON"} response from server: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     } finally {
       globalThis.clearTimeout(timer);
     }
-
-    if (response.status === 204) {
-      return undefined as T;
-    }
-
-    const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
-    if (!response.ok) {
-      let detail: unknown = null;
-      let msg = `HTTP ${response.status}`;
-      try {
-        const errJson = (await response.json()) as { detail?: unknown };
-        detail = errJson.detail ?? errJson;
-        if (typeof detail === "string") {
-          msg = detail;
-        } else if (
-          detail &&
-          typeof detail === "object" &&
-          "message" in detail &&
-          typeof (detail as { message: unknown }).message === "string"
-        ) {
-          msg = (detail as { message: string }).message;
-        }
-      } catch {
-        // Non-JSON error response
-      }
-      throw new ApiHttpError(response.status, msg, detail, retryAfter);
-    }
-
-    if (accept === "application/xml") {
-      return (await response.text()) as T;
-    }
-    return (await response.json()) as T;
   }
 
   // --- Health & Auth ---

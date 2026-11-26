@@ -141,7 +141,7 @@ export class SyncEngine {
     if (
       typeof document !== "undefined" &&
       !document.hidden &&
-      Date.now() - this.lastCycleAt > 15_000
+      this.now() - this.lastCycleAt > 15_000
     ) {
       void this.triggerSync();
     }
@@ -237,8 +237,8 @@ export class SyncEngine {
       document.addEventListener("securitypolicyviolation", this.boundCspViolation);
     }
 
-    await this.initializeRuntimeAndAuth();
-
+    // Install the 60 s poll timer BEFORE the first startup sync so an unexpected startup
+    // failure can never leave the tab without periodic retry (V-01, checklist B6).
     this.pollTimer = globalThis.setInterval(() => {
       if (typeof document !== "undefined" && document.hidden) {
         return;
@@ -251,6 +251,15 @@ export class SyncEngine {
         void this.triggerSync();
       }
     }, 60_000);
+
+    try {
+      await this.initializeRuntimeAndAuth();
+    } catch (err) {
+      this.updateSnapshot({
+        connectionState: "sync_error",
+        statusDetail: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   stop(): void {
@@ -360,6 +369,7 @@ export class SyncEngine {
       ...auth,
       api_origin: pending.newOrigin,
     });
+    this.postBroadcast({ type: "auth_changed", senderId: this.tabId });
     this.updateSnapshot({
       pendingOriginChange: null,
       connectionState: "detached",
@@ -485,6 +495,13 @@ export class SyncEngine {
       return;
     }
 
+    // In-tab re-entrancy guard (V-03, checklist B5): mark dirty so the active drain loop
+    // picks up new work without starting an overlapping cycle.
+    if (this.running) {
+      this.dirty = true;
+      return;
+    }
+
     const attempt = await this.tryRunLockedCycle(true);
     if (!attempt.acquired) {
       // Gap-closing deduplicated waiter (U-09-F1)
@@ -537,10 +554,15 @@ export class SyncEngine {
           if (err instanceof SyncLockLostError) {
             return;
           }
-          throw err;
+          // Catch every unexpected error (parse error, Dexie quota/state error, etc.) so
+          // the engine never wedges in `syncing` (V-01, checklist B6).
+          this.updateSnapshot({
+            connectionState: "sync_error",
+            statusDetail: err instanceof Error ? err.message : String(err),
+          });
         } finally {
           this.running = false;
-          this.lastCycleAt = Date.now();
+          this.lastCycleAt = this.now();
         }
       },
     );
@@ -593,14 +615,14 @@ export class SyncEngine {
 
     this.updateSnapshot({ connectionState: "syncing", statusDetail: null });
 
-    // 1. Flush outbox BEFORE pull
+    // 1. Flush outbox BEFORE pull (clock drift persisted inside applyPushSuccessBatch's fenced tx, V-04)
     const pushOutcome = await flushOutbox(this.db, api, lock, {
-      onServerNow: (serverNow, driftMs) => {
+      onServerNow: (_serverNow, driftMs) => {
         this.updateSnapshot({ clockDriftMs: driftMs });
-        void this.persistClockDrift(serverNow, driftMs);
       },
       onArchiveMutationResolved: this.onArchiveMutationResolved,
       onItemsChanged: (ids) => this.onItemsMutated?.(ids, []),
+      now: this.now,
     });
 
     if (pushOutcome.status === "auth_revoked") {
@@ -638,13 +660,8 @@ export class SyncEngine {
     if (pullRes === "sync_error") {
       return false;
     }
-    if (pullRes === "resynced") {
-      // Restore recovery already ran bootstrap + push + pull
-      this.updateSnapshot({ connectionState: "online", statusDetail: null });
-      return true;
-    }
 
-    // 3. Prune 48h replay journal & evict stale local items
+    // 3. Prune 48h replay journal & evict stale local items (also runs after `resynced`, V-10)
     await pruneReplayJournal(this.db, this.now());
     const evictedIds = await evictStaleLocalItems(this.db, this.now(), () =>
       lock.assertAndRenewInTx(),
@@ -674,15 +691,6 @@ export class SyncEngine {
         statusDetail: null,
       });
     }
-  }
-
-  private async persistClockDrift(serverNow: string, driftMs: number): Promise<void> {
-    const syncMeta = await getSyncMeta(this.db);
-    await setSyncMeta(this.db, {
-      ...syncMeta,
-      last_server_now: serverNow,
-      clock_drift_ms: driftMs,
-    });
   }
 
   /**

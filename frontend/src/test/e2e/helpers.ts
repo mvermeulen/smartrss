@@ -28,6 +28,7 @@ export interface SeedResult {
 }
 
 export interface DbStateSnapshot {
+  sync_mutation_count: number;
   items: Record<string, { state: string; is_starred: boolean; title: string }>;
   feeds: Record<
     string,
