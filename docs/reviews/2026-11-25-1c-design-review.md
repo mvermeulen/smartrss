@@ -5,7 +5,7 @@
 - **Specs checked against**: `requirements.md` (§4.5–§4.7, §5, §6 `1c` row), `data-model.md` §6.2, `architecture.md`, ADRs `0002`, `0004`, `0005`, `0006`, `development-process.md` §2 and §7, `review-checklist.md`, `1a-backend-ingestion-and-security.md` §4, §6, §10, `1b-sync-protocol-and-search.md` §6–§8
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `U` (`U-01`–`U-21`)
-- **Status**: `Addressed (2026-11-25) — awaiting verification` *(follow-ups `U-04-F1`, `U-05-F1`, `U-08-F1`, `U-09-F1`, `U-17-F1` addressed)*
+- **Status**: `Verified (2026-11-25)` — all 21 findings and follow-ups `U-04-F1`, `U-05-F1`, `U-08-F1`, `U-09-F1`, `U-17-F1` resolved; project owner marked the `1c` design **`Approved`** on 2026-11-25
 
 ## Review outcome
 
@@ -481,3 +481,40 @@ All five verification follow-ups (`U-04-F1`, `U-05-F1`, `U-08-F1`, `U-09-F1`, `U
 
 ### Verification (`make check`)
 - `make check` passed cleanly on `milestone/1c`: `167 passed`, total backend coverage `91.18%`, all 16 critical core modules `>= 90%` (lowest: `src/smartrss/security/middleware.py` at `90.80%`).
+
+---
+
+## 10. Verification pass 2 (2026-11-25)
+
+- **Verifier**: Claude Code (Claude Opus 5.5)
+- **Scope**: commit `bc8b1f6` (`docs(1c): address design verification follow-ups …`): `1c` design §3.1, §5.1, §6.2, §6.4, §6.5, §10.5, §12.2 (`1c-T04`, `T06`, `T15`), plus `review-checklist.md` `B2`, `docs/README.md`
+- **`make check`**: green. `167 passed`, total backend coverage `91.18%` (pass 1: `91.14%`; the 0.04-point difference is normal run-to-run variation, and the test count is unchanged), all 16 critical modules `>= 90%` (lowest `security/middleware.py` `90.80%`).
+- **Method**: This is a design-only change. I re-read every changed section, checked each follow-up against the failure scenario it was raised for, and grepped for stale text (old `siblingSucceeded` wording, three-argument `applyOutboxToItem` calls, "critical 5", the old `DataError` wording). None remains. I re-checked the backend behavior that `U-17-F1` relies on with the real `create_app()`.
+
+### Verdicts
+
+| ID | Sev | Verdict | Evidence |
+| :--- | :--- | :--- | :--- |
+| `U-04-F1` | Major | ✅ Resolved | §6.4 step 4 now sets a **cycle-wide** `skewDisproven` on any `200`. When both halves fail and skew has not been disproven, the client sends up to 4 rows one at a time and stops at the first `200`, then resumes bisecting. A lone `422` records `last_error` and halts, and §10.5 adds **"Move to quarantine"** on pending rows (recompute from `*_base`, Retry kept). I traced both scenarios. **Lone mutation**: halts, then the manual quarantine unblocks it; no deadlock remains. **Rows 2 and 7 of 10**: the first single-row send (row 0) returns `200`, both pills are quarantined, and the other 8 rows are flushed. **All-`422`**: four single-row failures halt with zero quarantines. `1c-T04` (c)(i)–(iv) covers each case. |
+| `U-05-F1` | Minor | ✅ Resolved | §5.1 and §6.2 add `fencing_token`, incremented on every acquire. `assertAndRenewLock(tx, …)` runs **inside** every sync-cycle `rw` transaction (`bootstrap_*`, `*_base`, display rows, outbox outcomes, cursor), so a tab that has lost the lock aborts atomically with no partial write. Renewing the lease at each step means throttled heartbeat timers no longer matter. `1c-T06` (d) uses fake timers to show that reclaiming the lease aborts the old holder without touching `sync_cursor` or `*_base`. |
+| `U-08-F1` | Minor | ✅ Resolved | §6.2: confirming now sets `auth.api_origin` **and** activates the waiting worker (`SKIP_WAITING` → `controllerchange` → a single reload, or `reg.update()` for up to 5 s first). That gets the page onto the new CSP before any sync attempt. `1c-T06` (a) asserts the client reaches `online` without a second prompt. |
+| `U-09-F1` | Minor | ✅ Resolved | §6.2: a busy `ifAvailable` attempt now also schedules **one** deduplicated waiter (`waiterPending`). Under `navigator.locks` that is a blocking `request(...)`, which is granted when the holder releases, so the post-check/pre-release window is closed by construction. Under the lease fallback, `recheckOnSyncComplete` fires on the holder's post-release `sync_complete` or when the lease expires. `1c-T06` (c) injects the enqueue exactly inside the window. |
+| `U-17-F1` | Minor | ✅ Resolved | §6.2 probe step 2 sends an unauthenticated `GET /api/v1/devices`, which goes through the `Host` check. Authenticated `TypeError`s re-run the probe. `1c-T06` (e)(ii) and `1c-T15` (c) cover it. **Re-verified** with the real `create_app()` (`ALLOWED_HOSTS=localhost:8080`, `Origin: http://localhost:4180`): `Host: localhost:8080` → `401` with `access-control-allow-origin: http://localhost:4180`, so the response is readable. `Host: smartrss.lan:8080` → `400` with **no** ACAO, so the browser raises a `TypeError`. The `401` came back with no database running, which confirms the "zero DB queries" claim (`deps.py` raises before using the session). |
+| Editorial nits | — | ✅ Resolved | §3.1 says "critical 6"; `applyOutboxToItem` has two arguments everywhere (`bootstrap_gen` carried on `LocalItemBaseRecord`); §5.1 and checklist `B2` wording corrected. |
+
+**Totals (all passes)**: all 21 findings and all 5 follow-ups are ✅ resolved. Nothing is ⚠️ or ❌.
+
+### Implementation notes (not follow-ups; for the `1c` implementation review to check)
+1. **`U-04-F1`, partial skew is quarantined, but reversibly**: `skewDisproven` is cycle-wide. If a server upgrade changes the schema of only **one** mutation type (say `feed_set_field`) while item mutations still succeed, the failing type is treated as poison pills: up to 3 are quarantined per cycle, repeated on later cycles. Every quarantine can be retried, triggers a notification and is recomputed from the base, so no data is lost silently. The implementation should still make repeated quarantines of the same `type` across cycles obvious, for example with a single "Server rejected all `<type>` changes — update the app" banner instead of N toasts.
+2. **`U-05-F1`, push timeout equals the lease TTL**: both are 15 s. One slow push without a heartbeat can lose the lease. The fencing check then aborts safely and another tab redoes the cycle, so correctness holds, but renew the lease right before each `fetch` to avoid needless aborts.
+3. **`U-08-F1`, 5 s update timeout**: the "proceed directly" branch assumes the active CSP already allows the new origin. If the worker install is slow, the page can still be running under the old CSP. Have the implementation listen for `securitypolicyviolation` events naming the API origin and show "Reload required" instead of falling to `detached`.
+
+### Drift checks
+- No stale wording left (checks listed in Method above). `docs/README.md` has a single `1c` review row. The design header, `design/README.md` and the review status agree. The design stays **`In Design Review`** until the owner approves.
+- Backend `CRITICAL_MODULES` is unchanged and matches `1a` §12 and `1b` §10.1.
+- No untracked files.
+
+### Status
+**`Verified (2026-11-25)`**. All findings and follow-ups are resolved, and no residual risks need owner acceptance. The `1c` design is ready for the project owner's approval decision. On approval, update all five status locations in one commit (`development-process.md` §4.1).
+
+**Owner decision (2026-11-25)**: The project owner approved the `1c` component design. Status updated in the design header, `docs/design/README.md`, `docs/README.md` (Component Designs row and this review's row), this header, and `AGENTS.md`. `1c` implementation may begin on `milestone/1c`.
