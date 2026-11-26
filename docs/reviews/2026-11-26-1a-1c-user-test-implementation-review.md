@@ -25,17 +25,18 @@ The findings so far:
 - a cron-mode documentation nit (`E-05`);
 - a misleading `items_polled` counter name (`E-06`);
 - a CORS preflight on every API call from the client (`E-07`);
-- an **owner-requested** change: record `304 Not Modified` polls separately (`E-08`).
+- an **owner-requested** change: record `304 Not Modified` polls separately (`E-08`);
+- **owner feedback** asking for a one-command first-time server setup (`E-09`). This is future design work and doesn't block `1c`.
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
 
-**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`.
+**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`. `E-09` needs a requirement and a component design first; the owner should choose which milestone carries it.
 
 | Severity | Findings |
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
-| Minor | `E-02`, `E-03`, `E-04`, `E-08` (owner-requested) |
+| Minor | `E-02`, `E-03`, `E-04`, `E-08` (owner-requested), `E-09` (owner-requested, future design) |
 | Nit | `E-05`, `E-06`, `E-07` |
 
 ---
@@ -192,6 +193,40 @@ The line used for this test is:
 - (b) the rollup returns the right `not_modified_count`, and `ok_count` still includes 304s;
 - (c) the migration upgrades and downgrades cleanly on a populated `stage_metrics`;
 - (d) the `run-once` JSON contains `feeds_polled` / `feeds_not_modified`.
+
+### E-09 — One-command first-time server setup (owner feedback, 2026-11-26; future design)
+
+**Severity:** Minor (owner-requested enhancement). It needs a requirement and a component design before code. It doesn't block `1c`.
+
+**Owner feedback (verbatim, lightly trimmed):** *"It would be nice if the backend deployment was even easier, e.g. perhaps a single script. Once I have a single backend running and can create a frontend, then it becomes easier to add hosts but this first time still took some assistance."*
+
+**What the first install actually needed.** Each of these was a manual step, or one that needed help, in this session:
+
+| # | Step | What it took | Related |
+| :--- | :--- | :--- | :--- |
+| 1 | Prerequisites | Install `docker.io` + `docker-compose-v2` (sudo), add user to the `docker` group, then **reboot**, since `sg` is missing and `newgrp` isn't installed by default on 26.04. Install `uv` with `curl … \| sh`. Pin Python 3.12 by hand. | `E-02`, `E-03` |
+| 2 | `.env` | Copy `.env.example`, generate a strong `POSTGRES_PASSWORD` and substitute it in **two** places (`POSTGRES_PASSWORD` and inside `DATABASE_URL`), `chmod 600`. Decide `WORKER_MODE` and set the matching `COMPOSE_PROFILES`. Work out the LAN host/IP for `ALLOWED_HOSTS` / `CORS_ALLOW_ORIGINS`. Decide whether `SSRF_BLOCKED_CIDRS` needs the WAN `/32`. | — |
+| 3 | Start | `make up`, `make migrate`, then poll `/api/v1/health` until ready. | — |
+| 4 | Worker scheduling | Cron mode: write a crontab line by hand (flock, `-T`, `--max-duration`, log path), because the README example isn't usable as is. | `E-05` |
+| 5 | First pairing | `docker compose exec api smartrss pair create`, copy the 16-character code into the UI within 5 minutes. For headless setup, a `curl` exchange for a bearer token. | — |
+| 6 | Feeds | There's no CLI. Pairing a device and running `curl POST /api/v1/feeds` was needed, unless done in the UI after step 7. | §3a Q-1 |
+| 7 | Client | `make install-client`, where the README's `--api-origin` flag fails, so edit `config.env` by hand. | `E-04` |
+
+**Suggested shape (for the designer to evaluate):**
+
+- **`make setup`** / **`scripts/setup-server.sh`**: idempotent and safe to re-run, ending in a working server.
+  1. Run `check-prereqs.sh --mode server`, including daemon access (`E-03`). On a missing prerequisite, print the exact `apt` / `usermod` commands. Don't run `sudo` without asking.
+  2. Create `.env` only if absent: a random password written consistently into both variables, mode `0600`, and LAN IP/hostname detection (offered for confirmation) for `ALLOWED_HOSTS` / `CORS_ALLOW_ORIGINS`. Ask for or flag the worker mode (`daemon` default) and set `COMPOSE_PROFILES` to match. Never overwrite an existing `.env`.
+  3. `docker compose up -d --build --wait`, `smartrss db migrate`, and a health check.
+  4. In cron mode, optionally install a `systemd` user timer (`deploy/systemd/smartrss-worker.{service,timer}`) instead of a raw crontab.
+  5. Optionally import an OPML file (`--opml feeds.opml`) through a server-side CLI, with no pairing needed (covers §3a Q-1).
+  6. Finish by printing the UI URL(s) and a fresh pairing code with its expiry, plus the exact `make install-client` command for this server's origin.
+- **`make install-client API_ORIGIN=http://host:8080`**: a working origin flag (`E-04`), so adding another laptop is one command plus pairing.
+- Keep the advanced path (manual `.env`, `make up`) documented. Setup is a convenience layer, not a replacement.
+
+**Placement:** add a requirement, for example a new `NFR-OPS-02 Guided first-time install`, or extend `NFR-OPS-01` with a criterion such as "fresh Ubuntu LTS host → paired UI with feeds in one command plus a pairing paste". Then design it in a component spec. It's mostly scripts and docs with no data-model impact, so the owner may schedule it alongside `1d` rather than after `1g`.
+
+**Tests (when designed):** a scripted fresh-install E2E in a clean VM or container-in-container runner. Re-running `setup` is a no-op that preserves `.env` and data. Prerequisite failure messages for each missing prerequisite, including no daemon access. A pairing code is printed and works.
 
 ---
 
