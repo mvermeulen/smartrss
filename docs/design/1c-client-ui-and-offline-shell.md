@@ -630,9 +630,10 @@ Cross-checked against [docs/review-checklist.md](../review-checklist.md):
 | **E2** | Silent drops | Rejected mutations, poison-pill quarantines, `misconfigured` CORS/Host probes (`U-17`), `> 5,000`-item post-restore bulk-read drops, clock drift, and denied `navigator.storage.persist()` all surface explicit banners/toasts. |
 | **T2 / T3 / T5** | Coverage gates, mapped tests & lockfiles | `package-lock.json` (`npm ci`), `scripts/check-prereqs.sh` (`Q-4`), two-tier `scripts/check-frontend-coverage.mjs` (`>= 90%` on 6 critical, `>= 80%` on 4 core, `Q-1`), `>= 90%` runner pytest coverage, and 1:1 test matrix `1c-T01`–`1c-T15`. |
 
-### High-Level Doc Alignments
-- Updated in this design-review cycle: [docs/development-process.md](../development-process.md) §2.2 (two-tier `90%`/`80%` frontend coverage gate, `Q-1`), [docs/data-model.md](../data-model.md) §6.2 (client server-base + overlay model and 48h chunked scoped bulk-read journaling, `U-01`/`U-10`/`Q-3`), [docs/review-checklist.md](../review-checklist.md) (client browser checklist section).
-- To apply on implementation (`development-process.md` §4.2): [docs/requirements.md](../requirements.md) §7 Open Question #1 (resolved in `1c`), [docs/architecture.md](../architecture.md) §3.1 & §7, `.env.example`, `docker-compose.yml`, and root `README.md`.
+### High-Level Doc Alignments & Scheduled Carry-Forwards
+- Updated in this design-review cycle: [docs/development-process.md](../development-process.md) §2.2 (two-tier `90%`/`80%` frontend coverage gate, `Q-1`/`V-07`), [docs/data-model.md](../data-model.md) §6.2 (client server-base + overlay model and 48h chunked scoped bulk-read journaling, `U-01`/`U-10`/`Q-3`), [docs/review-checklist.md](../review-checklist.md) (client browser checklist section `B1`–`B6`).
+- Applied on implementation (`development-process.md` §4.2): [docs/requirements.md](../requirements.md) §7 Open Question #1 (resolved in `1c`), [docs/architecture.md](../architecture.md) §3.1 & §7, `.env.example`, `docker-compose.yml`, and root `README.md`.
+- **Scheduled Carry-Forward → Milestone `1d`**: `SyncEngine.forceFullResync()` currently clears `bootstrap_*` and sets `sync_cursor: null` without acquiring `withSyncLock` (user-initiated rare recovery action; if a background pull is simultaneously in flight, the pull could overwrite `null` with `next_seq`). Scheduled to be serialized under `withSyncLock` (with a fenced flag honored by an active cycle) in Milestone `1d` alongside the `1d` frontend sync/settings updates (tracked in [docs/design/README.md](README.md) item #4 and [2026-11-25-1c-implementation-review.md](../reviews/2026-11-25-1c-implementation-review.md)).
 
 ---
 

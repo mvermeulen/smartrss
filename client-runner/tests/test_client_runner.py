@@ -328,14 +328,20 @@ def test_v07_runner_main_signal_shutdown_inprocess(
     monkeypatch.setattr(signal, "signal", fake_signal)
 
     orig_serve = runner.SmartRSSClientServer.serve_forever
+    missing_sigterm = False
 
     def serve_then_trigger_sigterm(
         self: runner.SmartRSSClientServer, *args: object, **kwargs: object
     ) -> None:
         def trigger() -> None:
+            nonlocal missing_sigterm
             handler = registered.get(signal.SIGTERM)
-            assert callable(handler)
-            handler(signal.SIGTERM, None)
+            if callable(handler):
+                handler(signal.SIGTERM, None)
+            else:
+                # V-07-F1: never hang serve_forever() if SIGTERM registration regresses!
+                missing_sigterm = True
+                self.shutdown()
 
         threading.Timer(0.05, trigger).start()
         orig_serve(self, *args, **kwargs)  # type: ignore[arg-type]
@@ -357,6 +363,7 @@ def test_v07_runner_main_signal_shutdown_inprocess(
             "http://192.168.1.50:8080",
         ]
     )
+    assert not missing_sigterm, "SIGTERM handler was not registered before serve_forever()"
     assert rc == 0
     assert signal.SIGTERM in registered
     assert signal.SIGINT in registered

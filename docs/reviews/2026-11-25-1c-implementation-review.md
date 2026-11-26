@@ -4,7 +4,7 @@
 - **Scope**: Committed branch `milestone/1c`, `main` (`c1a56f0`) → `7566002` (`feat(1c): implement local-first Ubuntu reader UI, offline shell, runner & E2E suite`). Covers `client-runner/`, `frontend/` (sync engine, outbox, reconciliation, lock, probe, Dexie schema, API client and normalizer, sanitizer, URL safety, Service Worker, search, UI components), `deploy/` (Nginx, systemd, desktop), `scripts/` (`install-client.sh`, `check-prereqs.sh`, `check-frontend-coverage.mjs`), `Makefile`, `docker-compose.yml`, the CORS default in `config.py`, the E2E suite, and doc updates. Checked against [`docs/design/1c-client-ui-and-offline-shell.md`](../design/1c-client-ui-and-offline-shell.md) (Approved), `data-model.md` §6.2, ADRs `0002`/`0004`/`0005`/`0006`, and [`review-checklist.md`](../review-checklist.md).
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `V-`
-- **Status**: `Addressed (2026-11-25) — awaiting verification`
+- **Status**: `Addressed (2026-11-25, pass 2) — awaiting verification`
 
 ## Review outcome
 
@@ -365,7 +365,103 @@ All findings (`V-01`–`V-10`, including all 8 sub-items of `V-10`) have been fi
 ### Verification Summary (`make check` + `make test-e2e`)
 - **Backend (`make check`)**: `167 passed` (total `91%`, all 16 critical modules `>= 90%`; `ruff` + `mypy` clean).
 - **Localhost Runner (`make runner-test`)**: `32 passed`, `smartrss_client_runner.py` **`94.87%`** branch+line coverage (`>= 90%` gate OK).
-- **Frontend Core (`make frontend-lint`, `frontend-typecheck`, `frontend-test-cov`)**: `eslint` + `prettier` + `tsc --noEmit` clean; `53 passed` (6 test files); scoped core report (`src/{security,db,api,sync,search}`) `93.05%` lines:
+- **Frontend Core (`make frontend-lint`, `frontend-typecheck`, `frontend-test-cov`)**: `eslint` + `prettier` + `tsc --noEmit` clean; `54 passed` (6 test files; corrected from 53); scoped core report (`src/{security,db,api,sync,search}`) `93.05%` lines:
   - Critical 6 (`>= 90%` lines & branches): `uuid.ts` `100/100`, `urlSafety.ts` `96.82/94.73`, `sanitizeHtml.ts` `98.01/90.00`, `reconciliation.ts` `97.36/91.30`, `outbox.ts` `95.66/90.44`, `engine.ts` `96.42/90.67`.
   - Core 5 (`>= 80%` lines & branches): `schema.ts` `91.76/100`, `clientMeta.ts` `100/86.11`, `normalize.ts` `99.32/90.24`, `queryParser.ts` `94.02/84.00`, `localSearch.ts` `97.02/89.47`.
 - **Playwright E2E (`make test-e2e`)**: **`8/8 passed`** in `23.2s` (`1c-T09`–`1c-T15`, including PostgreSQL verification of 500-mutation flush in `1c-T10(b)`).
+
+---
+
+## Verification pass (2026-11-25)
+
+- **Verifier**: Claude Code (fresh pass over fix commit `481d64d`, `7566002` → `481d64d`)
+- **Result**: 8 ✅ resolved, 2 ⚠️ partially resolved → follow-ups `V-03-F1`, `V-07-F1`. Both follow-ups are test-quality gaps; no production defect remains open.
+
+### `make check` (on `481d64d`)
+
+```text
+backend:  167 passed in 19.65s — Total coverage: 91.13% — all 16 critical core modules >= 90%
+runner:    32 passed in 1.57s  — smartrss_client_runner.py 94.87% (missing 76,120,122,146,158,162,167-168,184)
+frontend: eslint + prettier OK, tsc --noEmit OK, vitest 54 passed (6 files)
+  [OK] uuid 100/100  urlSafety 96.82/94.73  sanitizeHtml 98.01/90.00  reconciliation 97.36/91.11
+  [OK] outbox 95.66/90.47  engine 96.42/90.67
+  [OK] schema 91.76/100  clientMeta 100/86.11  normalize 99.32/90.24  queryParser 94.02/84.00  localSearch 97.02/89.47
+EXIT 0
+```
+
+`make test-e2e`: **8 passed** (24.7 s), including the new PostgreSQL assertions in `1c-T10(b)`.
+
+The resolution notes record **53** frontend tests; this run has **54**. Coverage figures match. Please correct the count in §7.
+
+### Revert-the-fix checks (performed by the verifier)
+
+Each fix was disabled with a minimal edit, one path at a time. The **full** vitest suite, or the full runner pytest suite for runner and script fixes, was then run, and the file was restored from a scratchpad copy. Restores were confirmed with `cmp`, and `git status` was clean after every step.
+
+| Finding / path | Mutation | Result |
+| :--- | :--- | :--- |
+| `V-01` client body-parse → `ApiHttpError(502)` | rethrow raw `err` | ❌ fails: `test_v01_push_non_json_200…`, `test_v01_client_maps_invalid_json_200…` |
+| `V-01` `tryRunLockedCycle` catch-all | `throw err` | ❌ fails: `test_v01_dexie_throw_inside_apply_push…`, `test_v02_omitted_results_during_bisection_and_non_error…` |
+| `V-01` `start()` try/catch around `initializeRuntimeAndAuth` | rethrow in `catch` | ❌ fails: `test_v01_startup_unexpected_exception_still_installs_poll_timer` |
+| `V-02` `missingRows` check in `applyAndCheckResults` | `if (false)` | ❌ fails: `test_v02_flush_outbox_omitted_results…`, `test_v02_omitted_results_during_bisection…` |
+| `V-02` outer progress guard | `if (false)` | ✅ still green: unreachable while the `missingRows` check holds (defence in depth; observation, not a follow-up) |
+| `V-03` lease treats same-tab lease as busy | restore `&& owner_tab_id !== tabId` | ❌ fails: `test_v03_idb_lease_lock_blocks_same_tab_reentry…` |
+| `V-03` in-tab `if (this.running)` guard in `triggerSync()` | delete the guard | ✅ **still green**: path untested → `V-03-F1` |
+| `V-04` drift persisted inside fenced push tx | add an unfenced `getSyncMeta`/`setSyncMeta` before the tx | ❌ fails: `test_v04_push_clock_drift_persist_is_fenced…` |
+| `V-05` timer covers body read | `clearTimeout` right after `fetch()` resolves | ❌ fails: `test_v05_stalled_response_body_times_out…` |
+| `V-06` precache throws on `!res.ok` | `if (false)` | ❌ fails: `test_v06_sw_precache_rejects_on_non_ok_response` |
+| `V-07` 1.5 MiB byte-cap `break` | `if (false)` | ❌ fails: `test_v07_1_5_mib_byte_cap…` and the existing `1c-T04` scoped/413 test |
+| `V-07` runner `SIGTERM` registration | replace with `pass` | ❌ `test_v07_runner_sigterm_graceful_shutdown` fails in 0.15 s, **but** `test_v07_runner_main_signal_shutdown_inprocess` **hangs indefinitely** (killed after 20 s; the full runner suite hit the 300 s harness timeout) → `V-07-F1` |
+| `V-09` `compose create --no-deps` + `ps -a -q` | restore `docker create smartrss-web:latest … \| tail -n1` | ❌ fails: `test_v09_install_client_from_docker_outside_smartrss_dir` |
+| `V-10` sanitizer `WeakSet` placeholder trust | restore the `class !== "srss-blocked-img"` check | ❌ fails: `test_v10_sanitize_blocks_spoofed_blocked_img_class…` |
+| `V-10` runner origin-tag global prefix | `prefix = b''` | ❌ fails: `test_v10_sw_origin_tag_sets_global_variable` |
+
+### Findings
+
+| ID | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `V-01` | ✅ | All three paths are fixed and each is revert-proven. Siblings checked: bootstrap and pull already caught all errors. Errors thrown *before* the lock callback (`getAuthMeta`, lease-acquire tx) still reject `triggerSync()`, but they never set `syncing`, and the poll timer is now installed first, so the engine retries (observation). |
+| `V-02` | ✅ | All four `200` paths (main, left, right, probe) go through `applyAndCheckResults`. Revert-proven. The outer guard and `maxIterations` cap are defence in depth. |
+| `V-03` | ⚠️ | The root cause (same-tab lease re-entry) is fixed and revert-proven. The in-tab `running` guard has no test that reaches it (`V-03-F1`). |
+| `V-04` | ✅ | Drift is written inside the fenced push tx; `persistClockDrift` was removed. The remaining unfenced `setSyncMeta` is `forceFullResync()` (`engine.ts:478`). It is user-initiated and outside a cycle, so it is not in `V-04`'s scope (see residual risks). |
+| `V-05` | ✅ | The `requestJson` timer now spans the body read, and `AbortError` during the body maps to `ApiNetworkError(isTimeout)`. `fetchClientRuntimeConfig` already covered its body. The probe cancels unread bodies. Revert-proven. |
+| `V-06` | ✅ | `precacheShellUrls()` throws on non-OK responses. Revert-proven. The built `dist/sw.js` contains no `export` statement (it is tree-shaken), so classic-script registration still works. E2E `1c-T10(c)` passes. |
+| `V-07` | ⚠️ | Items 1, 3, 4 and 5 are resolved: the byte-cap test is revert-proven; `normalize.ts` is in the 80 % gate at 99.32 %; the coverage scope is documented in §12.1 and `development-process.md` §2.2; `1c-T10(b)` asserts PostgreSQL state. Item 2: the subprocess test is sound, but its in-process sibling hangs on regression (`V-07-F1`). |
+| `V-08` | ✅ | §3.1 layout, the 25 s TTL (§6.2; code `LEASE_TTL_MS = 25_000`), `test-e2e` naming (§1) and the `runner-test` flags (§3.2) are all updated. |
+| `V-09` | ✅ | `compose build` / `create --no-deps` / `ps -a -q` with an empty-CID guard. The stubbed-`docker` test runs from `smartrss-custom-checkout`. Revert-proven. |
+| `V-10` | ✅ | All 8 items are present. Items 2 and 4 are revert-proven; the others were verified by inspection: dead branch removed; O(n) packer equivalence asserted in the `V-07` test; connected search no longer depends on `items`; `this.now()`; `auth_changed` broadcast; prune and evict after `resynced`. |
+
+### Follow-ups
+
+- **`V-03-F1` (Minor, test only)** — Deleting the `if (this.running) { this.dirty = true; return; }` guard in `SyncEngine.triggerSync()` (`engine.ts:498-503`) leaves the full suite green. `test_v03_…` still sees exactly one push because the lock fix alone refuses the second acquisition. **Expected fix:** a test that calls `triggerSync()` while a cycle is running in the same tab (IDB-lease mode). It should assert that no second `withSyncLock` attempt is made (spy on `client_meta` lease reads, or check that `recheckOnSyncComplete` stays `false`), and that work enqueued during the running cycle is pushed by the same drain loop. Prove it fails with the guard removed.
+- **`V-07-F1` (Minor, test only)** — `test_v07_runner_main_signal_shutdown_inprocess` hangs forever when the `SIGTERM` handler is not registered. The `threading.Timer` callback's `assert callable(handler)` raises in the background thread, and nothing stops `serve_forever()`. A regression would turn `make check` into a hang instead of a failure. **Expected fix:** in the timer callback, record the missing handler and call the server's `shutdown()` unconditionally (for example, capture the server instance via `monkeypatch` on `SmartRSSClientServer.__init__`), then assert in the main thread. Alternatively, add a bounded `pytest-timeout`. Prove it fails within seconds with the registration removed.
+
+### Repo-wide drift checks
+
+- `docs/README.md`: one `1c` implementation-review row, no duplicates. `docs/design/README.md` and the design header both say "Implemented — In Implementation Review", consistent with `AGENTS.md`.
+- `review-checklist.md`: `B5`/`B6` appear once each.
+- Frontend gate (`check-frontend-coverage.mjs`) matches §12.1: 6 critical modules, 5 core modules including `normalize.ts`. Backend `CRITICAL_MODULES` is unchanged (16) and matches `1a` §12 / `1b` §10.1.
+- No untracked files; `git status` is clean after verification.
+
+### Observations (no action required)
+
+- **Small window in IDB-lease mode.** Between `running = false` and the fenced lease release, the lease is still held by the same tab. An *immediate* trigger in that window (manual Sync, `online` event) is refused, and `recheckOnSyncComplete` waits for a `sync_complete` the tab never receives from itself. Enqueues are unaffected: they set `dirty` during the run, and their 250 ms debounce lands after release. The next poll covers the rest.
+
+### Residual risks for owner acceptance
+
+- **`forceFullResync()` does not take the sync lock.** It clears `bootstrap_*` and writes `sync_cursor: null` without the lock or fencing (`engine.ts:470-479`). If a cycle is in flight at that moment, its pull transaction can write `next_seq` back over the `null`, and the forced resync is silently skipped. This is user-initiated and pre-existing, not introduced by the fixes. Owner may accept it or schedule a fix: run it under `withSyncLock` and set a flag that the cycle honours.
+
+---
+
+## Follow-up Resolutions (2026-11-25)
+
+- **`V-03-F1` (Minor, test only)** — Fixed (`frontend/src/test/unit/review_regressions.test.ts:309-396`). Added `test_v03_f1_in_tab_running_guard_avoids_second_lock_and_drains_enqueued_work` in IDB-lease mode: holds push #1 in flight, enqueues a second mutation, spies on `db.client_meta.get`, and invokes `await engine.triggerSync()`. Asserts `0` reads of `"sync_lock"` (no second `withSyncLock` attempt), `recheckOnSyncComplete === false`, and that unblocking push #1 causes the active drain loop to push both `item_set_state` and `item_set_starred` (`pushCalls === 2`, `outbox.count() === 0`).
+  - **Evidence**: Deleted `if (this.running) { this.dirty = true; return; }` in `frontend/src/sync/engine.ts` → full Vitest suite failed (`test_v03_f1_...`: `expected [ [ 'sync_lock' ] ] to have a length of +0 but got 1`); restored → full Vitest suite (`55 passed`) green. Fixed lines covered (`engine.ts:498-503`).
+- **`V-07-F1` (Minor, test only)** — Fixed (`client-runner/tests/test_client_runner.py:330-370`). Updated `test_v07_runner_main_signal_shutdown_inprocess` so the timer callback checks `callable(handler)`: if `SIGTERM` was not registered, it sets `missing_sigterm = True` and calls `self.shutdown()` unconditionally, then asserts `not missing_sigterm` in the main thread so regressions fail immediately instead of hanging `serve_forever()`.
+  - **Evidence**: Replaced `signal.signal(signal.SIGTERM, _shutdown_handler)` with `pass` in `client-runner/smartrss_client_runner.py` → full runner pytest suite failed in **1.36 s** (both `test_v07_runner_sigterm_graceful_shutdown` AND `test_v07_runner_main_signal_shutdown_inprocess` failed with `AssertionError: SIGTERM handler was not registered before serve_forever()`); restored → full runner pytest suite (`32 passed`, `94.87%`) green.
+- **Typo corrected**: Corrected the pass-1 frontend test count in §7 from `53` to `54` (now `55 passed` with `test_v03_f1_...`).
+- **Residual risk scheduled (`forceFullResync()` lock/fencing)**: Per project owner direction, scheduled as an explicit carry-forward into **Milestone `1d`** (alongside the `1d` frontend sync/settings updates) and tracked in [`docs/design/README.md`](../design/README.md) (item #4) and [`docs/design/1c-client-ui-and-offline-shell.md`](../design/1c-client-ui-and-offline-shell.md) (§11) so it is not left undone.
+
+### Verification Summary (Pass 2 `make check`)
+- **Backend**: `167 passed` (total `91%`, all 16 critical modules `>= 90%`; `ruff` + `mypy` clean).
+- **Localhost Runner**: `32 passed`, `smartrss_client_runner.py` `94.87%` (`>= 90%` gate OK).
+- **Frontend Core**: `eslint` + `prettier` + `tsc --noEmit` clean; **`55 passed`** (6 test files); all 6 critical modules `>= 90%` and all 5 core modules `>= 80%` passed.

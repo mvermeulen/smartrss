@@ -306,6 +306,96 @@ describe("1c Implementation Review Regressions (V-01..V-10)", () => {
     }
   });
 
+  it("test_v03_f1_in_tab_running_guard_avoids_second_lock_and_drains_enqueued_work", async () => {
+    const { itemId } = await seedPairedReady();
+    await enqueueItemState(db, itemId, "read");
+
+    let pushCalls = 0;
+    const pushedTypes: string[] = [];
+    let releaseFirstPush!: () => void;
+    const firstPushStarted = new Promise<void>((resolve) => {
+      releaseFirstPush = resolve;
+    });
+    let unblockFirstPush!: () => void;
+    const firstPushGate = new Promise<void>((resolve) => {
+      unblockFirstPush = resolve;
+    });
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = new URL(String(input), "http://localhost:4180");
+      if (url.pathname === "/api/v1/sync/push") {
+        pushCalls += 1;
+        if (pushCalls === 1) {
+          releaseFirstPush();
+          await firstPushGate;
+        }
+        const req = JSON.parse(String(init?.body)) as SyncPushRequest;
+        for (const m of req.mutations) {
+          pushedTypes.push(m.type);
+        }
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-25T12:00:05.000Z",
+          results: req.mutations.map((m) => ({
+            client_mutation_id: m.client_mutation_id,
+            outcome: "applied",
+            reason: null,
+            affected_count: null,
+            current_entity_type: null,
+            current_entity: null,
+          })),
+        } satisfies SyncPushResponse);
+      }
+      if (url.pathname === "/api/v1/sync/pull") {
+        return jsonResp({
+          resync_required: false,
+          resync_reason: null,
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-25T12:00:06.000Z",
+          watermark: 10,
+          next_seq: 10,
+          has_more: false,
+          changes: [],
+        } satisfies SyncPullResponse);
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const engine = new SyncEngine({
+      db,
+      fetchImpl: mockFetch,
+      forceIdbLockFallback: true,
+    });
+    try {
+      const p1 = engine.triggerSync();
+      await firstPushStarted;
+
+      // Enqueue a second mutation while push #1 is still in flight, then call triggerSync().
+      // Spy on db.client_meta.get("sync_lock"): with the in-tab `if (this.running)` guard,
+      // the second triggerSync() MUST NOT attempt a second withSyncLock() acquisition!
+      await enqueueItemStarred(db, itemId, true);
+      const getSpy = vi.spyOn(db.client_meta, "get");
+      await engine.triggerSync();
+      const lockReads = getSpy.mock.calls.filter((call) => (call[0] as unknown) === "sync_lock");
+      getSpy.mockRestore();
+
+      expect(lockReads).toHaveLength(0);
+      expect((engine as unknown as { recheckOnSyncComplete: boolean }).recheckOnSyncComplete).toBe(
+        false,
+      );
+
+      // Unblock push #1 -> active drain loop picks up `this.dirty = true` and flushes the second mutation!
+      unblockFirstPush();
+      await p1;
+
+      expect(pushCalls).toBe(2);
+      expect(pushedTypes).toEqual(["item_set_state", "item_set_starred"]);
+      expect(await db.outbox.count()).toBe(0);
+    } finally {
+      engine.stop();
+    }
+  });
+
   it("test_v04_push_clock_drift_persist_is_fenced_and_aborts_on_stolen_lease", async () => {
     const { itemId } = await seedPairedReady();
     await enqueueItemState(db, itemId, "read");
