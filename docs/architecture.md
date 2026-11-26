@@ -58,9 +58,9 @@ flowchart LR
 
 ## 3. Components & Responsibilities
 
-### 3.1 Reverse Proxy / Web (`web`)
-- Single exposed LAN entry point (e.g., port `8080`).
-- Reverse-proxies `/api/` to `api` (preserving `Host` and forwarding client headers) and serves the static SPA bundle with strict security headers (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`).
+### 3.1 Reverse Proxy / Web (`web`) & Phase 1 Localhost Client Runner
+- **`web` container**: Single exposed LAN entry point (e.g., port `8080`), built via multi-stage `frontend/Dockerfile` (`node:22-alpine` → `nginx:1.27-alpine`). Reverse-proxies `/api/` to `api` (preserving `Host` and forwarding client headers) and serves the compiled Vite React SPA bundle with shared `deploy/nginx/security-headers.conf` (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`) as a full connected LAN fallback (including reads and mutations via `crypto.getRandomValues` UUIDv4 and fenced IndexedDB lease locking).
+- **Phase 1 Ubuntu localhost runner (`client-runner/smartrss_client_runner.py`)**: Zero-dependency Python 3.12 stdlib static server bound to `127.0.0.1:4180` (installed via `scripts/install-client.sh` + user `systemd` service + `.desktop` launcher) that serves the compiled SPA on a fixed `http://localhost:4180` secure origin for Service Worker offline reload survival, pins CSP `connect-src` to `SMARTRSS_API_ORIGIN`, and requires `http://localhost:4180` in the server's `CORS_ALLOW_ORIGINS` (enabled by default alongside `http://localhost:8080`).
 
 ### 3.2 API Server (`api`)
 - Exposes versioned REST/JSON endpoints (`/api/v1/...`).
@@ -173,8 +173,8 @@ Because Ollama and `llama.cpp` diverge on structured-output parameters, reasonin
   - `db`: `pgvector/pgvector:pg16` with named persistent volume (`pgdata`).
   - `api`: FastAPI container (uvicorn) connecting to `db`.
   - `worker`: Same Python image as `api` (worker entrypoint) with bounded extraction subprocess limits, connecting to `db` and host LLM over the Docker bridge gateway.
-  - `web`: Nginx/Caddy single LAN entry point serving static SPA fallback + reverse-proxying `/api/` to `api`.
-- **Configuration**: `.env` for infrastructure (DB credentials, LAN port, allowed `Host`/CORS origins, LLM URL/runtime/models) + database `app_settings` & `prompt_configs` for user-tunable behavior.
+  - `web`: Multi-stage `frontend/Dockerfile` (`nginx:1.27-alpine`) single LAN entry point serving the compiled Vite SPA fallback (with `/client-config.json` and `deploy/nginx/security-headers.conf`) + reverse-proxying `/api/` to `api`.
+- **Configuration**: `.env` for infrastructure (DB credentials, LAN port, `ALLOWED_HOSTS`, `CORS_ALLOW_ORIGINS` defaulting to `http://localhost:8080,http://localhost:4180`, LLM URL/runtime/models) + database `app_settings` & `prompt_configs` for user-tunable behavior. On Ubuntu laptops, `~/.config/smartrss-client/config.env` sets `SMARTRSS_API_ORIGIN` for the user `systemd` localhost runner.
 - **Backups & Restore Drill**:
   - Simple scheduled nightly `pg_dump` (compressed custom format) written to a host backup directory with **14-day local rotation**.
   - Optional simple `rsync`/SSH copy hook to another machine on the home LAN (configured via env/script; more elaborate backup tooling deferred to a later phase).

@@ -132,6 +132,6 @@ Standard RSS readers fetch raw feeds chronologically and leave all triage, organ
 All initial architectural questions (`Q-01`–`Q-11`) have been answered by the owner and recorded in [ADR 0001](decisions/0001-tech-stack-and-container-topology.md)–[ADR 0006](decisions/0006-lan-security-ssrf-and-content-isolation.md) (all `Accepted`).
 
 Remaining design-level choices to finalize inside the milestone component specs (`docs/design/`):
-1. **Phase 1 Localhost Launcher**: Exact packaging for the Ubuntu `localhost` runner (lightweight local static HTTP server via systemd user unit vs. Tauri desktop wrapper) — to finalize in `1c` client design.
+1. ~~**Phase 1 Localhost Launcher**~~ *(Resolved in `1c`, [1c-client-ui-and-offline-shell.md](design/1c-client-ui-and-offline-shell.md) §2)*: Zero-dependency Python 3.12 stdlib static runner (`client-runner/smartrss_client_runner.py`, port `4180`) installed via `make install-client` / `scripts/install-client.sh` with a user `systemd` service (`smartrss-client.service`) and XDG desktop launcher (`smartrss.desktop`), plus the Docker Nginx `web` service as a connected LAN fallback.
 2. **Phase 2 Android Wrapper Choice**: Capacitor (with native HTTP plugin) vs. native Kotlin client — to finalize before Phase 2.
 3. **Default Candidate MoE & Embedding Models**: Concrete default model pair to benchmark first on Ryzen 395+ in `1d` (`live_llm` suite).

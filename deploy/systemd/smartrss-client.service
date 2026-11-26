@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartRSS Localhost Client Runner (Offline-Capable SPA)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/smartrss-client/config.env
+Environment=SMARTRSS_CLIENT_PORT=4180
+Environment=SMARTRSS_API_ORIGIN=http://localhost:8080
+Environment=SMARTRSS_DIST_DIR=%h/.local/share/smartrss/dist
+ExecStart=/usr/bin/python3 %h/.local/share/smartrss/smartrss_client_runner.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

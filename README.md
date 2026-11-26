@@ -1,8 +1,8 @@
 # SmartRSS
 
-Self-hosted, single-user, LAN-first RSS reader backend with SSRF-hardened polite polling, isolated full-text extraction, PostgreSQL `SKIP LOCKED` job queue, per-device pairing auth, and backup/restore tooling.
+Self-hosted, single-user, LAN-first RSS reader with an SSRF-hardened backend, commit-ordered sync engine + PostgreSQL FTS search, and a local-first Ubuntu SPA with Service Worker offline reload survival.
 
-> **Current Implementation:** Milestone `1a` — Backend Foundation, Security, Polling & Extraction ([Design Spec](docs/design/1a-backend-ingestion-and-security.md)).
+> **Current Implementation:** Milestones `1a`–`1b` (`Approved`) and `1c` (`In Implementation Review`) — Backend Foundation & Extraction ([`1a`](docs/design/1a-backend-ingestion-and-security.md)), Sync Engine & Search ([`1b`](docs/design/1b-sync-protocol-and-search.md)), and Local-First Ubuntu Reader UI, Detached Offline Shell & System Health ([`1c`](docs/design/1c-client-ui-and-offline-shell.md)).
 
 ## Quickstart (Docker Compose)
 
@@ -100,11 +100,31 @@ make restore-drill
    curl http://localhost:8080/api/v1/health
    ```
 
+## Ubuntu Laptop Client (Localhost Offline Shell — `1c`)
+
+For full detached offline reading, Service Worker reload survival, and `navigator.storage.persist()` on Ubuntu laptops, run the lightweight Python 3.12 stdlib static server on `http://localhost:4180` (default `CORS_ALLOW_ORIGINS` already allows `http://localhost:8080,http://localhost:4180`):
+
+1. **Install or update** (builds `frontend/dist` and installs the runner, user `systemd` service, and `.desktop` launcher):
+   ```bash
+   make install-client INSTALL_CLIENT_ARGS="--api-origin http://<server-lan-ip>:8080"
+   ```
+   - Installs into `~/.local/share/smartrss-client/` (with atomic symlink switch + previous-release backup for rollback), `~/.config/smartrss-client/config.env`, `~/.config/systemd/user/smartrss-client.service`, and `~/.local/share/applications/smartrss.desktop`.
+   - Ensure the server's `.env` includes `<server-lan-ip>:8080` in `ALLOWED_HOSTS` and `http://localhost:4180` in `CORS_ALLOW_ORIGINS`.
+2. **Open the app** at `http://localhost:4180` (or launch **SmartRSS** from your desktop app menu) and paste a one-time pairing code generated via `smartrss pair create` or from another paired device's **Settings & Devices** tab.
+3. **Rollback** to the previous client build if needed:
+   ```bash
+   ./scripts/install-client.sh --rollback
+   ```
+4. **LAN Fallback (`web` container)**: Opening `http://<server-lan-ip>:8080` directly in a browser on the home LAN also provides full connected reading and mutations (using `crypto.getRandomValues` UUIDs and fenced IndexedDB lease locking), without requiring the localhost runner.
+
 ## Local Development & Verification
 
-Requires Python 3.12+, `uv`, and Docker (for `db-test`):
+Requires Python 3.12+, `uv`, Node.js 20+ / npm (or `FRONTEND_RUNTIME=docker`), and Docker (for `db-test` and Nginx `web` E2E):
 ```bash
-make check        # ruff check/format + mypy + unit/boundary/integration tests + coverage gate
-make test-unit    # fast unit & boundary tests (no DB needed)
-make test-int     # real PostgreSQL 16 (pgvector) integration tests
+make check               # prereqs + backend ruff/mypy/pytest/90% critical gate + runner-test (>=90%) + frontend lint/typecheck/vitest/90%&80% gates
+make test-unit           # fast backend unit & boundary tests (no DB needed)
+make test-int            # real PostgreSQL 16 (pgvector) integration tests
+make runner-test         # localhost static runner unit & security tests (>= 90% branch+line coverage)
+make frontend-test-cov   # frontend Vitest unit tests + two-tier 90%/80% coverage gate
+make test-e2e            # Playwright E2E suite (1c-T09–1c-T15) against real API, PostgreSQL, localhost runner & Nginx web
 ```
