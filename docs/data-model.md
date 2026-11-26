@@ -295,9 +295,10 @@ effective_ttl_days(item, feed, settings):
   expire if item.state == 'unread' AND age_anchor < (now() - ttl days)
 ```
 
-### 6.2 Client Bootstrap, Cache Window & Eviction
-- **Bootstrap**: `GET /api/v1/sync/bootstrap` returns feeds, categories, active `interest_profile`, client `app_settings`, active clusters, and items matching `state = 'unread' OR is_starred = TRUE OR (state = 'read' AND read_at >= now() - INTERVAL '14 days')`, plus `{watermark, instance_epoch}`.
-- **Local Eviction**: After each pull, the client evicts local items where `is_starred == false` and `(state == 'expired' OR (state == 'read' AND read_at < now() - 14 days))` unless referenced by a pending outbox mutation. Incoming deltas for already-evicted out-of-window items are ignored unless the delta transitions `state` to `unread` or `is_starred` to `true`.
+### 6.2 Client Bootstrap, Server-Base Overlay, Cache Window & Eviction
+- **Bootstrap**: `GET /api/v1/sync/bootstrap` returns feeds, categories, active `interest_profile`, client `app_settings`, active clusters, and items matching `state = 'unread' OR is_starred = TRUE OR (state = 'read' AND read_at >= now() - INTERVAL '14 days')`, plus `{watermark, instance_epoch}`. Clients stream bootstrap pages into a resumable staging area and keep server-confirmed base records (`items_base`/`feeds_base`) separate from displayed records (`display = base ⊕ fold(outbox)`), so pull updates and rejected-mutation rollbacks never restore stale local snapshots.
+- **48-Hour Acknowledged Replay Journal**: Clients retain server-acknowledged replayable mutations (`item_set_state`, `item_set_starred`, `feed_set_field`, `scope='items'` bulk mark-read, plus chunked `scope='items'` rewrites of applied scoped bulk reads with `<= 5,000` captured IDs) for a rolling 48-hour window and promote them into the outbox on both `epoch_mismatch` and `cursor_ahead` restore recovery.
+- **Local Eviction**: After each pull, the client evicts local items (from both base and display tables) where `is_starred == false` and `(state == 'expired' OR (state == 'read' AND read_at < now() - 14 days))` unless referenced by any pending outbox mutation. Incoming deltas for already-evicted out-of-window items are ignored unless the delta transitions `state` to `unread` or `is_starred` to `true`.
 
 ### 6.3 Realistic Storage & Retention Estimates (~200 items/day ≈ 73k items/year)
 - `items` (including `extracted_text` avg ~20–30 KB + `raw_summary`): ~2.0–2.5 GB/year (compressed TOAST in Postgres typically brings this down ~2–3× to ~1.0–1.5 GB/year).

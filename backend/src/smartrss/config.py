@@ -37,7 +37,7 @@ class Settings(BaseSettings):
         alias="ALLOWED_HOSTS",
     )
     cors_allow_origins_raw: str = Field(
-        default="http://localhost:8080",
+        default="http://localhost:8080,http://localhost:4180",
         alias="CORS_ALLOW_ORIGINS",
     )
     ssrf_blocked_cidrs_raw: str = Field(default="", alias="SSRF_BLOCKED_CIDRS")

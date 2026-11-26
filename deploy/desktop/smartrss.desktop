@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SmartRSS
+Comment=Local-first SmartRSS Reader
+Exec=xdg-open http://localhost:4180
+Terminal=false
+Categories=Network;News;
+StartupNotify=true

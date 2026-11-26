@@ -26,7 +26,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-smartrss}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-smartrss}}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,localhost:8080,127.0.0.1,127.0.0.1:8080}
-      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080,http://localhost:4180}
       SSRF_BLOCKED_CIDRS: ${SSRF_BLOCKED_CIDRS:-}
     depends_on:
       db:
@@ -67,13 +67,12 @@ services:
       - "host.docker.internal:host-gateway"
 
   web:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     ports:
       - "${LAN_PORT:-8080}:80"
-    volumes:
-      - ./deploy/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./deploy/nginx/index.html:/usr/share/nginx/html/index.html:ro
     depends_on:
       api:
         condition: service_healthy

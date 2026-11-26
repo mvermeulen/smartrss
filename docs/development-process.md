@@ -46,7 +46,10 @@ Testing is an integral part of every code change, not an optional verification s
   - The percentage is `coverage.py`'s `percent_covered`, which combines lines and branches under `--cov-branch`.
   - Run it manually with `python3 scripts/check-critical-coverage.py backend/coverage.json` after `pytest --cov=smartrss --cov-branch --cov-report=json:coverage.json` in `backend/`.
   - **Maintaining the list**: when a milestone adds or renames a critical module (as listed in that milestone's component design §"Verification & Test Plan"), update `CRITICAL_MODULES` in the **same commit**. Never lower `MIN_CRITICAL_PCT` or drop a module to make the gate pass; add meaningful tests instead.
-  - **Frontend core logic** (Dexie local store, sync engine, outbox/rollback handling, detached search, HTML sanitization): **>= 80%** line coverage.
+  - **Frontend core logic** (`scripts/check-frontend-coverage.mjs`, part of `make check`):
+    - **Critical sync & security modules** (`uuid.ts`, `urlSafety.ts`, `sanitizeHtml.ts`, `reconciliation.ts`, `outbox.ts`, `engine.ts`): **>= 90%** line/branch coverage (matching the backend's 90% critical gate).
+    - **Other frontend core modules** (Dexie schema/meta, API DTO timestamp/UUID normalizer `api/normalize.ts`, detached search parser/index): **>= 80%** line/branch coverage.
+    - *Scope*: Vitest v8 coverage measures non-UI core directories (`src/{security,db,api,sync,search}/**`); React UI components, hooks, and Service Worker lifecycle are verified by the Playwright E2E suite (`make test-e2e`) plus targeted unit tests. Do not quote the scoped Vitest core percentage as overall UI+core frontend coverage.
 - **Quality Over Vanity Metrics**:
   - Do **not** write low-value tests that merely assert mock call counts or test framework boilerplate to inflate numbers.
   - Assert observable behavior, state transitions, invariants, and error handling.
