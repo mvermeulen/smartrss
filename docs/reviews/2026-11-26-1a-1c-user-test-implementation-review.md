@@ -1,6 +1,6 @@
 # User-Test Review — Milestones `1a`–`1c` on a Live Deployment
 
-- **Date**: 2026-11-26 (opened 02:40 MST; soak check-in 03:51 MST; observation still in progress)
+- **Date**: 2026-11-26 (opened 02:40 MST; soak check-ins 03:51 and 07:39 MST; observation still in progress)
 - **Scope**: `main` at `87bba29` (Merge PR #2, `milestone/1c`), deployed with `make up` / `make migrate` on a single Ubuntu 26.04 host. Five live feeds, worker in `WORKER_MODE=cron` driven by a host crontab every 15 minutes, a UI paired through the localhost runner (`make install-client`, `http://localhost:4180`), and the LAN `web` container (`http://localhost:8080`). This covers the running system, the setup scripts and README, and the SSRF HTTP stack. It is not a full code re-review.
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
@@ -31,6 +31,8 @@ The findings so far:
 - **owner feedback** on feed-list export (`E-11`, amended by the owner): the UI export is fine. Only optional gaps remain: a headless CLI export and an OPML copy alongside backups.
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
+
+**Soak check-in 2 (07:39, about 5 h 10 min in, 10 feeds):** 21 cron runs: 19 `completed`, 2 `partial`. Both partial runs were Hacker News polls failing through the `E-01` unhandled path (03:30 `ConnectError` at TLS, 05:15 `ConnectTimeout`), and both recovered on retry. All 10 feeds are `healthy` with `consecutive_errors = 0`. 0 duplicates by `(feed_id, guid)`, `canonical_url`, or `(feed_id, content_hash)`. 0 non-`done` jobs and 0 dead letters. API: 350 pulls, 101 pushes, 5 feed creates, 2 PATCHes, 2 OPML exports and 1 search, with 0 5xx responses and 0 tracebacks. The client cursor (`since_seq=1390`) equals `sync_state.current_seq`. Poll latency p50 is 185–750 ms for every feed except Hacker News (p50 8.9 s, max 10.1 s, 2 of 7 failed). Diagnosis in the `api` container: `hnrss.org` has a single A record (TCP connect 58 ms), and a cold fetch took 2.6 s against about 0.1 s warm, so the publisher is slow to generate the feed. These are genuine transient failures, not a failover case, but they show how often `E-01`'s misclassification happens in practice: 2 of the 2 poll failures seen so far.
 
 **Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`. `E-09` needs a requirement and a component design first; the owner should choose which milestone carries it.
 
@@ -70,6 +72,8 @@ await SafeHttpClient(policy).fetch("https://lwn.net/headlines/rss")
 ```
 
 This was also seen live: the first `run-once` printed `httpcore.ConnectError: All connection attempts failed` before its JSON summary. That was an `extract_content` job for `news.ycombinator.com/item?id=50649864`, which succeeded on attempt 2.
+
+**Second live occurrence (05:15 cron run):** `poll_feed` job 146 (Hacker News): `PollFeedUnexpectedError: ConnectTimeout` ← `httpcore.ConnectTimeout`, again through the unhandled path, and successful on retry. Connect *timeouts* are affected as well as refusals, so the mapping has to cover `httpcore.TimeoutException` subclasses.
 
 **Seen again on the poll path (soak, 03:30 cron run):** `poll_feed` job 72 (Hacker News) failed with `Unhandled error in job 72 (poll_feed)` and a full traceback in `worker.log`. The cause was `PollFeedUnexpectedError: ConnectError` ← `httpcore.ConnectError` raised from `httpcore/_backends/anyio.py:67 start_tls`, through `safe_http.py:306` and `poll_feed.py:352`. This one came from the **TLS handshake** (`start_tls`), after `connect_tcp` had returned. So the per-IP failover fix alone doesn't cover it: the exception mapping in `SafeTransport` is needed too. The run ended `partial`. The job was retried at 03:45 and succeeded, and the feed is back to `healthy` / `consecutive_errors = 0`. A transient TLS failure belongs on the typed `_record_feed_poll_error` path, not the unhandled-crash path.
 
@@ -273,6 +277,7 @@ The line used for this test is:
 - **Q-1 — No CLI for feed management.** Setup without the UI needed `pair create`, a `curl` exchange for a bearer token, then `POST /api/v1/feeds`. A `smartrss feeds add|list|import-opml` CLI (running in-container, as `pair create` does) would make headless setup and scripting easier. Is that wanted for a later milestone?
 - **A `304 Not Modified` poll can't be told apart from a `200` poll.** Both return `PollFeedOutcome(metric_status="ok")` (`poll_feed.py:379`, `:479`), and `stage_metrics.status` only allows `ok` / `failed` / `skipped`, so the soak test can't confirm from the database that conditional GET is in use. Replaying the stored validators by hand returned `304` for Ars Technica and `200` for the others, which is consistent with their content having changed. BBC sends neither `ETag` nor `Last-Modified`, so it is always fully re-downloaded and relies on de-duplication alone (no duplicates so far). **Owner decision (2026-11-26): yes, record 304s separately → `E-08`.**
 - **Large first-subscribe archives.** The Hugging Face blog feed returned 917 entries on its first poll (the 04:30 run ingested 987 items in 61 s). 10 are `unread` and 907 are stored as `expired` permanently (the permanent historical log). That is per spec and fine at this scale, but feeds that publish their whole archive will dominate storage and FTS size over time. Should backfill keep only the newest `K` entries beyond the unread cap (say 100), or is the permanent log meant to be complete?
+- **The startup reachability probe runs twice per page load.** At each of 5 page loads (04:24, 04:34, 05:06, 05:07, 07:28 MST), Nginx logged `GET /api/v1/health` and the unauthenticated `GET /api/v1/devices` probe (`frontend/src/sync/probe.ts`) **twice within 1 ms**, followed by a single `sync/pull`. The probe in `engine.ts:588-600` runs before the cycle lock, so either two triggers fire at load (startup `triggerSync()` plus a `visibilitychange` / `online` event) or two tabs on the same origin started together. It's harmless (two extra small requests per load) and not raised as a finding. The implementer can check it when touching `engine.ts`, for example by de-duplicating the in-flight probe the way the cycle itself is de-duplicated.
 - **Permanent redirects work.** TLDR (`tldrnewsletter.com/rss`) moved on its own to `tldr.tech/api/rss/tech` with no user stamp on `field_updated_at['feed_url']`, as `1a` specifies for 301/308.
 - **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
 
@@ -289,10 +294,10 @@ The line used for this test is:
 
 ### Soak-test checklist (to append results)
 
-- [x] Steady-state polls at each feed's 60-minute interval (03:51: all 5 re-polled within one 15-minute cron tick of `next_fetch_at`); conditional GET is only partly verifiable (see §3a, 304 visibility)
-- [x] No duplicate items across polls (GUID / canonical-URL dedupe) so far (03:51); updated entries not yet observed
-- [x] Feed health stays `healthy` (03:51); the one transient Hacker News failure (`E-01`) recovered on retry
-- [x] `worker.log`: no `failed` runs (03:51); the one traceback is recorded under `E-01`
+- [x] Steady-state polls at each feed's 60-minute interval (03:51: all 5 re-polled within one 15-minute cron tick of `next_fetch_at`; 07:39: all 10 on schedule over 21 runs); conditional GET is only partly verifiable (see §3a, 304 visibility)
+- [x] No duplicate items across polls (GUID / canonical-URL / content-hash) so far (03:51; 07:39 with 10 feeds and 1,118 items); updated entries not yet observed
+- [x] Feed health stays `healthy` (03:51; 07:39 for all 10); both transient Hacker News failures (`E-01`) recovered on retry
+- [x] `worker.log`: no `failed` runs (03:51; 07:39 over 21 runs); both tracebacks are recorded under `E-01`
 - [ ] Client: offline reload, reconnect, star/read round-trip across the localhost runner and the LAN `web` client
 - [ ] `retention_cleanup` daily run; `pipeline_runs` / `stage_metrics` growth
 - [ ] `make backup` and `make restore-drill` against the live data
