@@ -1,6 +1,6 @@
 # User-Test Review — Milestones `1a`–`1c` on a Live Deployment
 
-- **Date**: 2026-11-26 (opened; observation still in progress)
+- **Date**: 2026-11-26 (opened 02:40 MST; soak check-in 03:51 MST; observation still in progress)
 - **Scope**: `main` at `87bba29` (Merge PR #2, `milestone/1c`), deployed with `make up` / `make migrate` on a single Ubuntu 26.04 host. Five live feeds, worker in `WORKER_MODE=cron` driven by a host crontab every 15 minutes, a UI paired through the localhost runner (`make install-client`, `http://localhost:4180`), and the LAN `web` container (`http://localhost:8080`). This covers the running system, the setup scripts and README, and the SSRF HTTP stack. It is not a full code re-review.
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
@@ -22,16 +22,20 @@ The findings so far:
 - an unpinned Python version that makes the whole suite error on a host with Python 3.14 (`E-02`);
 - a prerequisite check that passes without Docker daemon access (`E-03`);
 - README drift in the client-install section (`E-04`);
-- a cron-mode documentation nit (`E-05`).
+- a cron-mode documentation nit (`E-05`);
+- a misleading `items_polled` counter name (`E-06`);
+- a CORS preflight on every API call from the client (`E-07`).
 
-**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05` is optional.
+**Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
+
+**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional.
 
 | Severity | Findings |
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
 | Minor | `E-02`, `E-03`, `E-04` |
-| Nit | `E-05` |
+| Nit | `E-05`, `E-06`, `E-07` |
 
 ---
 
@@ -62,6 +66,8 @@ await SafeHttpClient(policy).fetch("https://lwn.net/headlines/rss")
 ```
 
 This was also seen live: the first `run-once` printed `httpcore.ConnectError: All connection attempts failed` before its JSON summary. That was an `extract_content` job for `news.ycombinator.com/item?id=50649864`, which succeeded on attempt 2.
+
+**Seen again on the poll path (soak, 03:30 cron run):** `poll_feed` job 72 (Hacker News) failed with `Unhandled error in job 72 (poll_feed)` and a full traceback in `worker.log`. The cause was `PollFeedUnexpectedError: ConnectError` ← `httpcore.ConnectError` raised from `httpcore/_backends/anyio.py:67 start_tls`, through `safe_http.py:306` and `poll_feed.py:352`. This one came from the **TLS handshake** (`start_tls`), after `connect_tcp` had returned. So the per-IP failover fix alone doesn't cover it: the exception mapping in `SafeTransport` is needed too. The run ended `partial`. The job was retried at 03:45 and succeeded, and the feed is back to `healthy` / `consecutive_errors = 0`. A transient TLS failure belongs on the typed `_record_feed_poll_error` path, not the unhandled-crash path.
 
 **Impact:** a feed or article host with several A/AAAA records fails whenever its first address is unreachable. Examples are a dual-stack host when the Docker bridge has no IPv6, or one dead node in a round-robin. Those feeds degrade instead of working. glibc's RFC 6724 ordering usually puts IPv4 first when there is no IPv6 source address, which hides the problem most of the time. Transient network errors are also logged as unhandled crashes.
 
@@ -141,11 +147,28 @@ The line used for this test is:
 
 **Suggested fix:** document a complete line like this one (or a `deploy/systemd/smartrss-worker.{service,timer}` pair, like the backup units). Note that `--json` mode leaves logging unconfigured, so stderr warnings and tracebacks are mixed in with the JSON lines (see `E-01`).
 
+### E-06 — `items_polled` counts items ingested, not feeds polled
+
+**Where:** `backend/src/smartrss/worker/runner.py:176` (`counters.items_polled += outcome.items_ingested`); `pipeline_runs.items_polled` (`data-model.md` §4, no definition given); the CLI text summary (`cli.py:219`, `polled=…`).
+
+**What happens:** the 03:15 cron run polled two feeds (LWN, Simon Willison; both `stage_metrics` rows `ok`) but reported `"items_polled": 0`, because neither feed had new entries. Someone reading `worker.log` or `polled=0` naturally concludes that no feeds were polled. That is how this review first misread it. Nothing in the summary counts feed polls.
+
+**Suggested fix:** define the field in `data-model.md` ("new items ingested by `poll_feed`"). Preferably rename it to `items_ingested` (keeping `items_polled` as a JSON alias for one release) and add `feeds_polled`, plus `feeds_not_modified` once the 304 outcome is recorded (see §3a). Update the CLI text summary to match.
+
+### E-07 — Every client API call sends a CORS preflight despite `Access-Control-Max-Age: 600`
+
+**Where:** `frontend/src/api/client.ts:110` and `:201` (`cache: "no-store"` on every request); the API's CORS config in `backend/src/smartrss/api/app.py:78`.
+
+**What happens:** over about 90 minutes of UI use, the API logged 72 `OPTIONS /api/v1/sync/pull` for 71 `GET`s and 53 `OPTIONS /api/v1/sync/push` for 53 `POST`s. The push URL is constant, and the preflight response carries `access-control-max-age: 600`, so the browser's preflight cache is not being used. The likely cause is `cache: "no-store"`: Chromium skips its preflight cache for requests with cache-disabling load flags. That has not been confirmed per browser. The impact is only twice the request count and latency on the LAN (each cycle is one extra round trip), but it adds up over many devices and long soak periods.
+
+**Suggested fix:** confirm the cause in the owner's browser (DevTools → Network, with "Disable cache" off). If confirmed, keep `no-store` semantics by having the API send `Cache-Control: no-store` on responses, and drop the request-side `cache: "no-store"` for authenticated JSON calls. Alternatively, accept the extra round trip and record it as a residual risk. If the client changes, add a vitest assertion on the fetch options.
+
 ---
 
 ## 3a. Owner questions / observations (not findings)
 
 - **Q-1 — No CLI for feed management.** Setup without the UI needed `pair create`, a `curl` exchange for a bearer token, then `POST /api/v1/feeds`. A `smartrss feeds add|list|import-opml` CLI (running in-container, as `pair create` does) would make headless setup and scripting easier. Is that wanted for a later milestone?
+- **A `304 Not Modified` poll can't be told apart from a `200` poll.** Both return `PollFeedOutcome(metric_status="ok")` (`poll_feed.py:379`, `:479`), and `stage_metrics.status` only allows `ok` / `failed` / `skipped`, so the soak test can't confirm from the database that conditional GET is in use. Replaying the stored validators by hand returned `304` for Ars Technica and `200` for the others, which is consistent with their content having changed. BBC sends neither `ETag` nor `Last-Modified`, so it is always fully re-downloaded and relies on de-duplication alone (no duplicates so far). Should 304s be recorded (an outcome column or a `not_modified` count) for health and bandwidth visibility?
 - **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
 
 ## 4. Verification performed
@@ -161,10 +184,10 @@ The line used for this test is:
 
 ### Soak-test checklist (to append results)
 
-- [ ] Steady-state polls at each feed's 60-minute interval; conditional GET (`ETag` / `Last-Modified` → `304`) on unchanged feeds
-- [ ] No duplicate items across polls (GUID / canonical-URL dedupe); updated entries handled
-- [ ] Feed health stays `healthy`; any `degraded` or `broken` transitions explained
-- [ ] `worker.log`: no `failed` runs; investigate any tracebacks
+- [x] Steady-state polls at each feed's 60-minute interval (03:51: all 5 re-polled within one 15-minute cron tick of `next_fetch_at`); conditional GET is only partly verifiable (see §3a, 304 visibility)
+- [x] No duplicate items across polls (GUID / canonical-URL dedupe) so far (03:51); updated entries not yet observed
+- [x] Feed health stays `healthy` (03:51); the one transient Hacker News failure (`E-01`) recovered on retry
+- [x] `worker.log`: no `failed` runs (03:51); the one traceback is recorded under `E-01`
 - [ ] Client: offline reload, reconnect, star/read round-trip across the localhost runner and the LAN `web` client
 - [ ] `retention_cleanup` daily run; `pipeline_runs` / `stage_metrics` growth
 - [ ] `make backup` and `make restore-drill` against the live data
