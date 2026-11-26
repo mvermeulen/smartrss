@@ -24,17 +24,18 @@ The findings so far:
 - README drift in the client-install section (`E-04`);
 - a cron-mode documentation nit (`E-05`);
 - a misleading `items_polled` counter name (`E-06`);
-- a CORS preflight on every API call from the client (`E-07`).
+- a CORS preflight on every API call from the client (`E-07`);
+- an **owner-requested** change: record `304 Not Modified` polls separately (`E-08`).
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
 
-**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional.
+**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`.
 
 | Severity | Findings |
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
-| Minor | `E-02`, `E-03`, `E-04` |
+| Minor | `E-02`, `E-03`, `E-04`, `E-08` (owner-requested) |
 | Nit | `E-05`, `E-06`, `E-07` |
 
 ---
@@ -165,10 +166,39 @@ The line used for this test is:
 
 ---
 
+## 3b. Owner-requested changes
+
+### E-08 — Record `304 Not Modified` polls separately from full fetches (owner decision, 2026-11-26)
+
+**Severity:** Minor (an observability gap, now owner-requested; tracked like a finding).
+
+**Where:** `backend/src/smartrss/worker/stages/poll_feed.py:379` (the 304 branch) and `:479` both return `PollFeedOutcome(metric_status="ok")`. `stage_metrics.status` is constrained to `ok | failed | skipped` (`data-model.md` §4.9; `alembic/versions/0001_milestone_1a_core.py:467`, `ck_stage_metrics_status`). The rollups in `backend/src/smartrss/jobs/metrics.py:109-111` count those three values only.
+
+**Problem:** a poll answered with `304` can't be told apart from a full `200` download. The soak test therefore can't show from the database that conditional GET is working, how much bandwidth it saves, or which feeds never send validators (BBC sends neither `ETag` nor `Last-Modified`). See §3a for the manual replay.
+
+**Owner decision:** record 304s separately.
+
+**Suggested design (spec first, per §4.2):**
+
+- **Don't add a new `status` value.** A `not_modified` status would disappear from the `ok_count` / `failed_count` / `skipped_count` rollups and from every consumer that treats `ok` as success, such as System Health success rates (`1c-T13`). Keep `status = 'ok'` for a successful 304.
+- Add a nullable **`stage_metrics.outcome TEXT`** column, `CHECK (outcome IN ('fetched','not_modified'))`, set by `poll_feed` only (`NULL` for other job types), in a new Alembic migration `0003`. Optionally also add **`http_status SMALLINT NULL`** for the final response code. Document both in `data-model.md` §4.9.
+- Add `not_modified_count` (`COUNT(*) FILTER (WHERE outcome = 'not_modified')`) to the rollup query and to `GET /api/v1/system/metrics`. Show it in the System Health pipeline view if that's cheap.
+- Add **`feeds_polled`** and **`feeds_not_modified`** to the `run-once` JSON summary and to `pipeline_runs`, which covers `E-06` at the same time.
+- Optional, for feed health: show per feed whether the publisher sends validators (`etag` / `last_modified` already stored) so "always full download" feeds are visible.
+
+**Tests:**
+
+- (a) integration: a `poll_feed` against a recorded fixture returning `304` writes `status='ok', outcome='not_modified'`, and a `200` writes `outcome='fetched'`;
+- (b) the rollup returns the right `not_modified_count`, and `ok_count` still includes 304s;
+- (c) the migration upgrades and downgrades cleanly on a populated `stage_metrics`;
+- (d) the `run-once` JSON contains `feeds_polled` / `feeds_not_modified`.
+
+---
+
 ## 3a. Owner questions / observations (not findings)
 
 - **Q-1 — No CLI for feed management.** Setup without the UI needed `pair create`, a `curl` exchange for a bearer token, then `POST /api/v1/feeds`. A `smartrss feeds add|list|import-opml` CLI (running in-container, as `pair create` does) would make headless setup and scripting easier. Is that wanted for a later milestone?
-- **A `304 Not Modified` poll can't be told apart from a `200` poll.** Both return `PollFeedOutcome(metric_status="ok")` (`poll_feed.py:379`, `:479`), and `stage_metrics.status` only allows `ok` / `failed` / `skipped`, so the soak test can't confirm from the database that conditional GET is in use. Replaying the stored validators by hand returned `304` for Ars Technica and `200` for the others, which is consistent with their content having changed. BBC sends neither `ETag` nor `Last-Modified`, so it is always fully re-downloaded and relies on de-duplication alone (no duplicates so far). Should 304s be recorded (an outcome column or a `not_modified` count) for health and bandwidth visibility?
+- **A `304 Not Modified` poll can't be told apart from a `200` poll.** Both return `PollFeedOutcome(metric_status="ok")` (`poll_feed.py:379`, `:479`), and `stage_metrics.status` only allows `ok` / `failed` / `skipped`, so the soak test can't confirm from the database that conditional GET is in use. Replaying the stored validators by hand returned `304` for Ars Technica and `200` for the others, which is consistent with their content having changed. BBC sends neither `ETag` nor `Last-Modified`, so it is always fully re-downloaded and relies on de-duplication alone (no duplicates so far). **Owner decision (2026-11-26): yes, record 304s separately → `E-08`.**
 - **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
 
 ## 4. Verification performed
