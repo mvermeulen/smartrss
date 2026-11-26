@@ -28,7 +28,7 @@ The findings so far:
 - an **owner-requested** change: record `304 Not Modified` polls separately (`E-08`);
 - **owner feedback** asking for a one-command first-time server setup (`E-09`). This is future design work and doesn't block `1c`;
 - feed URL validation that accepted a pasted Markdown link (`E-10`), caught live;
-- **owner feedback** that exporting the feed list is hard to find, plus no headless or backup export (`E-11`). The UI button exists, so this is discoverability and the gaps around it.
+- **owner feedback** on feed-list export (`E-11`, amended by the owner): the UI export is fine. Only optional gaps remain: a headless CLI export and an OPML copy alongside backups.
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
 
@@ -38,8 +38,8 @@ The findings so far:
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
-| Minor | `E-02`, `E-03`, `E-04`, `E-10`, `E-08` (owner-requested), `E-09` (owner-requested, future design), `E-11` (owner-requested) |
-| Nit | `E-05`, `E-06`, `E-07` |
+| Minor | `E-02`, `E-03`, `E-04`, `E-10`, `E-08` (owner-requested), `E-09` (owner-requested, future design) |
+| Nit | `E-05`, `E-06`, `E-07`, `E-11` (owner feedback, amended) |
 
 ---
 
@@ -251,24 +251,20 @@ The line used for this test is:
 
 **Tests (for `E-09`, when designed):** a scripted fresh-install E2E in a clean VM or container-in-container runner. Re-running `setup` is a no-op that preserves `.env` and data. Prerequisite failure messages for each missing prerequisite, including no daemon access. A pairing code is printed and works.
 
-### E-11 — Exporting the feed list is hard to find, and there's no headless export (owner feedback, 2026-11-26)
+### E-11 — Feed-list export: no headless export and no OPML copy in backups (owner feedback, 2026-11-26; amended)
 
-**Severity:** Minor (owner-requested enhancement; mostly UX and docs).
+**Severity:** Nit (optional enhancement).
 
-**Owner feedback:** *"It would be nice to be able to export the list of feeds."*
+**Owner feedback:** *"It would be nice to be able to export the list of feeds."* **Amended by the owner (2026-11-26):** the UI export is fine. The owner had just missed the existing **Export OPML** button, so the discoverability and relabel parts of this finding are **withdrawn**.
 
-**What already exists:** `GET /api/v1/feeds/export-opml` (`feeds.py:309`, returns `200 application/xml`, checked during the soak). The **Feeds & OPML** view also has an **Export OPML** button (`frontend/src/components/feeds/FeedManagerView.tsx:170-201`, `data-testid="export-opml-btn"`) that downloads `smartrss-feeds.opml`, as `1c` §596 and `1c-T14` specify. So the feature is there, but the owner didn't find it while using that same view to add 5 feeds. That makes it a discoverability gap, and it reveals some gaps around it:
+**What already exists, and is sufficient for interactive use:** the **Feeds & OPML** view's **Export OPML** button (`frontend/src/components/feeds/FeedManagerView.tsx:170-201`, `data-testid="export-opml-btn"`) downloads `smartrss-feeds.opml` through `GET /api/v1/feeds/export-opml` (`feeds.py:309`; `1c` §596, `1c-T14`).
 
-1. **Labelling and discoverability.** "OPML" means nothing to someone who wants "my list of feeds". The button doesn't say what it exports or that the file works in other readers.
-2. **No headless export.** Without a paired browser there's no `smartrss feeds export-opml` CLI, so a script or the server host needs a bearer token and `curl`. This is the same gap as §3a Q-1 and `E-09` step 6.
-3. **No export alongside backups.** `NFR-OPS-01` lists "OPML/config export" next to the nightly `pg_dump`, but `scripts/backup.sh` writes only the dump. Nothing human-readable or portable is kept unless someone exports by hand. The README never mentions OPML.
+**Remaining small gaps, for whenever convenient:**
 
-**Suggested change (designer to evaluate):**
+1. **No headless export.** There's no `smartrss feeds export-opml` CLI, so exporting without a paired browser needs a bearer token and `curl`. This is the same gap as §3a Q-1 and `E-09` step 6, and is best done with them.
+2. **No OPML copy alongside backups.** `NFR-OPS-01` lists "OPML/config export" next to the nightly `pg_dump`, but `scripts/backup.sh` writes only the dump. Either write `smartrss-feeds-<timestamp>.opml` (mode `0600`, same rotation) with each backup, or clarify in `NFR-OPS-01` that the UI/API export satisfies the requirement.
 
-- **UI:** relabel to something like **"Export feed list (OPML)"**, with a one-line hint: "Download all subscriptions with their categories; importable into SmartRSS or any RSS reader." Put Import and Export together at the top of the Feeds view, and optionally add an export entry under Settings. Optional extra formats: a plain list of URLs (`.txt`) or JSON with per-feed settings (poll interval, full-text, curation instructions). OPML can't carry those settings, so JSON is needed for a full config backup.
-- **CLI:** `smartrss feeds export-opml [--output FILE]` (and `import-opml FILE`), run in-container like `pair create`, so no token is needed. It reuses the existing `export_opml` domain function.
-- **Backups:** have `scripts/backup.sh` also write `smartrss-feeds-<timestamp>.opml` (mode `0600`, same rotation) next to each dump, and document it in the README backup section. Check this against the `NFR-OPS-01` wording.
-- **Tests:** a CLI test that its output round-trips through `import-opml` (no duplicates, categories kept); a backup-script test that the OPML file exists with the right mode and rotation; and an updated `1c-T14` selector or label assertion if the button is relabelled.
+**Tests (if done):** a CLI export that round-trips through `import-opml` (no duplicates, categories kept); a backup-script check for the OPML file's presence, mode and rotation.
 
 ---
 
