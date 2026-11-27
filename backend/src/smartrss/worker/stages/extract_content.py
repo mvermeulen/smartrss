@@ -23,8 +23,8 @@ from smartrss.security.safe_http import (
     DomainRateLimiter,
     ResponseTooLargeError,
     SafeHttpClient,
+    SafeHttpError,
     SSRFBlockedError,
-    SSRFConnectionError,
     TooManyRedirectsError,
     UnsupportedEncodingError,
 )
@@ -173,7 +173,7 @@ async def run_extract_content(
                 )
                 await session.commit()
             return ExtractContentOutcome(metric_status="ok", extraction_status="fallback_rss")
-        except (SSRFConnectionError, TimeoutError, httpx.HTTPError, OSError) as exc:
+        except (SafeHttpError, TimeoutError, httpx.HTTPError, OSError) as exc:
             raise TransientExtractionError(f"{type(exc).__name__}: {exc}") from exc
 
     status_code = fetch_result.status_code

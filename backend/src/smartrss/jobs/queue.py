@@ -191,6 +191,8 @@ async def complete_job(
     queue_wait_ms: int,
     duration_ms: int,
     metric_status: str = "ok",
+    metric_outcome: str | None = None,
+    http_status: int | None = None,
     feed_id: uuid.UUID | None = None,
     item_id: uuid.UUID | None = None,
     run_id: uuid.UUID | None = None,
@@ -232,6 +234,8 @@ async def complete_job(
             feed_id=feed_id,
             item_id=item_id,
             status=metric_status,
+            outcome=metric_outcome,
+            http_status=http_status,
             queue_wait_ms=clamped_wait,
             duration_ms=clamped_duration,
         )

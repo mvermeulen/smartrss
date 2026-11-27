@@ -2,6 +2,7 @@ import { useState, type ChangeEvent, type FormEvent } from "react";
 import { ApiHttpError, type SmartRSSApiClient } from "../../api/client";
 import type { FeedUpdateRequest, OpmlImportResponse } from "../../types/api";
 import type { SyncCategoryDTO, SyncFeedDTO } from "../../types/sync";
+import { cleanPastedFeedUrl } from "./feedUrlInput";
 
 export function FeedManagerView({
   isOnline,
@@ -61,9 +62,13 @@ export function FeedManagerView({
     e.preventDefault();
     if (!apiClient || !isOnline) return;
     setAddStatus(null);
+    const cleanedUrl = cleanPastedFeedUrl(newFeedUrl);
+    if (cleanedUrl !== newFeedUrl) {
+      setNewFeedUrl(cleanedUrl);
+    }
     try {
       await apiClient.createFeed({
-        feed_url: newFeedUrl.trim(),
+        feed_url: cleanedUrl,
         title: newFeedTitle.trim() || null,
         category_id: newFeedCatId || null,
       });
@@ -106,8 +111,12 @@ export function FeedManagerView({
     setEditError(null);
 
     const patch: FeedUpdateRequest = {};
+    const cleanedEditUrl = cleanPastedFeedUrl(editUrl);
+    if (cleanedEditUrl !== editUrl) {
+      setEditUrl(cleanedEditUrl);
+    }
     if (editTitle.trim() !== editingFeed.title) patch.title = editTitle.trim();
-    if (editUrl.trim() !== editingFeed.feed_url) patch.feed_url = editUrl.trim();
+    if (cleanedEditUrl !== editingFeed.feed_url) patch.feed_url = cleanedEditUrl;
     if (editPoll !== editingFeed.poll_interval_minutes) patch.poll_interval_minutes = editPoll;
     if (editFullText !== editingFeed.fetch_full_text) patch.fetch_full_text = editFullText;
 
@@ -215,7 +224,7 @@ export function FeedManagerView({
                 required
                 disabled={!isOnline}
                 value={newFeedUrl}
-                onChange={(e) => setNewFeedUrl(e.target.value)}
+                onChange={(e) => setNewFeedUrl(cleanPastedFeedUrl(e.target.value))}
                 placeholder="https://example.com/feed.xml"
                 className="w-full rounded border border-slate-300 bg-white px-2.5 py-1.5 dark:border-slate-700 dark:bg-slate-950"
               />
@@ -416,7 +425,7 @@ export function FeedManagerView({
                 <input
                   type="url"
                   value={editUrl}
-                  onChange={(e) => setEditUrl(e.target.value)}
+                  onChange={(e) => setEditUrl(cleanPastedFeedUrl(e.target.value))}
                   className="mt-1 w-full rounded border border-slate-300 bg-white px-2.5 py-1.5 font-mono dark:border-slate-700 dark:bg-slate-950"
                 />
               </div>

@@ -31,6 +31,23 @@ TRACKING_PARAM_NAMES: frozenset[str] = frozenset(
         "oly_enc_id",
         "vero_id",
         "s_cid",
+        # AT Internet / Piano Analytics (BBC, etc.; explicit names only, never bare `at_`, E-12)
+        "at_medium",
+        "at_campaign",
+        "at_campaign_type",
+        "at_custom1",
+        "at_custom2",
+        "at_custom3",
+        "at_custom4",
+        "at_format",
+        "at_link",
+        "at_link_id",
+        "at_link_type",
+        "at_link_origin",
+        "at_ptr_name",
+        "at_bbc_team",
+        "at_creation",
+        "at_variant",
     }
 )
 

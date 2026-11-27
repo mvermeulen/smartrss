@@ -37,6 +37,46 @@ def test_validate_url_accepts_http_and_https_default_ports() -> None:
 
 
 @pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://www.latent.space/feed](https://www.latent.space/feed",
+        "https://example.com/feed with space",
+        "https://example.com/feed<tag>",
+        'https://example.com/feed"quote',
+        "https://example.com/feed{brace}",
+        "https://example.com/feed|pipe",
+        "https://example.com/feed\\slash",
+        "https://example.com/feed^caret",
+        "https://example.com/feed`tick",
+        "https://example.com/feed[0]",
+        "https://example.com/feed?a=b]",
+        "https://example.com/feed#frag[1]",
+        "https://example.com/feed/https://other.example/rss",
+        "https://example.com/feed?next=http://other.example/rss",
+    ],
+)
+def test_e10_validate_url_rejects_markdown_and_rfc3986_disallowed_chars(bad_url: str) -> None:
+    policy = SSRFPolicy()
+    with pytest.raises(SSRFBlockedError):
+        policy.validate_url(bad_url)
+
+
+def test_e10_validate_url_accepts_percent_encoded_and_ipv6_hosts() -> None:
+    policy = SSRFPolicy()
+    encoded_url = "https://example.com/feed%5D?q=a%20b&src=https%3A%2F%2Fother.test"
+    assert policy.validate_url(encoded_url) == (
+        "https",
+        "example.com",
+        443,
+    )
+    assert policy.validate_url("https://[2606:2800:220:1:248:1893:25c8:1946]/feed.xml") == (
+        "https",
+        "2606:2800:220:1:248:1893:25c8:1946",
+        443,
+    )
+
+
+@pytest.mark.parametrize(
     "blocked_ip",
     [
         "127.0.0.1",

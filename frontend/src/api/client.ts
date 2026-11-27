@@ -2,7 +2,9 @@
  * Typed SmartRSS REST & Sync API client (1c §3.2, §6, §10).
  *
  * Strictly CORS-safe: sends ONLY `Authorization`, `Accept`, and `Content-Type: application/json`
- * (matching backend `CORSMiddleware`), with `credentials: "omit"` and `cache: "no-store"`.
+ * (matching backend `CORSMiddleware`), with `credentials: "omit"`. Response-side
+ * `Cache-Control: no-store` from the backend replaces request-side `cache: "no-store"` on API
+ * calls so Chromium uses the `Access-Control-Max-Age` preflight cache (E-07).
  * Normalizes all incoming timestamps via `normalize.ts` (U-07).
  */
 
@@ -198,7 +200,6 @@ export class SmartRSSApiClient {
           headers,
           body: body !== undefined ? JSON.stringify(body) : undefined,
           credentials: "omit",
-          cache: "no-store",
           signal: controller.signal,
         });
       } catch (err) {

@@ -298,13 +298,15 @@ class SafeNetworkBackend(httpcore.AsyncNetworkBackend):
         for ip in ips:
             try:
                 return await self.inner.connect_tcp(str(ip), port, timeout=timeout, ...)
-            except OSError:
+            except (OSError, httpcore.ConnectError, httpcore.ConnectTimeout):
                 continue
         raise SSRFConnectionError(...)
 ```
 
+- **Exception mapping (`E-01`)**: `SafeTransport.handle_async_request()` and `_PinnedStream` (`__aiter__`, `aclose`) map `httpcore` exceptions into the `SafeHttpError` hierarchy (`httpcore.TimeoutException` → `SafeHttpTimeoutError`, `httpcore.NetworkError`/`ProxyError` → `SSRFConnectionError`, `httpcore.ProtocolError`/`UnsupportedProtocol` → `SafeHttpError`) so raw `httpcore` errors never escape `SafeHttpClient.fetch()`.
+
 ### 7.2 Validation Rules & Guardrails
-- **Scheme check**: Only `http` and `https`. Rejects `file://`, `ftp://`, `gopher://`, `data://`, etc., and rejects embedded userinfo (`http://user:pass@host`) or non-standard control characters.
+- **Scheme & URL syntax check**: Only `http` and `https`. Rejects `file://`, `ftp://`, `gopher://`, `data://`, etc., embedded userinfo (`http://user:pass@host`), control characters, unescaped RFC 3986-disallowed characters (whitespace, `<>"{}|\^\``, and `[`/`]` outside an IPv6 host literal), and embedded second `http(s)://` schemes (`E-10`, shared across `POST /feeds`, `PATCH /feeds/{id}`, OPML import, and `SafeHttpClient.fetch()`).
 - **Port check**: Allow ports `80` and `443` by default (configurable allow-list in `SSRFPolicy` for test fixtures).
 - **IP denylist (fail-closed)**: Every A and AAAA address returned for `host` is validated. If **any** resolved IP is forbidden (preventing dual-homed DNS trickery where one A record is public and another is `127.0.0.1`), the request is rejected with `SSRFBlockedError`:
   - **Embedded-IPv4 transition addresses (unwrapped & checked against all IPv4 rules)**:
@@ -550,7 +552,7 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 | `GET /api/v1/items` | Paginated item inspection (`1a` verification) | Filters: `feed_id`, `state`, `is_starred`, `limit` (max 100), `offset`. |
 | `GET /api/v1/items/{id}` | Single item detail | |
 | `GET /api/v1/system/health` | System health summary | DB status, queue counts by status/type, dead-letter count, last 10 `pipeline_runs`, `instance_epoch`. |
-| `GET /api/v1/system/metrics?window=24h\|7d\|30d` | Pipeline timing metrics | Exact SQL `percentile_cont(0.5/0.95)`, `avg`, `max`, failure rate per `job_type`, plus per-feed cost rollup. |
+| `GET /api/v1/system/metrics?window=24h\|7d\|30d` | Pipeline timing metrics | Exact SQL `percentile_cont(0.5/0.95)`, `avg`, `max`, failure rate, and `not_modified_count` (`outcome = 'not_modified'`) per `job_type`, plus per-feed cost rollup. |
 | `GET /api/v1/system/jobs/dead-letter` | List `failed` jobs | Paginated with `last_error`, `attempts`, `payload`. |
 | `POST /api/v1/system/jobs/{id}/retry` | Requeue a dead-letter job | Resets `status='queued'`, `attempts=0`, `run_after=now()`. Catches `uq_jobs_active_dedupe` conflict if an active job with the same `(job_type, dedupe_key)` already exists and returns `409 Conflict` (with `active_job_id`). |
 | `POST /api/v1/system/jobs/{id}/dismiss` | Delete a dead-letter job | Removes acknowledged failure from dead-letter queue. |
@@ -559,9 +561,10 @@ All routes except `/health` and `/auth/pair` require `Authorization: Bearer <tok
 - `smartrss pair create --name <name> [--platform ubuntu|android|web]`
 - `smartrss devices list` / `smartrss devices revoke <device_id>`
 - `smartrss worker run` (continuous daemon; refuses to start if `WORKER_MODE=cron`)
-- `smartrss worker run-once [--stage all|poll|extract|expire|maintenance] [--feed <id>] [--force-poll] [--max-duration <sec, default 1800>] [--json]`
+- `smartrss worker run-once [--stage all|poll|extract|expire|maintenance] [--feed <id>] [--force-poll] [--max-duration <sec, default 1800>] [--json]` *(reports `feeds_polled`, `feeds_not_modified`, `items_ingested`, backwards-compatible `items_polled`, `items_extracted`, `jobs_failed`, `jobs_deferred`)*
 - `smartrss settings get` / `smartrss settings set <key> <value>` (`backfill_cap`, `default_expiration_days`, `default_poll_interval_minutes`; validated, stamps `updated_at`, emits `app_settings` `upsert` via `SyncLogWriter` using `APP_SETTINGS_ENTITY_ID`; the only `1a` way to change `FR-FEED-05`'s configurable cap until the settings UI/API in `1b`/`1c`)
 - `smartrss db migrate` (runs `alembic upgrade head`)
+- `smartrss db recanonicalize [--batch-size 500]` *(recomputes `items.canonical_url` using current `url_canon` rules and emits `item` `upsert`s for changed rows, `E-12`)*
 - `smartrss db rotate-epoch (--database-url <url> | --database-url-env <ENV_VAR>)` *(explicit target URL required via flag or env var — `--database-url-env` avoids exposing passwords in process argv — so drills can never accidentally rotate production's epoch; generates new `sync_state.instance_epoch` UUID)*
 
 ---

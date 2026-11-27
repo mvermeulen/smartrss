@@ -158,7 +158,7 @@ smartrss/
   - Document in `README.md` / `.env.example` that LAN deployments should add their server LAN hostname/IP to `ALLOWED_HOSTS` (e.g., `smartrss.lan:8080,192.168.1.50:8080`) and any LAN fallback origin to `CORS_ALLOW_ORIGINS` (e.g., `http://smartrss.lan:8080,http://localhost:4180`).
 - **CORS-Safe Request Header Invariant**:
   - Backend `CORSMiddleware` (`backend/src/smartrss/api/app.py`) explicitly allows `allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]`, `allow_headers=["Authorization", "Content-Type"]`, `allow_credentials=False`.
-  - `frontend/src/api/client.ts` MUST always set `credentials: "omit"` and `cache: "no-store"` (fetch option, never a custom header), and send ONLY `Authorization`, `Accept`, and `Content-Type: application/json` (on mutation requests).
+  - `frontend/src/api/client.ts` MUST always set `credentials: "omit"` and send ONLY `Authorization`, `Accept`, and `Content-Type: application/json` (on mutation requests). The backend API sends `Cache-Control: no-store` on responses (`E-07`) so authenticated API requests omit request-side `cache: "no-store"` (allowing browsers to use `Access-Control-Max-Age` CORS preflight caching), while same-origin `/client-config.json` and reachability probes keep `cache: "no-store"`.
 - **`Makefile` Targets**:
   - `make check-prereqs`: runs `./scripts/check-prereqs.sh --mode dev`
   - `make frontend-lint`: `npm --prefix frontend run lint` (ESLint + Prettier check)
@@ -584,9 +584,9 @@ A lightweight Vite build plugin (`emitSwManifestPlugin` in `vite.config.ts`) inj
 When online, fetches `GET /api/v1/system/health`, `GET /api/v1/system/metrics?window=24h|7d|30d`, `GET /api/v1/feeds/health`, and `GET /api/v1/system/jobs/dead-letter` (when detached, displays local client storage/outbox diagnostics plus an online-only notice):
 1. **Overview Cards**: DB health, `instance_epoch`, Server `current_seq` vs Local `sync_cursor`, Dead-letter count, Storage persistence (`granted`/`denied`/`unsupported`) & quota estimate, Local Dexie counts (items, pending outbox, 48h replay journal, quarantined), and Job Queue matrix (`job_type` × `queued`/`running`/`done`/`failed`).
 2. **Pipeline Performance Metrics** (`window`: `24h` | `7d` | `30d`):
-   - **Per-Stage Latency & Failure Table** (`job_type`, `total_count`, `ok`, `failed`, `skipped`, `failure_rate%`, `avg`, `p50`, `p95`, `max`, `avg_queue_wait_ms`, sortable, `<progress>` bars).
+   - **Per-Stage Latency & Failure Table** (`job_type`, `total_count`, `ok`, `not_modified_count`, `failed`, `skipped`, `failure_rate%`, `avg`, `p50`, `p95`, `max`, `avg_queue_wait_ms`, sortable, `<progress>` bars).
    - **Per-Feed Processing Cost Rollup Table** (`feed_title`, `total_jobs`, `failed_jobs`, `total_duration_ms`, `avg_duration_ms`, sortable).
-   - **Recent Pipeline / Cron Runs (`recent_runs`)**: `trigger`, `stages`, `status`, `started_at`, `duration_ms`, `items_polled`, `items_extracted`, `items_enriched`, `jobs_failed`, `notes`.
+   - **Recent Pipeline / Cron Runs (`recent_runs`)**: `trigger`, `stages`, `status`, `started_at`, `duration_ms`, `feeds_polled`, `feeds_not_modified`, `items_polled` (new items ingested), `items_extracted`, `items_enriched`, `jobs_failed`, `notes`.
 3. **Feed Health Table** (`GET /api/v1/feeds/health`): Severity-sorted (`gone` → `broken` → `degraded` → `healthy`), separated `status` and `health_state` badges, `last_success_at`, `last_fetched_at`, `consecutive_errors`, `last_error`, row actions (**Poll Now**, **Edit URL**, **Pause/Mute/Unsubscribe**).
 4. **Dead-Letter Queue**: Paginated failed jobs (`limit=25`) with **Retry** (`409` active-job collision handled cleanly) and **Dismiss** (with confirmation).
 

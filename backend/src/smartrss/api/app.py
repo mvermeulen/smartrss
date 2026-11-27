@@ -25,7 +25,11 @@ from smartrss.config import Settings, get_settings
 from smartrss.db.engine import build_engine, build_sessionmaker
 from smartrss.logging import configure_logging
 from smartrss.security.auth import GlobalSlidingWindowRateLimiter
-from smartrss.security.middleware import HostAllowListMiddleware, JsonMutationGuardMiddleware
+from smartrss.security.middleware import (
+    HostAllowListMiddleware,
+    JsonMutationGuardMiddleware,
+    NoStoreResponseHeaderMiddleware,
+)
 from smartrss.security.safe_http import SSRFPolicy
 
 
@@ -72,8 +76,9 @@ def create_app(
     app.state.pair_rate_limiter = pair_rate_limiter or GlobalSlidingWindowRateLimiter()
 
     # Middleware registration (LAST added runs FIRST on incoming requests):
-    # Execution order: HostAllowList -> CORS -> JsonMutationGuard -> Router
+    # Execution order: HostAllowList -> CORS -> NoStoreResponseHeader -> JsonMutationGuard -> Router
     app.add_middleware(JsonMutationGuardMiddleware)
+    app.add_middleware(NoStoreResponseHeaderMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_allow_origins,

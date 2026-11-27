@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Idempotent installer, updater, and rollback script for the SmartRSS localhost runner (U-18, 1c §4.3).
 # Usage:
-#   scripts/install-client.sh                   # Build frontend/dist locally with npm ci && npm run build
-#   scripts/install-client.sh --from-dist DIR   # Install from an existing pre-built dist directory
-#   scripts/install-client.sh --from-docker     # Extract /usr/share/nginx/html from built smartrss web image
-#   scripts/install-client.sh --rollback        # Swap dist.prev back to dist and restart runner
+#   scripts/install-client.sh [--api-origin URL]                   # Build frontend/dist locally with npm ci && npm run build
+#   scripts/install-client.sh --from-dist DIR [--api-origin URL]   # Install from an existing pre-built dist directory
+#   scripts/install-client.sh --from-docker [--api-origin URL]     # Extract /usr/share/nginx/html from built smartrss web image
+#   scripts/install-client.sh --rollback                           # Swap dist.prev back to dist and restart runner
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,6 +15,7 @@ APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 
 SOURCE_MODE="local"
 FROM_DIST=""
+API_ORIGIN=""
 DO_ROLLBACK=0
 
 while [[ $# -gt 0 ]]; do
@@ -26,6 +27,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --from-docker)
       SOURCE_MODE="docker"
+      shift
+      ;;
+    --api-origin)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --api-origin requires a URL argument (e.g. http://smartrss.lan:8080)" >&2
+        exit 2
+      fi
+      API_ORIGIN="$2"
+      shift 2
+      ;;
+    --api-origin=*)
+      API_ORIGIN="${1#--api-origin=}"
+      if [[ -z "$API_ORIGIN" ]]; then
+        echo "ERROR: --api-origin requires a URL argument (e.g. http://smartrss.lan:8080)" >&2
+        exit 2
+      fi
       shift
       ;;
     --rollback)
@@ -63,6 +80,18 @@ if [[ "$SOURCE_MODE" == "local" ]]; then
   "$REPO_ROOT/scripts/check-prereqs.sh" --mode client
 else
   "$REPO_ROOT/scripts/check-prereqs.sh" --mode client --no-node-build
+fi
+
+NORMALIZED_API_ORIGIN=""
+if [[ -n "$API_ORIGIN" ]]; then
+  if ! NORMALIZED_API_ORIGIN="$(
+    PYTHONPATH="$REPO_ROOT/client-runner" python3 -c \
+      'import sys; from smartrss_client_runner import validate_api_origin; print(validate_api_origin(sys.argv[1]))' \
+      "$API_ORIGIN"
+  )"; then
+    echo "ERROR: Invalid --api-origin value: '$API_ORIGIN'" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "$SHARE_DIR" "$CONFIG_DIR" "$SYSTEMD_DIR" "$APPS_DIR"
@@ -109,9 +138,30 @@ install -m 0755 "$REPO_ROOT/client-runner/smartrss_client_runner.py" "$SHARE_DIR
 
 if [[ ! -f "$CONFIG_DIR/config.env" ]]; then
   install -m 0644 "$REPO_ROOT/deploy/systemd/smartrss-client.env.example" "$CONFIG_DIR/config.env"
-  echo "Created $CONFIG_DIR/config.env (edit SMARTRSS_API_ORIGIN to point to your LAN server)."
+  echo "Created $CONFIG_DIR/config.env."
 else
   echo "Preserved existing $CONFIG_DIR/config.env."
+fi
+
+if [[ -n "$NORMALIZED_API_ORIGIN" ]]; then
+  python3 -c '
+import pathlib, sys
+cfg_path = pathlib.Path(sys.argv[1])
+origin = sys.argv[2]
+lines = cfg_path.read_text(encoding="utf-8").splitlines()
+replaced = False
+out = []
+for line in lines:
+    if line.startswith("SMARTRSS_API_ORIGIN="):
+        out.append(f"SMARTRSS_API_ORIGIN={origin}")
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    out.append(f"SMARTRSS_API_ORIGIN={origin}")
+cfg_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+' "$CONFIG_DIR/config.env" "$NORMALIZED_API_ORIGIN"
+  echo "Configured SMARTRSS_API_ORIGIN=$NORMALIZED_API_ORIGIN in $CONFIG_DIR/config.env."
 fi
 
 install -m 0644 "$REPO_ROOT/deploy/systemd/smartrss-client.service" "$SYSTEMD_DIR/smartrss-client.service"

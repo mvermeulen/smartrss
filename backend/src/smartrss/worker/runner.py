@@ -71,6 +71,8 @@ SHUTDOWN_GRACE_SECONDS = 30.0
 
 @dataclass(slots=True)
 class _RunCounters:
+    feeds_polled: int = 0
+    feeds_not_modified: int = 0
     items_polled: int = 0
     items_extracted: int = 0
     jobs_failed: int = 0
@@ -83,6 +85,9 @@ class RunOnceSummary:
     run_id: str | None = None
     stages: list[str] | None = None
     duration_ms: int = 0
+    feeds_polled: int = 0
+    feeds_not_modified: int = 0
+    items_ingested: int = 0
     items_polled: int = 0
     items_extracted: int = 0
     jobs_failed: int = 0
@@ -160,6 +165,8 @@ async def execute_claimed_job(
 
     try:
         metric_status = "ok"
+        metric_outcome: str | None = None
+        http_status: int | None = None
         repoll_feed_id: uuid.UUID | None = None
         if job.job_type == "poll_feed":
             assert job.feed_id is not None
@@ -170,10 +177,16 @@ async def execute_claimed_job(
                 run_id=job.run_id,
             )
             metric_status = outcome.metric_status
+            metric_outcome = outcome.outcome
+            http_status = outcome.http_status
             if outcome.repoll_needed:
                 repoll_feed_id = job.feed_id
             if counters is not None:
                 counters.items_polled += outcome.items_ingested
+                if outcome.metric_status == "ok":
+                    counters.feeds_polled += 1
+                if outcome.outcome == "not_modified":
+                    counters.feeds_not_modified += 1
         elif job.job_type == "extract_content":
             assert job.item_id is not None
             ext_outcome = await run_extract_content(
@@ -205,6 +218,8 @@ async def execute_claimed_job(
                 queue_wait_ms=queue_wait_ms,
                 duration_ms=duration_ms,
                 metric_status=metric_status,
+                metric_outcome=metric_outcome,
+                http_status=http_status,
                 feed_id=job.feed_id,
                 item_id=job.item_id,
                 run_id=job.run_id,
@@ -508,6 +523,8 @@ async def run_worker_once(
                     session,
                     run_id=run_id,
                     status="failed",
+                    feeds_polled=counters.feeds_polled,
+                    feeds_not_modified=counters.feeds_not_modified,
                     items_polled=counters.items_polled,
                     items_extracted=counters.items_extracted,
                     jobs_failed=counters.jobs_failed,
@@ -520,6 +537,9 @@ async def run_worker_once(
                 run_id=str(run_id),
                 stages=list(job_types),
                 duration_ms=int((time.monotonic() - started) * 1000),
+                feeds_polled=counters.feeds_polled,
+                feeds_not_modified=counters.feeds_not_modified,
+                items_ingested=counters.items_polled,
                 items_polled=counters.items_polled,
                 items_extracted=counters.items_extracted,
                 jobs_failed=counters.jobs_failed,
@@ -554,6 +574,8 @@ async def run_worker_once(
                 session,
                 run_id=run_id,
                 status=final_status,
+                feeds_polled=counters.feeds_polled,
+                feeds_not_modified=counters.feeds_not_modified,
                 items_polled=counters.items_polled,
                 items_extracted=counters.items_extracted,
                 jobs_failed=counters.jobs_failed,
@@ -567,6 +589,9 @@ async def run_worker_once(
             run_id=str(run_id),
             stages=list(job_types),
             duration_ms=finalized.duration_ms or 0,
+            feeds_polled=counters.feeds_polled,
+            feeds_not_modified=counters.feeds_not_modified,
+            items_ingested=counters.items_polled,
             items_polled=counters.items_polled,
             items_extracted=counters.items_extracted,
             jobs_failed=counters.jobs_failed,

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
+import re
 import socket
 import ssl
 import time
 import zlib
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -36,6 +38,8 @@ NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 NAT64_LOCAL_USE_PREFIX = ipaddress.ip_network("64:ff9b:1::/48")
 
 DEFAULT_USER_AGENT = "SmartRSS/0.1 (+https://github.com/smartrss)"
+_FORBIDDEN_URL_CHARS = frozenset(' <>"{}|\\^`')
+_EMBEDDED_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
 
 
 class SafeHttpError(Exception):
@@ -47,7 +51,11 @@ class SSRFBlockedError(SafeHttpError):
 
 
 class SSRFConnectionError(SafeHttpError):
-    """Raised when DNS resolution or TCP connect fails for all validated IPs."""
+    """Raised when DNS resolution, TCP connect, TLS handshake, or network I/O fails."""
+
+
+class SafeHttpTimeoutError(SafeHttpError):
+    """Raised when an outbound HTTP connect, read, write, or pool operation times out."""
 
 
 class TooManyRedirectsError(SafeHttpError):
@@ -100,9 +108,11 @@ class SSRFPolicy:
         self.resolver: AsyncResolver = resolver or default_dns_resolver
 
     def validate_url(self, url: str) -> tuple[str, str, int]:
-        """Validate URL syntax, scheme, userinfo, and port. Return (scheme, host, port)."""
+        """Validate URL syntax, scheme, userinfo, port, and RFC 3986 path/query/fragment safety."""
         if not url or any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
             raise SSRFBlockedError("URL contains control characters or is empty")
+        if any(ch in _FORBIDDEN_URL_CHARS for ch in url):
+            raise SSRFBlockedError("URL contains disallowed unescaped characters")
 
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
@@ -112,6 +122,18 @@ class SSRFPolicy:
             raise SSRFBlockedError("Embedded URL credentials are forbidden")
         if not parts.hostname:
             raise SSRFBlockedError("URL is missing hostname")
+
+        # E-10: Reject unescaped '[' / ']' outside the host literal and embedded http(s)://
+        rest_parts = (parts.path, parts.query, parts.fragment)
+        if any("[" in part or "]" in part for part in rest_parts):
+            raise SSRFBlockedError("URL contains unescaped brackets outside host")
+        non_host = (
+            f"{parts.path}"
+            f"{'?' + parts.query if parts.query else ''}"
+            f"{'#' + parts.fragment if parts.fragment else ''}"
+        )
+        if _EMBEDDED_SCHEME_RE.search(non_host):
+            raise SSRFBlockedError("URL contains an embedded http(s):// scheme")
 
         try:
             port = parts.port or (443 if scheme == "https" else 80)
@@ -212,6 +234,21 @@ class SSRFPolicy:
         return ips
 
 
+@contextlib.contextmanager
+def _map_httpcore_exceptions() -> Iterator[None]:
+    """Translate raw httpcore exceptions into the SafeHttpError hierarchy (E-01)."""
+    try:
+        yield
+    except SafeHttpError:
+        raise
+    except httpcore.TimeoutException as exc:
+        raise SafeHttpTimeoutError(f"{type(exc).__name__}: {exc}") from exc
+    except (httpcore.NetworkError, httpcore.ProxyError) as exc:
+        raise SSRFConnectionError(f"{type(exc).__name__}: {exc}") from exc
+    except (httpcore.ProtocolError, httpcore.UnsupportedProtocol) as exc:
+        raise SafeHttpError(f"{type(exc).__name__}: {exc}") from exc
+
+
 class SafeNetworkBackend(httpcore.AsyncNetworkBackend):
     """httpcore AsyncNetworkBackend that validates DNS and pins the literal IP at connect_tcp()."""
 
@@ -232,7 +269,7 @@ class SafeNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Any = None,
     ) -> httpcore.AsyncNetworkStream:
         ips = await self.policy.resolve_and_validate(host, port)
-        last_exc: OSError | None = None
+        last_exc: Exception | None = None
         for ip in ips:
             try:
                 return await self.inner.connect_tcp(
@@ -242,11 +279,12 @@ class SafeNetworkBackend(httpcore.AsyncNetworkBackend):
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except OSError as exc:
+            except (OSError, httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last_exc = exc
                 continue
+        detail = f" ({type(last_exc).__name__}: {last_exc})" if last_exc is not None else ""
         raise SSRFConnectionError(
-            f"Unable to connect to any validated IP for {host!r}:{port}"
+            f"Unable to connect to any validated IP for {host!r}:{port}{detail}"
         ) from last_exc
 
     async def connect_unix_socket(
@@ -266,11 +304,13 @@ class _PinnedStream(httpx.AsyncByteStream):
         self._core_response = core_response
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        async for chunk in self._core_response.aiter_stream():
-            yield chunk
+        with _map_httpcore_exceptions():
+            async for chunk in self._core_response.aiter_stream():
+                yield chunk
 
     async def aclose(self) -> None:
-        await self._core_response.aclose()
+        with _map_httpcore_exceptions():
+            await self._core_response.aclose()
 
 
 class SafeTransport(httpx.AsyncBaseTransport):
@@ -303,7 +343,8 @@ class SafeTransport(httpx.AsyncBaseTransport):
             headers=request.headers.raw,
             extensions=request.extensions,
         )
-        core_resp = await self._pool.handle_async_request(core_req)
+        with _map_httpcore_exceptions():
+            core_resp = await self._pool.handle_async_request(core_req)
         return httpx.Response(
             status_code=core_resp.status,
             headers=core_resp.headers,
@@ -313,7 +354,8 @@ class SafeTransport(httpx.AsyncBaseTransport):
         )
 
     async def aclose(self) -> None:
-        await self._pool.aclose()
+        with _map_httpcore_exceptions():
+            await self._pool.aclose()
 
 
 @dataclass(frozen=True, slots=True)

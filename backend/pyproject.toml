@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "smartrss"
 version = "0.1.0"
 description = "SmartRSS self-hosted single-user RSS reader backend"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "alembic>=1.14.0,<2.0",
     "defusedxml>=0.7.1,<1.0",

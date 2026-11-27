@@ -2,7 +2,7 @@
 
 Self-hosted, single-user, LAN-first RSS reader with an SSRF-hardened backend, commit-ordered sync engine + PostgreSQL FTS search, and a local-first Ubuntu SPA with Service Worker offline reload survival.
 
-> **Current Implementation:** Milestones `1a`–`1b` (`Approved`) and `1c` (`In Implementation Review`) — Backend Foundation & Extraction ([`1a`](docs/design/1a-backend-ingestion-and-security.md)), Sync Engine & Search ([`1b`](docs/design/1b-sync-protocol-and-search.md)), and Local-First Ubuntu Reader UI, Detached Offline Shell & System Health ([`1c`](docs/design/1c-client-ui-and-offline-shell.md)).
+> **Current Implementation:** Milestones `1a`–`1c` (`Implemented & Approved`) — Backend Foundation & Extraction ([`1a`](docs/design/1a-backend-ingestion-and-security.md)), Sync Engine & Search ([`1b`](docs/design/1b-sync-protocol-and-search.md)), and Local-First Ubuntu Reader UI, Detached Offline Shell & System Health ([`1c`](docs/design/1c-client-ui-and-offline-shell.md)).
 
 ## Quickstart (Docker Compose)
 
@@ -39,10 +39,22 @@ Self-hosted, single-user, LAN-first RSS reader with an SSRF-hardened backend, co
 SmartRSS supports two mutually exclusive worker modes (`WORKER_MODE=daemon` or `WORKER_MODE=cron`):
 
 - **Daemon mode (default)**: Keep `WORKER_MODE=daemon` and `COMPOSE_PROFILES=daemon` in `.env`. Docker Compose runs the `worker` container continuously.
-- **External cron mode**: Set `WORKER_MODE=cron` and `COMPOSE_PROFILES=` (empty) in `.env` so `docker compose up` does not start the daemon container. Invoke batches from host `cron` or a `systemd` timer:
-  ```bash
-  docker compose run --rm worker smartrss worker run-once --stage all --json
+- **External cron mode**: Set `WORKER_MODE=cron` and `COMPOSE_PROFILES=` (empty) in `.env` so `docker compose up` does not start the daemon container. Invoke batches from host `cron` (with `-T` for non-TTY execution, `flock -n` to avoid stacked containers, and `--max-duration` shorter than the cron cadence):
+  ```cron
+  */15 * * * * cd /path/to/smartrss && /usr/bin/flock -n ~/.local/state/smartrss/worker.lock /usr/bin/docker compose run --rm -T worker smartrss worker run-once --stage all --max-duration 840 --json >> ~/.local/state/smartrss/worker.log 2>&1
   ```
+  - Note: `--json` leaves Python logging unconfigured so stdout stays machine-readable JSON; any unexpected stderr warnings or tracebacks will interleave when redirecting `2>&1` (redirect stderr to a separate file if parsing `worker.log` strictly as JSONL).
+  - Rotate `worker.log` via `logrotate` (or invoke the command from a `systemd` timer so output is rotated automatically by `journald`):
+    ```text
+    /home/<user>/.local/state/smartrss/worker.log {
+        weekly
+        rotate 8
+        compress
+        missingok
+        notifempty
+        copytruncate
+    }
+    ```
 
 ## Settings CLI (`1a`)
 
@@ -108,7 +120,7 @@ For full detached offline reading, Service Worker reload survival, and `navigato
    ```bash
    make install-client INSTALL_CLIENT_ARGS="--api-origin http://<server-lan-ip>:8080"
    ```
-   - Installs into `~/.local/share/smartrss-client/` (with atomic symlink switch + previous-release backup for rollback), `~/.config/smartrss-client/config.env`, `~/.config/systemd/user/smartrss-client.service`, and `~/.local/share/applications/smartrss.desktop`.
+   - Installs into `~/.local/share/smartrss/` (using an atomic `mv` directory swap preserving `dist.prev` for rollback), `~/.config/smartrss-client/config.env`, `~/.config/systemd/user/smartrss-client.service`, and `~/.local/share/applications/smartrss.desktop`.
    - Ensure the server's `.env` includes `<server-lan-ip>:8080` in `ALLOWED_HOSTS` and `http://localhost:4180` in `CORS_ALLOW_ORIGINS`.
 2. **Open the app** at `http://localhost:4180` (or launch **SmartRSS** from your desktop app menu) and paste a one-time pairing code generated via `smartrss pair create` or from another paired device's **Settings & Devices** tab.
 3. **Rollback** to the previous client build if needed:
@@ -119,7 +131,7 @@ For full detached offline reading, Service Worker reload survival, and `navigato
 
 ## Local Development & Verification
 
-Requires Python 3.12+, `uv`, Node.js 20+ / npm (or `FRONTEND_RUNTIME=docker`), and Docker (for `db-test` and Nginx `web` E2E):
+Requires Python 3.12+ (for the backend test suite, `uv` automatically provisions Python 3.12 per `backend/.python-version`), `uv`, Node.js 22+ / npm (or `FRONTEND_RUNTIME=docker`), and Docker with daemon access (for `db-test` and Nginx `web` E2E):
 ```bash
 make check               # prereqs + backend ruff/mypy/pytest/90% critical gate + runner-test (>=90%) + frontend lint/typecheck/vitest/90%&80% gates
 make test-unit           # fast backend unit & boundary tests (no DB needed)

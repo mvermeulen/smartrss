@@ -71,6 +71,11 @@ check_docker() {
     if ! docker compose version >/dev/null 2>&1; then
       echo "ERROR: 'docker compose' plugin is missing. Install: sudo apt install docker-compose-plugin" >&2
       MISSING=1
+    elif ! docker info >/dev/null 2>&1; then
+      echo "ERROR: Cannot connect to the Docker daemon ('docker info' failed)." >&2
+      echo "  Add yourself to the docker group: sudo usermod -aG docker \$USER" >&2
+      echo "  Then log out and back in (or run: sudo apt install util-linux-extra && newgrp docker)." >&2
+      MISSING=1
     fi
   fi
 }

@@ -191,6 +191,8 @@ class PipelineRunResponse(BaseModel):
     started_at: datetime
     finished_at: datetime | None
     duration_ms: int | None
+    feeds_polled: int = 0
+    feeds_not_modified: int = 0
     items_polled: int
     items_extracted: int
     items_clustered: int

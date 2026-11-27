@@ -5,7 +5,7 @@
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `E-`
-- **Status**: `Open` — soak test complete; findings `E-01`–`E-13` are ready for the implementer
+- **Status**: `Addressed (2026-11-27) — awaiting verification`
 
 ## Review outcome
 
@@ -358,7 +358,74 @@ The line used for this test is:
 
 ## Resolutions
 
-*(To be filled in by the implementer.)*
+*(Addressed 2026-11-27 on `review/1a-1c-user-test`; awaiting Claude Code verification pass.)*
+
+- **E-01** — Fixed.
+  - `SafeNetworkBackend.connect_tcp` (`backend/src/smartrss/security/safe_http.py:263-288`) now catches `(OSError, httpcore.ConnectError, httpcore.ConnectTimeout)` per IP so failover works with real `httpcore.AnyIOBackend`, and includes the last exception class/detail in the final `SSRFConnectionError` (chained via `from last_exc`).
+  - Added `SafeHttpTimeoutError` (`safe_http.py:57-58`) and `_map_httpcore_exceptions()` (`safe_http.py:237-249`) applied across `SafeTransport.handle_async_request` (`safe_http.py:345-346`), `SafeTransport.aclose` (`safe_http.py:356-357`), `_PinnedStream.__aiter__` (`safe_http.py:306-308`), and `_PinnedStream.aclose` (`safe_http.py:311-312`) so raw `httpcore` errors never escape `SafeHttpClient.fetch()`.
+  - Updated `run_extract_content` (`backend/src/smartrss/worker/stages/extract_content.py:176-177`) to catch `SafeHttpError` (after permanent-fallback subclasses) so `SafeHttpTimeoutError`, `SSRFConnectionError`, and protocol errors all raise `TransientExtractionError` instead of reaching the worker catch-all.
+  - Also fixed `backend/alembic/env.py:17` (`disable_existing_loggers=False`) so Alembic migrations during tests do not silently disable `smartrss.*` loggers.
+  - Added checklist row `T7` in `docs/review-checklist.md` and updated `docs/design/1a-backend-ingestion-and-security.md` §7.1.
+  - Tests:
+    - `test_e01_connect_tcp_failover_httpcore_errors_and_real_anyio` (`backend/tests/boundary/test_safe_http_boundary.py`) — fake inner backend raising `httpcore.ConnectError`/`ConnectTimeout` plus real `httpcore.AnyIOBackend` failing over from refused `[::1]` to listening `127.0.0.1`.
+    - `test_e01_all_ips_fail_with_httpcore_errors_raises_ssrf_connection_error` (`backend/tests/boundary/test_safe_http_boundary.py`) — all-IPs-fail with real `httpcore` exceptions and real `AnyIOBackend` against a closed port.
+    - `test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions` (`backend/tests/boundary/test_safe_http_boundary.py`) — TLS `start_tls` `ConnectError`, header `ReadTimeout`, `RemoteProtocolError`, mid-body `ReadTimeout` in `_PinnedStream.__aiter__`, and `ReadError` in `_PinnedStream.aclose`.
+    - `test_e01_poll_feed_and_extract_content_typed_paths_on_httpcore_errors` (`backend/tests/integration/test_user_test_regressions.py`) — asserts zero `Unhandled error` logs across `poll_feed` (TLS `ConnectError`, `ConnectTimeout`) and `extract_content` (`ConnectError`, body `ReadTimeout`).
+  - Evidence (each path reverted individually):
+    - Reverted `connect_tcp` catch to `except OSError`: `test_e01_connect_tcp_failover_httpcore_errors_and_real_anyio` & `test_e01_all_ips_fail_with_httpcore_errors_raises_ssrf_connection_error` failed (`httpcore.ConnectError: All connection attempts failed`); restored, passed.
+    - Reverted `SafeTransport.handle_async_request` `_map_httpcore_exceptions()`: `test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions` & `test_e01_poll_feed_and_extract_content_typed_paths_on_httpcore_errors` failed (`httpcore.ConnectError: TLS handshake failed`); restored, passed.
+    - Reverted `_PinnedStream.__aiter__` `_map_httpcore_exceptions()`: `test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions` & `test_e01_poll_feed_and_extract_content_typed_paths_on_httpcore_errors` failed (`httpcore.ReadTimeout: body timeout`); restored, passed.
+    - Reverted `_PinnedStream.aclose` `_map_httpcore_exceptions()`: `test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions` failed (`httpcore.ReadError: close error`); restored, passed.
+    - Reverted `extract_content.py` catch from `SafeHttpError` to `SSRFConnectionError`: `test_e01_poll_feed_and_extract_content_typed_paths_on_httpcore_errors` failed (`Unexpected runner.logger.exception calls: ['Unhandled error in job 4 (extract_content)']`); restored, passed.
+    - All fixed lines in `safe_http.py` (92.32%) and `extract_content.py` (90%) are covered.
+
+- **E-02** — Fixed. Added `backend/.python-version` (`3.12`), bounded `requires-python = ">=3.12,<3.14"` in `backend/pyproject.toml:9` (verified `uv --directory backend lock --check` passes), and documented in `README.md` that `uv` provisions Python 3.12 automatically.
+  - Test: `test_e02_python_version_pin_present` (`backend/tests/unit/test_user_test_ops.py`).
+  - Evidence: temporarily removed `backend/.python-version` → failed (`assert False`); reverted `requires-python` in `pyproject.toml` → failed (`assert 'requires-python = ">=3.12,<3.14"' in pyproject`); restored, passed.
+
+- **E-03** — Fixed. Added `docker info >/dev/null 2>&1` check to `check_docker()` in `scripts/check-prereqs.sh:74-79` with actionable `usermod -aG docker` / `util-linux-extra && newgrp docker` hints.
+  - Test: `test_e03_check_prereqs_rejects_inaccessible_docker_daemon` (`backend/tests/unit/test_user_test_ops.py`).
+  - Evidence: disabled `elif ! docker info` branch → test failed (`assert 0 == 1`); restored, passed.
+
+- **E-04** — Fixed. Implemented `--api-origin URL` / `--api-origin=URL` in `scripts/install-client.sh:32-47,85-95,146-165` (validated via `smartrss_client_runner.validate_api_origin`, updating `SMARTRSS_API_ORIGIN` in `config.env` in place without clobbering on invalid input). Synced `README.md:5,123,134` (`1a`–`1c` `Implemented & Approved`, `~/.local/share/smartrss/` with `mv` directory swap, Node.js 22+).
+  - Test: `test_e04_install_client_api_origin_flag` (`backend/tests/unit/test_user_test_ops.py`).
+  - Evidence: disabled `--api-origin` case in `install-client.sh` → test failed (`Unknown option: --api-origin`); restored, passed.
+
+- **E-05** — Fixed. Updated `README.md` "Worker Execution Modes" with the complete crontab line (`flock -n`, `docker compose run --rm -T`, `--max-duration 840`, `--json`, log redirect), a note on `--json` stderr interleaving, and a `logrotate` stanza (or `systemd` timer / `journald` alternative).
+
+- **E-06** — Fixed (together with `E-08`). Added `feeds_polled` and `feeds_not_modified` columns to `pipeline_runs` (`backend/alembic/versions/0003_user_test_metrics_and_canon.py`, `backend/src/smartrss/db/models.py:240-241`, `backend/src/smartrss/api/schemas.py:194-195`), populated in `worker/runner.py:183-189,574-592` and `jobs/metrics.py:73-88`. Added `items_ingested` alongside backwards-compatible `items_polled` on `RunOnceSummary`, updated CLI text summary (`backend/src/smartrss/cli.py:220-222`), updated System Health UI (`frontend/src/components/health/SystemHealthView.tsx`, `frontend/src/types/api.ts`), and documented all fields in `docs/data-model.md`, `docs/design/1a-backend-ingestion-and-security.md`, and `docs/design/1c-client-ui-and-offline-shell.md`.
+  - Tests: `test_e08_e06_304_outcome_metrics_rollup_and_run_once_counters` (`backend/tests/integration/test_user_test_regressions.py`), `test_e06_e12_cli_text_summary_and_recanonicalize` (`backend/tests/unit/test_user_test_ops.py`).
+  - Evidence: disabled `counters.feeds_polled += 1` in `runner.py` → `test_e08_e06_...` failed (`assert 0 == 2`); reverted `cli.py` text summary → `test_e06_e12_cli_...` failed (`assert 'feeds_polled=3' in ...`); restored, passed. Fixed lines covered.
+
+- **E-07** — Fixed. Added `NoStoreResponseHeaderMiddleware` (`backend/src/smartrss/security/middleware.py:35-56`, registered in `backend/src/smartrss/api/app.py:81`) so all API responses send `Cache-Control: no-store` (preserving any route-specific `Cache-Control`), and dropped request-side `cache: "no-store"` on authenticated JSON calls in `frontend/src/api/client.ts:196-205` (keeping `cache: "no-store"` on `/client-config.json` and reachability probes) so browsers can reuse the `Access-Control-Max-Age: 600` CORS preflight cache. Updated `docs/design/1c-client-ui-and-offline-shell.md`.
+  - Tests: `test_e07_api_responses_include_cache_control_no_store` (`backend/tests/integration/test_user_test_regressions.py`), `test_e07_no_store_middleware_preserves_existing_header_and_non_http_scope` (`backend/tests/unit/test_user_test_ops.py`), `test_e07_api_client_omits_request_cache_no_store_while_config_keeps_it` (`frontend/src/test/unit/review_regressions.test.ts`).
+  - Evidence: removed `NoStoreResponseHeaderMiddleware` from `app.py` → backend test failed (`assert None == 'no-store'`); re-added `cache: "no-store"` in `frontend/src/api/client.ts` → vitest test failed; restored, passed. All middleware lines covered (`middleware.py` 92.66%).
+
+- **E-08** — Fixed (owner-requested). Updated `docs/data-model.md` §4.9, `docs/design/1a-backend-ingestion-and-security.md`, and `docs/design/1c-client-ui-and-offline-shell.md`. Added Alembic migration `0003_user_test_metrics_canon` (`backend/alembic/versions/0003_user_test_metrics_and_canon.py`) adding nullable `stage_metrics.outcome TEXT CHECK (outcome IN ('fetched', 'not_modified'))` and `stage_metrics.http_status SMALLINT NULL` (plus `pipeline_runs.feeds_polled` / `feeds_not_modified`). Updated `poll_feed.py` (`outcome="not_modified"`, `http_status=304` while keeping `status="ok"`; `outcome="fetched"`, `http_status=2xx` on full fetch; `http_status` on HTTP error branches), `jobs/queue.py` (`complete_job`), `jobs/metrics.py` (`not_modified_count` in SQL rollup while `ok_count` still includes 304s), and `SystemHealthView.tsx`.
+  - Tests: `test_e08_e06_304_outcome_metrics_rollup_and_run_once_counters` and `test_e08_e12_migration_0003_upgrade_downgrade_on_populated_db` (`backend/tests/integration/test_user_test_regressions.py`).
+  - Evidence: reverted `poll_feed.py` 304 `outcome`/`http_status` → failed (`assert 0 == 1`); reverted `metrics.py` `not_modified_count` SQL → failed (`assert 0 == 1`); restored, passed. Migration 0003 upgrade, check constraint enforcement, and downgrade on populated 0002 DB verified. Fixed lines covered.
+
+- **E-09** — Deferred → future milestone (requires a new requirement such as `NFR-OPS-02` and a component design before implementation, per review and `AGENTS.md`). → *Owner decision needed on which milestone carries `E-09` (e.g., alongside `1d`).*
+
+- **E-10** — Fixed. Extended shared `SSRFPolicy.validate_url()` (`backend/src/smartrss/security/safe_http.py:41-42,110-137`) to reject unescaped RFC 3986-disallowed characters (space, `<>"{}|\^\``), unescaped `[`/`]` outside IPv6 host literals, and embedded `http(s)://` schemes in path/query/fragment — enforced uniformly across `POST /api/v1/feeds`, `PATCH /api/v1/feeds/{id}`, `POST /api/v1/feeds/import-opml`, and `SafeHttpClient.fetch()`. Added optional UI paste cleanup helper `cleanPastedFeedUrl` (`frontend/src/components/feeds/feedUrlInput.ts`, wired into add/edit inputs in `FeedManagerView.tsx`) for well-formed `[label](url)` and `<url>` pastes while leaving malformed partial pastes untouched for server `422` rejection. Updated `docs/design/1a-backend-ingestion-and-security.md` §7.2.
+  - Tests: `test_e10_validate_url_rejects_markdown_and_rfc3986_disallowed_chars` & `test_e10_validate_url_accepts_percent_encoded_and_ipv6_hosts` (`backend/tests/unit/test_ssrf_policy.py`), `test_e10_feed_url_validation_all_three_paths` (`backend/tests/integration/test_user_test_regressions.py`), `test_e10_clean_pasted_feed_url_extracts_markdown_and_angle_brackets` (`frontend/src/test/unit/review_regressions.test.ts`).
+  - Evidence: reverted bracket/embedded-scheme checks in `safe_http.py` → unit and all-3-paths API tests failed (`DID NOT RAISE SSRFBlockedError`); reverted `_FORBIDDEN_URL_CHARS` check → unit tests failed; disabled Markdown extraction in `feedUrlInput.ts` → vitest failed; restored, passed. Fixed lines covered.
+
+- **E-11** — Deferred → alongside `E-09` / `1d` (owner amended finding: interactive **Export OPML** button in **Feeds & OPML** is sufficient; optional headless `smartrss feeds export-opml` CLI and backup OPML copy are best grouped with `E-09` ops/CLI work).
+
+- **E-12** — Fixed. Added explicit AT Internet / Piano Analytics parameter names (`at_medium`, `at_campaign`, `at_campaign_type`, `at_custom1`–`at_custom4`, `at_format`, `at_link`, `at_link_id`, `at_link_type`, `at_link_origin`, `at_ptr_name`, `at_bbc_team`, `at_creation`, `at_variant` — explicit names only, never bare `at_`) to `TRACKING_PARAM_NAMES` (`backend/src/smartrss/domain/url_canon.py:34-51`). Added `backend/src/smartrss/db/recanonicalize.py`, CLI command `smartrss db recanonicalize` (`backend/src/smartrss/cli.py:393-409`), and automatic batch re-canonicalization in migration `0003` (`backend/alembic/versions/0003_user_test_metrics_and_canon.py:59-145`) emitting `item` `upsert`s into `sync_changes` under the serialized `sync_state` lock. Documented strip-list scope in `docs/data-model.md` and `smartrss db recanonicalize` in `docs/design/1a-backend-ingestion-and-security.md`.
+  - Tests: `test_e12_canonicalize_strips_bbc_at_tracking_params_and_preserves_other_at_params` (`backend/tests/unit/test_url_canon.py`), `test_e12_compute_updated_canonical_url_fallbacks` & `test_e06_e12_cli_text_summary_and_recanonicalize` (`backend/tests/unit/test_user_test_ops.py`), `test_e12_recanonicalize_and_poll_feed_guid_rotation_matches` & `test_e08_e12_migration_0003_upgrade_downgrade_on_populated_db` (`backend/tests/integration/test_user_test_regressions.py`).
+  - Evidence: removed `at_medium`/`at_campaign` from `url_canon.py` → unit and integration tests failed (`bbc.com/...?at_campaign=rss&at_medium=RSS` not stripped); disabled data step in migration `0003` → migration test failed; disabled `compute_updated_canonical_url` call in `recanonicalize_all_items` → `test_e12_recanonicalize_...` failed (`assert 0 == 1`); restored, passed. `url_canon.py` (100%) and `recanonicalize.py` (100%) covered.
+
+- **E-13** — Fixed. Added shared `x-logging: &default-logging` (`driver: json-file`, `max-size: "10m"`, `max-file: "3"`) to every service in `docker-compose.yml` (`db`, `api`, `worker`, `web`, `db-test`), relaxed `api` healthcheck interval from `10s` to `30s` (with `start_period: 10s`), added `HealthCheckAccessFilter` (`backend/src/smartrss/logging.py:58-82`) attached idempotently to `uvicorn.access` in `configure_logging()` to drop `GET /api/v1/health` probe lines while keeping `/api/v1/system/health` and all other routes, and documented `logrotate` for `worker.log` in `README.md`.
+  - Tests: `test_e13_healthcheck_access_log_filter` and `test_e13_compose_services_have_bounded_logging` (`backend/tests/unit/test_user_test_ops.py`).
+  - Evidence: bypassed `HealthCheckAccessFilter.filter()` (`return True`) → `test_e13_healthcheck_access_log_filter` failed (`assert True is False`); removed `logging: *default-logging` from `api` in `docker-compose.yml` → `test_e13_compose_services_have_bounded_logging` failed (`Service 'api' missing logging block`); restored, passed. All fixed lines in `logging.py` (96%) covered.
+
+### Verification summary (`make check`)
+
+- Backend: `ruff check` + `ruff format --check` clean; `mypy src` clean (54 source files); **200 passed**, **91.78%** total branch coverage; all 16 critical core modules **>= 90%** (`safe_http.py` 92.32%, `middleware.py` 92.66%, `url_canon.py` 100.00%, `poll_feed.py` 91.98%, `queue.py` 95.12%).
+- Client runner: **32 passed**, **94.87%** branch coverage (>= 90% gate).
+- Frontend: `eslint` + `prettier --check` clean; `tsc --noEmit` clean; **57 passed** across 6 test files, **93.13%** total line coverage; all critical (>= 90%) and core (>= 80%) coverage gates passed.
 
 ## Accepted residual risks
 

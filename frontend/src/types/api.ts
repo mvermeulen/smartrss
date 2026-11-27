@@ -176,6 +176,8 @@ export interface PipelineRunResponse {
   started_at: string;
   finished_at: string | null;
   duration_ms: number | null;
+  feeds_polled?: number;
+  feeds_not_modified?: number;
   items_polled: number;
   items_extracted: number;
   items_clustered: number;
@@ -223,6 +225,7 @@ export interface StageMetricRow {
   job_type: string;
   total_count: number;
   ok_count: number;
+  not_modified_count?: number;
   failed_count: number;
   skipped_count: number;
   failure_rate: number;
