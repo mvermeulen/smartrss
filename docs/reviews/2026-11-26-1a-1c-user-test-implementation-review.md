@@ -1,11 +1,11 @@
 # User-Test Review — Milestones `1a`–`1c` on a Live Deployment
 
-- **Date**: 2026-11-26 (opened 02:40 MST; soak check-ins 03:51 and 07:39 MST; observation still in progress)
+- **Date**: 2026-11-26 (opened 02:40 MST; soak check-ins 03:51 and 07:39 MST); soak closed 2026-11-27 13:58 MST after a 30 h unattended run (about 35.5 h in total), followed by the backup and restore drill
 - **Scope**: `main` at `87bba29` (Merge PR #2, `milestone/1c`), deployed with `make up` / `make migrate` on a single Ubuntu 26.04 host. Five live feeds, worker in `WORKER_MODE=cron` driven by a host crontab every 15 minutes, a UI paired through the localhost runner (`make install-client`, `http://localhost:4180`), and the LAN `web` container (`http://localhost:8080`). This covers the running system, the setup scripts and README, and the SSRF HTTP stack. It is not a full code re-review.
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `E-`
-- **Status**: `Open` — more findings may be appended as the soak test continues (see §4)
+- **Status**: `Open` — soak test complete; findings `E-01`–`E-13` are ready for the implementer
 
 ## Review outcome
 
@@ -29,19 +29,35 @@ The findings so far:
 - **owner feedback** asking for a one-command first-time server setup (`E-09`). This is future design work and doesn't block `1c`;
 - feed URL validation that accepted a pasted Markdown link (`E-10`), caught live;
 - **owner feedback** on feed-list export (`E-11`, amended by the owner): the UI export is fine. Only optional gaps remain: a headless CLI export and an OPML copy alongside backups.
+- URL canonicalization that keeps BBC's `at_medium` / `at_campaign` tracking parameters (`E-12`). This undermines `1e` exact canonical-URL deduplication;
+- unbounded container and worker logs, with the `api` log almost entirely healthcheck lines (`E-13`).
 
 **Soak check-in (03:51, about 95 minutes in):** six cron runs at 15-minute intervals, all exiting `0` or `2` (`partial`). Every feed was re-polled within one cron tick of its `next_fetch_at`. One Hacker News poll failed live through the `E-01` path, was retried, and succeeded on the next run. All feeds are `healthy` with `consecutive_errors = 0`. No duplicate items by `(feed_id, guid)` or `canonical_url`. 0 dead-lettered jobs. The API logged no 5xx responses or tracebacks across 71 pulls, 53 pushes, and the System Health / Settings views.
 
 **Soak check-in 2 (07:39, about 5 h 10 min in, 10 feeds):** 21 cron runs: 19 `completed`, 2 `partial`. Both partial runs were Hacker News polls failing through the `E-01` unhandled path (03:30 `ConnectError` at TLS, 05:15 `ConnectTimeout`), and both recovered on retry. All 10 feeds are `healthy` with `consecutive_errors = 0`. 0 duplicates by `(feed_id, guid)`, `canonical_url`, or `(feed_id, content_hash)`. 0 non-`done` jobs and 0 dead letters. API: 350 pulls, 101 pushes, 5 feed creates, 2 PATCHes, 2 OPML exports and 1 search, with 0 5xx responses and 0 tracebacks. The client cursor (`since_seq=1390`) equals `sync_state.current_seq`. Poll latency p50 is 185–750 ms for every feed except Hacker News (p50 8.9 s, max 10.1 s, 2 of 7 failed). Diagnosis in the `api` container: `hnrss.org` has a single A record (TCP connect 58 ms), and a cold fetch took 2.6 s against about 0.1 s warm, so the publisher is slow to generate the feed. These are genuine transient failures, not a failover case, but they show how often `E-01`'s misclassification happens in practice: 2 of the 2 poll failures seen so far.
 
-**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-05`–`E-07` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`. `E-09` needs a requirement and a component design first; the owner should choose which milestone carries it.
+**Final soak report — 30 h unattended (2026-11-26 07:45 → 2026-11-27 13:45 MST, 10 feeds, Hacker News unsubscribed at 07:34):**
+
+- **Cron and worker.** 122 cron runs, every one `completed` with exit `0`. No 15-minute slot was missed: the gap between consecutive `pipeline_runs` was never over 16 min after the first half hour. Over the whole soak there were 142 logged runs, 140 `completed` and 2 `partial`. Both partials came before the unattended window: the two Hacker News polls under `E-01`, which succeeded on retry. The median run took 0.66 s, and only the Hugging Face backfill run was long (61 s). `jobs` holds 609 rows, all `done`, with 0 dead letters, 0 reaped leases and 0 rows still carrying `last_error`.
+- **Polling.** Each active feed was polled 26–28 times in the 30 h. All 10 are `healthy` with `consecutive_errors = 0`, and none recorded an error the whole time. The cadence is slightly below one per hour; see §3a ("cron quantization").
+- **Unsubscribe.** Hacker News has had no `poll_feed` job since 07:15, the last poll before the 07:34 unsubscribe. Its stale `next_fetch_at` (11-26 08:11) was ignored as intended, and its 25 items were kept.
+- **Ingestion and updates.** 38 new items arrived in the last 24 h, 1,164 items in total. The update path worked on live data: 10 BBC items were updated in place, and 9 BBC GUID revisions (`…#0` → `#1`/`#2`/`#3`, and one `#1` → `#0`) were matched to their existing rows by the guarded `N-01` canonical-URL fallback. There were 0 duplicates by `(feed_id, guid)`, but one BBC video was stored twice under GUID fragments `#0` and `#2`. That residual is consistent with the guarded design (§3a). Separately, every BBC `canonical_url` still carries tracking parameters (`E-12`). Extraction: 164 items `ok`. One LWN subscriber-only article (`[$]`) fell back to `fallback_rss`, as intended.
+- **Expiration and retention.** `expire_items` ran in all 144 runs, and none of them had anything to expire, because the oldest unread items are 1.5 days old against the 30-day expiration window. `retention_cleanup` ran once per day, at 11-26 02:16 and 11-27 02:30.
+- **Sync.** `sync_state.current_seq = 1511` with an unchanged `instance_epoch`. The `sync_mutations` outcomes are 102 `item_set_state`, 4 `item_mark_bulk_read`, 3 `item_set_starred` and 1 `feed_set_field`, all `applied`, with 0 `superseded` or `rejected`. The UI was mostly closed during the unattended window: 13 pulls and 10 pushes, all `200`. The device `Ubuntu Test` was last seen at 13:58.
+- **API and containers.** No 5xx responses and no tracebacks in the `api` or `web` logs. `db` and `api` reported `healthy` throughout, and all three containers have been up for 36 h with no restarts. 10,589 of the roughly 10,640 `api` log lines are the container's own `/health` probe (`E-13`).
+- **Backup and restore.** Both passed against the live data (§4).
+- **Resources.** The database dump is 2.6 MB, `worker.log` is 58 KB, and 3.4 TB of disk is free.
+
+The soak found nothing new at Major or Blocker severity. `E-01` remains the only Major, and it showed up as 2 of the 2 live poll failures (3 occurrences including the first manual run). The unattended window added `E-12` (Minor) and `E-13` (Nit).
+
+**Recommendation:** fix `E-01` with regression tests that use the real `httpcore` backend's exception types. `E-02`–`E-04` are small script and doc fixes and should go in the same pass. `E-12` should land before `1e` relies on canonical URLs for exact deduplication, and it needs a re-canonicalization step for existing rows. `E-05`–`E-07` and `E-13` are optional. `E-08` needs the `data-model.md` §4.9 update before code; it can share a pass with `E-06`. `E-09` needs a requirement and a component design first; the owner should choose which milestone carries it.
 
 | Severity | Findings |
 | :--- | :--- |
 | Blocker | — |
 | Major | `E-01` |
-| Minor | `E-02`, `E-03`, `E-04`, `E-10`, `E-08` (owner-requested), `E-09` (owner-requested, future design) |
-| Nit | `E-05`, `E-06`, `E-07`, `E-11` (owner feedback, amended) |
+| Minor | `E-02`, `E-03`, `E-04`, `E-10`, `E-12`, `E-08` (owner-requested), `E-09` (owner-requested, future design) |
+| Nit | `E-05`, `E-06`, `E-07`, `E-13`, `E-11` (owner feedback, amended) |
 
 ---
 
@@ -154,6 +170,23 @@ The owner noticed it and corrected it with a `PATCH` at 04:29:56 (`field_updated
 - Apply the same check on all three paths (create, PATCH, OPML import) and keep it shared with `SSRFPolicy.validate_url` so they can't drift apart.
 - **Regression tests:** an API test for each path where the exact soak string gets `422`; a positive test for valid percent-encoded paths (`%5D`) and query strings; and a frontend test for the paste clean-up if it's added.
 
+
+### E-12 — URL canonicalization keeps BBC's `at_medium` / `at_campaign` tracking parameters
+
+**Where:** `backend/src/smartrss/domain/url_canon.py:9-35` (`TRACKING_PARAM_PREFIXES` = `utm_`, `mtm_`, `pk_` plus a fixed name list); used by `poll_feed` for `items.canonical_url`.
+
+**What happens:** BBC appends AT Internet / Piano Analytics campaign tags to every item link (`…/news/articles/c3pw4yrr8kz9o?at_medium=RSS&at_campaign=rss`). Neither parameter is on the strip list, so **all 70 BBC `canonical_url` values** keep them (sorted to `?at_campaign=rss&at_medium=RSS`). Two consequences:
+
+- `1e` exact canonical-URL deduplication (`FR-LLM-03`, using the `ix_items_canonical_url` index from `1a`) won't match a BBC story against the same article linked from another feed or aggregator without the tags. BBC is one of the largest cross-posted sources.
+- The "canonical" URL that clients show and open still carries tracking tags. That works against the point of canonicalizing.
+
+**Suggested fix:**
+
+- Add `at_medium` and `at_campaign` to `TRACKING_PARAM_NAMES`. Consider the other documented AT/Piano parameters (`at_custom1`–`at_custom4`, `at_format`, `at_link`, …) as well. Don't strip the bare `at_` prefix without a survey, because it could remove meaningful parameters on other sites.
+- Because `poll_feed` compares stored and incoming `canonical_url` (the `N-01` fallback and the `1e` URL deduplication), a strip-list change alters keys for rows already stored. Add a one-off data step (an Alembic data migration or a `smartrss db recanonicalize` command) that recomputes `canonical_url` for existing items and emits `item` `upsert`s. Otherwise the next GUID rotation of an already-stored BBC item misses the fallback once and creates a duplicate.
+- Record the strip list's scope in `1a` §5 or `data-model.md` (`canonical_url`).
+- **Regression tests:** a `url_canon` unit test with the exact BBC link from this soak; a `poll_feed` integration test where a stored item with the old canonical form, followed by a GUID-rotated entry, still matches after the migration.
+
 ---
 
 ## 3. Nit
@@ -191,6 +224,20 @@ The line used for this test is:
 **What happens:** over about 90 minutes of UI use, the API logged 72 `OPTIONS /api/v1/sync/pull` for 71 `GET`s and 53 `OPTIONS /api/v1/sync/push` for 53 `POST`s. The push URL is constant, and the preflight response carries `access-control-max-age: 600`, so the browser's preflight cache is not being used. The likely cause is `cache: "no-store"`: Chromium skips its preflight cache for requests with cache-disabling load flags. That has not been confirmed per browser. The impact is only twice the request count and latency on the LAN (each cycle is one extra round trip), but it adds up over many devices and long soak periods.
 
 **Suggested fix:** confirm the cause in the owner's browser (DevTools → Network, with "Disable cache" off). If confirmed, keep `no-store` semantics by having the API send `Cache-Control: no-store` on responses, and drop the request-side `cache: "no-store"` for authenticated JSON calls. Alternatively, accept the extra round trip and record it as a residual risk. If the client changes, add a vitest assertion on the fetch options.
+
+
+### E-13 — Container and worker logs are unbounded, and the `api` log is almost all healthcheck lines
+
+**Where:** `docker-compose.yml`, where no service sets a `logging:` block. The host has no `/etc/docker/daemon.json`, so Docker's default `json-file` driver runs with no `max-size`. Also the `api` healthcheck (`docker-compose.yml:37-41`, every 10 s against `/api/v1/health`), and the README cron example that appends to a log file (`E-05`).
+
+**What happens:** over 30 h, 10,589 of the roughly 10,640 `api` access-log lines were `127.0.0.1 "GET /api/v1/health" 200` from the container's own probe. That is about 8,600 lines and 0.6 MB a day of noise, which buries the 23 real sync requests from the same window when reading `docker compose logs api`. Nothing rotates the container logs or the cron `worker.log` (58 KB after 35 h). The growth is slow (tens of MB a month), but on an always-on home server it never stops.
+
+**Suggested fix:**
+
+- Add a shared `x-logging: &default-logging` block (`driver: json-file`, `max-size: "10m"`, `max-file: "3"`) to every service.
+- Stop logging the healthcheck: filter `/api/v1/health` from the uvicorn access log with a `logging.Filter`, or have the healthcheck call a path that isn't logged. Relaxing the interval to 30 s would also cut the volume threefold.
+- Document a `logrotate` stanza (or the `systemd` timer from `E-05`, which logs to the journal) for `worker.log`.
+- **Tests:** a compose-config test (`docker compose config` parsed in pytest, or a shell check in `make check`) that asserts every service has bounded logging. If the filter is added, a unit test that a `/api/v1/health` access record is dropped and a `/api/v1/sync/pull` record is kept.
 
 ---
 
@@ -279,6 +326,9 @@ The line used for this test is:
 - **Large first-subscribe archives.** The Hugging Face blog feed returned 917 entries on its first poll (the 04:30 run ingested 987 items in 61 s). 10 are `unread` and 907 are stored as `expired` permanently (the permanent historical log). That is per spec and fine at this scale, but feeds that publish their whole archive will dominate storage and FTS size over time. Should backfill keep only the newest `K` entries beyond the unread cap (say 100), or is the permanent log meant to be complete?
 - **The startup reachability probe runs twice per page load.** At each of 5 page loads (04:24, 04:34, 05:06, 05:07, 07:28 MST), Nginx logged `GET /api/v1/health` and the unauthenticated `GET /api/v1/devices` probe (`frontend/src/sync/probe.ts`) **twice within 1 ms**, followed by a single `sync/pull`. The probe in `engine.ts:588-600` runs before the cycle lock, so either two triggers fire at load (startup `triggerSync()` plus a `visibilitychange` / `online` event) or two tabs on the same origin started together. It's harmless (two extra small requests per load) and not raised as a finding. The implementer can check it when touching `engine.ts`, for example by de-duplicating the in-flight probe the way the cycle itself is de-duplicated.
 - **Permanent redirects work.** TLDR (`tldrnewsletter.com/rss`) moved on its own to `tldr.tech/api/rss/tech` with no user stamp on `field_updated_at['feed_url']`, as `1a` specifies for 301/308.
+- **A residual same-feed duplicate (BBC, guarded by design).** BBC revises its item GUIDs with a `#N` fragment (`…/videos/cq808d704m22o#0` → `#2`). The `N-01` fallback matched 9 such revisions correctly, but one video was stored twice: `#0` at 11-26 14:00 and `#2` at 11-27 00:00, with identical `canonical_url`, `entry_hash` and `content_hash`. The most likely cause is that both GUIDs appeared in the same response. Then guard (b) (exactly one batch entry per `canonical_url`) or guard (c) (the old GUID must be absent from the batch) correctly refuses the match, as `1a` specifies to protect shared-link feeds. This is not raised as a finding: `1e` exact-URL clustering is the intended backstop and would group the pair. Worth keeping as a `1e` test case: same feed, same `canonical_url` and `content_hash`, different GUID.
+- **Cron quantization lengthens the effective poll interval.** With a 60-minute `poll_interval_minutes` and a 15-minute cron, a feed is due at `last + 60 min ± jitter` but polled only at the next cron tick. Ars Technica, for example, succeeded at 12:45, became due at 13:47 and was polled at 14:00, 75 minutes later. Each feed got 26–28 polls in 30 h, not about 30. That is harmless and arguably polite. If exact cadence ever matters, set `next_fetch_at` from the scheduled time rather than the completion time, or document the effective `interval + cron period` ceiling for cron mode.
+- **The first failure's error text isn't kept after a successful retry.** Jobs 72 and 146 (`E-01`) are `done` with `attempts = 2` and `last_error = NULL`, and their `stage_metrics` rows have `status = 'failed'` with no error column. The exception text survives only in `worker.log`, which isn't rotated or collected (`E-13`). Consider storing a short error class or message on failed `stage_metrics` rows (it can share the `E-08` column migration) so System Health can show recent transient failures.
 - **Backfill-as-expired is surprising on first look.** 62 of 112 items showed up as `expired` minutes after subscribing. That is per spec (`FR-FEED-05`). Consider whether the UI or feed-add response should say "N older items archived" so it doesn't look like data loss.
 
 ## 4. Verification performed
@@ -290,17 +340,21 @@ The line used for this test is:
 - Cron run 02:30: `completed`, exit `0`.
 - Sync traced through API logs and the `sync_changes` / `sync_mutations` / `sync_state` tables (see the Review outcome section).
 - Reproductions: `E-01` (script run in the `api` container, plus an IPv4-only control), `E-02` (suite under 3.14), `E-04` (`install-client.sh --api-origin`).
+- **Unattended soak (2026-11-26 07:45 → 2026-11-27 13:45 MST):** analyzed `worker.log` (142 JSON summaries), `pipeline_runs` (cadence gaps), `jobs`, `stage_metrics`, `items`, `sync_changes`, `sync_mutations`, `sync_state`, `devices`, and 30 h of `api` / `web` logs. I also fetched the live BBC feed (`feeds.bbci.co.uk/news/world/rss.xml`, 32 entries) and compared its GUIDs with the stored ones (21 exact matches, 9 revised GUIDs matched to existing rows, 2 not yet ingested).
+- **`make backup`** (2026-11-27 13:58 MST): `backups/smartrss-20261127T205831Z.dump`, 2.6 MB, mode `0600`, in a `0700` directory (gitignored). Integrity was verified by `pg_restore --list`. The run took 0.5 s.
+- **`make restore-drill`** (immediately after, using that dump): **PASS** in 3.6 s. The restore went into `smartrss_restore_drill`; the drill database's `instance_epoch` rotated `9dfefb19…` → `5095ca93…` while production's stayed at `9dfefb19…`. The Alembic head is `0002_milestone_1b_sync_search` (it matches `alembic heads`), and the row counts `feeds=10 items=1164 devices=2` match the source. Afterwards `pg_database` showed the drill database dropped, and production was untouched. One detail: the drill reused the just-written dump rather than taking its own, so the script's strict count-equality check, which only runs for fresh dumps, was skipped. The counts matched anyway. The nightly `deploy/systemd/smartrss-backup.timer` was **not** installed for this test, so scheduled backups and rotation were not exercised.
 - **Ruled out:** the `instance_epoch` value is random (`gen_random_uuid()`); the pre-pairing `401`s on `GET /api/v1/devices` are the intentional `ALLOWED_HOSTS` probe (`frontend/src/sync/probe.ts:87`, `U-17-F1`); CORS preflight responses carry `access-control-max-age: 600`.
 
 ### Soak-test checklist (to append results)
 
-- [x] Steady-state polls at each feed's 60-minute interval (03:51: all 5 re-polled within one 15-minute cron tick of `next_fetch_at`; 07:39: all 10 on schedule over 21 runs); conditional GET is only partly verifiable (see §3a, 304 visibility)
-- [x] No duplicate items across polls (GUID / canonical-URL / content-hash) so far (03:51; 07:39 with 10 feeds and 1,118 items); updated entries not yet observed
-- [x] Feed health stays `healthy` (03:51; 07:39 for all 10); both transient Hacker News failures (`E-01`) recovered on retry
-- [x] `worker.log`: no `failed` runs (03:51; 07:39 over 21 runs); both tracebacks are recorded under `E-01`
-- [ ] Client: offline reload, reconnect, star/read round-trip across the localhost runner and the LAN `web` client
-- [ ] `retention_cleanup` daily run; `pipeline_runs` / `stage_metrics` growth
-- [ ] `make backup` and `make restore-drill` against the live data
+- [x] Steady-state polls at each feed's 60-minute interval (03:51: all 5 re-polled within one 15-minute cron tick of `next_fetch_at`; 07:39: all 10 on schedule over 21 runs; 30 h unattended: 26–28 polls per feed, 0 missed cron slots, see §3a "cron quantization"). Conditional GET is only partly verifiable (§3a, 304 visibility → `E-08`).
+- [x] No duplicate items by GUID (03:51; 07:39; final, 1,164 items). One same-feed BBC duplicate by canonical URL was found and analyzed as a guarded residual (§3a). **Updated entries observed:** 10 BBC items updated in place, and 9 BBC GUID revisions matched by the `N-01` fallback.
+- [x] Feed health stays `healthy` (03:51; 07:39; final, all 10 with 0 errors in the unattended window). Both transient Hacker News failures (`E-01`) recovered on retry.
+- [x] `worker.log`: no `failed` runs (142 runs: 140 `completed`, 2 `partial`, both before the unattended window). Both tracebacks are recorded under `E-01`.
+- [x] Unsubscribe stops polling: Hacker News has had no `poll_feed` since 07:15 and its items were kept.
+- [~] Client: star and read round-trips are covered (110 mutations applied, 0 rejected, cursor matches `current_seq`). **Not exercised:** offline reload and reconnect, and cross-client consistency between the localhost runner and the LAN `web` client, because only one UI device (`Ubuntu Test`) was paired. These are carried forward to the next user test.
+- [x] `retention_cleanup` ran daily (11-26 02:16 and 11-27 02:30). `expire_items` ran 144 times with nothing due (the window is shorter than the 30-day expiration). Growth: `pipeline_runs` +144 rows, `stage_metrics` 612 rows, `jobs` 609 rows, all small.
+- [x] `make backup` and `make restore-drill` against the live data: both pass (§4). The nightly backup timer was not installed.
 
 ## Resolutions
 
