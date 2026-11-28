@@ -11,7 +11,7 @@
   - the `1a`, `1b`, `1c` and `1d-ops` designs.
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `W` (`W-01`–`W-20`)
-- **Status**: `Addressed (2026-11-28) — awaiting verification` (owner decisions `Q-1`–`Q-7` incorporated and all findings `W-01`–`W-20` resolved in `docs/design/1d-llm-adapter-and-enrichment.md` and synced specs)
+- **Status**: `Addressed (2026-11-28, pass 2) — awaiting verification` (verification pass 2026-11-28 found follow-ups `W-01-F1`, `W-02-F1`, `W-07-F1`, `W-01-F2`; all 4 follow-ups addressed alongside `W-01`–`W-20` & `Q-1`–`Q-7`)
 
 ## Review outcome
 
@@ -385,3 +385,108 @@ All 20 findings (`W-01`–`W-20`) and all 7 owner decisions (`Q-1`–`Q-7`) have
 
 ### Verification (`make check`)
 - `make check` passed (exit 0): backend `ruff check`/`ruff format`/`mypy` clean, 219 pytest passed (92.94% total branch coverage, all 17 critical modules >= 90%); client-runner 32 passed (94.87% branch coverage); frontend lint/typecheck clean, 62 vitest passed (93.3% lines / 89.2% branches, all critical >= 90% and core >= 80% gates passed).
+
+## Verification pass (2026-11-28)
+
+- **Verifier**: Claude Code (Claude Opus 5.5), in a fresh session.
+- **Scope**: resolution commit `413e1d2`, which changes the `1d` design, `data-model.md`, `requirements.md`, `review-checklist.md` and `docs/README.md`.
+- **What a design-only fix means for this pass**: no application code changed, so the revert-the-fix check doesn't apply here. Each fix was checked against the design text, against the existing code it will change (`jobs/queue.py`, `worker/runner.py`, `worker/stages/extract_content.py`, `jobs/locks.py`), and for sibling paths with the same shape. Each proposed test was checked to see whether it would fail with its invariant broken. The revert-the-fix check is deferred to the `1d` implementation review.
+- **`make check`**: green (exit 0).
+  - Backend: 219 passed, 93% total coverage (the recorded figure was 92.94%), and every critical module is ≥ 90%.
+  - `client-runner`: 32 passed (95%).
+  - Frontend: 62 passed (93.3% lines, 89.2% branches), and both the critical and core gates pass.
+  - The test counts match the resolution notes. That is expected, because the commit changes only docs.
+- **Docs and status drift**: there is one index row for this review, with no duplicates. The `1d` status agrees across the design header, `docs/design/README.md`, `AGENTS.md` and `docs/README.md` (`In Design Review`). The `data-model.md` §4.6/§4.9 changes for the new columns are present. `C10` was added and `S2` updated in `review-checklist.md`. The working tree was clean before this pass.
+
+### Verdicts
+
+| ID | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `W-01` | ⚠️ Partially resolved | Connection and timeout errors and model-not-found `404`s now release the job without using up an attempt and open the breaker (§4.3, §6.4 step 5, `1d-T10d`). But the new **class 2** dead-letters `401`/`403` and other `400`s at once with `permanent=True`, and those are configuration-wide failures, not item-specific ones. See `W-01-F1`. The health endpoint now writes to the DB (`W-01-F2`, nit). |
+| `W-02` | ⚠️ Partially resolved | `mark_running_job_rerun`, the input fingerprint, the `complete_job … RETURNING payload` rerun check, rerun-on-dead-letter, the `/re-enrich` `after_running_job` response and `1d-T09c` are all present. The lock order is consistent: `mark_running_job_rerun` runs after the `items` lock in `_set_extraction_status`. If it waits on the row being completed, the retried `enqueue_job` succeeds once the dedupe slot is free. **Gap:** the paths that return a job to the queue don't clear the rerun flag or carry over its priority (`W-02-F1`). |
+| `W-03` | ✅ Resolved | §6.4 now locks `items` → `jobs` → `sync_state` in Steps A/B/C and in `mark_enrich_item_failed`. `_set_extraction_status` already holds the `items` lock before it enqueues. `1d-T09d` forces the overlap with retries disabled, and would deadlock with the order reversed (this matches my PG16 reproduction). The rule is added to the checklist as `C10`. Clearing `app_settings.llm_unavailable_since` in Step C adds `app_settings` between `jobs` and `sync_state`. That is consistent with `PATCH /settings` (`app_settings` → `sync_state`); nothing locks `sync_state` before `app_settings`. |
+| `W-04` | ✅ Resolved | §6.3 defines gated drain accounting with explicit reasons (`llm_unconfigured`, `llm_paused`, `prompts_not_seeded`, `llm_slot_busy`, `llm_unavailable`). I/O slots always run. The `run-once` LLM slot takes `LOCK_LLM_SLOT` without blocking, or exits as deferred. Quiet hours are daemon-only (`Q-6`). `1d-T11b` covers all three gate cases with `< 5s` bounds, and would fail with today's counter (`runner.py:337-347`). |
+| `W-05` | ✅ Resolved | `smartrss llm backfill` (§6.5) uses the eligibility filter from `Q-5`, chunks at 500, relies on dedupe so a re-run is a no-op, is wired into `setup-server.sh` after `db migrate` and documented in the README plan (§12), and is excluded from readiness lag. Re-running setup is safe: enriched or dead-lettered items have an `is_current` row and are skipped. `1d-T11c` covers eligibility and the double run. |
+| `W-06` | ✅ Resolved | The API lifespan no longer seeds. Seeding happens in `0004` (frozen literals) and in `smartrss db migrate`. Worker startup seeding is best-effort, and the gate has a `prompts_not_seeded` reason, so jobs are released without using up an attempt. `1d-T06b` starts the API against a `0003` schema. |
+| `W-07` | ⚠️ Partially resolved | The 400-token retry reserve is in place (6,512-token budget, arithmetic checked). Raw output is no longer echoed on retries, and the corrective turn is capped at ≤ 300 tokens. The llama.cpp `/props` `n_ctx` clamp, drift logging and `LLMContextTruncatedError` are added. **Gap (inferred):** the truncation and drift checks rely on `prompt_eval_count`, which on Ollama is believed to exclude prompt-cache hits (`W-07-F1`). |
+| `W-08` | ✅ Resolved | The system template now gets a `422` above 1,200 tokens. `estimated_tokens`/`budget_tokens` are returned on the profile, prompt and feed endpoints, the editors show counters, and `prompt_truncated` is stored on `item_enrichments`/`stage_metrics` and in metrics. |
+| `W-09` | ✅ Resolved for item-specific errors | Parse, oversize and context-length errors dead-letter after one attempt, and unexpected errors use `max_attempts=3`. The `LLMClientError` part of class 2 belongs to `W-01-F1`. |
+| `W-10` | ✅ Resolved | `user_prompt_config_id` and `interest_profile_version` are on both tables, the breakdown groups by `(model, system, user)`, and `data-model.md` is synced. |
+| `W-11` | ✅ Resolved | Lag is recorded only for the first completed, non-backfill, priority ≥ 50 enrichment (§6.4 Step B). `1d-T10(c)` asserts `NULL` for re-enrich and backfill. |
+| `W-12` | ✅ Resolved | `trust_env=False` is set on the adapter, the health probe and the unload client. `1d-T01` asserts zero proxy mounts with `HTTP_PROXY` set, which would fail on httpx 0.28.1's default as verified in the original review. `S2` is updated. |
+| `W-13` | ✅ Resolved | Migration `0004` allocates two `sync_state` sequence numbers and inserts `interest_profile` and `app_settings` upserts. `1d-T06` pulls them from a pre-`0004` watermark. *(Implementation note: the inserted rows need `changed_at`. Use `clock_timestamp()` as `SyncLogWriter` does.)* |
+| `W-14` | ✅ Resolved | `render()` wraps both untrusted values in nonce tags in code and appends a non-editable safety suffix naming the tags. Level 1 is reworded. `1d-T03` checks templates that contain no fence text at all. |
+| `W-15` | ✅ Resolved | `error_summary` is on the DTO. The failed notice in `ReadingPane`, the `ItemList` badge and the filter/sort treatment are specified (§8), with `1d-T14`/`T15` cases. |
+| `W-16` | ✅ Resolved | `worker/llm_slot.py` and `extract_content.py` are added to the critical modules (§10.1). The new tests `T06b`, `T08b`, `T09a` (daemon + `run-once`), `T09c`, `T09d`, `T10d`, `T11b` and `T11c` are listed with the `T6` revert-proof requirement. `CRITICAL_MODULES` in the script is updated at implementation time (§10.1). |
+| `W-17` | ✅ Resolved | `advisory_session_lock` commits after acquire and after unlock. `1d-T09a` asserts `pg_stat_activity.state == 'idle'`. |
+| `W-18` | ✅ Resolved | The thinking fallback now matches on the response body, Ollama's `:latest` tag is normalised, and an unknown `model_override` produces a non-blocking warning. |
+| `W-19` | ✅ Resolved | Frozen `1d-v1` literals are in `0004`, and the `tags.display_name` rule is defined (§3.4). |
+| `W-20` | ✅ Resolved | The pause decision is final. The gate function now receives `llm_configured`/`prompts_seeded` as arguments. Background jobs are skipped when the feed isn't active or the item isn't unread. "Pending" is defined as no current row. |
+| `Q-1`–`Q-7` | ✅ Incorporated | §11 table. `Q-6`: quiet hours and the cron window are daemon-only, and pause still applies to `run-once`. `Q-7`: the unload runs after commit, outside the request transaction, and a failure is reported in the `PATCH` response without failing the update. Both match the owner decisions recorded above. |
+
+**Totals:** 17 resolved, 3 partially resolved (`W-01`, `W-02`, `W-07`), 0 not resolved, 0 deferred.
+
+### Follow-ups
+
+#### `W-01-F1` (Major) — Authentication and other configuration-wide `4xx` errors now dead-letter the whole backlog within seconds
+
+**Location:** §4.3 class 2 (`LLMClientError` "Other HTTP `400`/`401`/`403`" → `fail_job(..., permanent=True)`), §6.4 step 5.
+
+**Problem:** `Q-4` says to dead-letter *only item-specific* errors. A `401`/`403` is not item-specific. It comes from a rotated or mistyped `LLM_API_KEY`, `llama-server` restarted with `--api-key`, or an authenticating reverse proxy in front of Ollama. Neither is a non-context `400` caused by configuration. Two examples: an older Ollama that rejects the `format` JSON-schema object, or an Ollama that rejects a `keep_alive` value that passed our regex but not Ollama's parser.
+
+These errors return in milliseconds and are now `permanent=True`. So the single LLM slot dead-letters **every** queued job, one after another, within seconds, and writes `status='failed'` for each item. That is faster than the ~15 minutes in the original `W-01`. `1d-T10d` covers only `ConnectError` and `404`, so it would not catch this.
+
+**Expected fix:**
+- Move `401`/`403` into class 1 with breaker reason `auth_failed`, surfaced in health. `check_llm_health` already maps them to `unreachable`.
+- For non-context `400`s, add a configuration-error guard. If the same normalised error signature (status plus a body prefix with IDs and numbers stripped) occurs for **two different items in a row**, treat it as slot-level: release the job without using up an attempt, open the breaker with reason `client_error`, and keep `llm_last_error`. Item-specific `400`s that don't repeat still dead-letter after one attempt.
+- Extend `1d-T10d` with (c) a `401` and (d) the same `400` body for 50 jobs. Assert that fewer than two dead-letters occur and that the breaker opens. Each case must fail with the current class-2 mapping.
+
+#### `W-01-F2` (Nit) — The health `GET` writes to the database
+
+§3.5 sets `app_settings.llm_unavailable_since` "when the worker circuit breaker opens **or a live probe fails**". If the API's `GET /api/v1/system/health` probe writes that column, a `GET` has a side effect on the request session (`C6`). It would also mark an outage when only the API container can't reach the host (for example, `extra_hosts` missing on `api`). Make the API probe read-only, with only the worker owning the outage columns, or require a separate short session. State which in §3.5.
+
+#### `W-02-F1` (Minor) — The rerun flag survives when a job goes back to the queue
+
+**Location:** §6.2 (`mark_running_job_rerun` sets `payload.rerun_requested` and `rerun_priority` on the running row); §4.3/§6.4 step 5 (`release_job_without_attempt`, non-permanent `fail_job` retry); the reaper requeue; `release_job_on_shutdown` (`jobs/queue.py:327-358, 400-418`).
+
+**Problem:** when a job marked for rerun returns to `queued` instead of finishing, `payload.rerun_requested` stays set. This happens on an outage release (`Q-4`), an unexpected-error retry, a lease-expiry requeue or a `SIGTERM`. The next attempt re-reads fresh inputs anyway, but when it completes it sees `rerun_requested=true` and enqueues a second, redundant enrichment, costing one wasted GPU call per affected item. The reverse also happens: a manual re-enrich (`rerun_priority=10`) marked on a background job (priority `50`/`90`) that is then requeued stays at the old priority. During a breaker-open window, the user's request waits behind the whole backlog.
+
+**Expected fix:** every requeue path (`release_job_without_attempt`, the retry branch of `fail_job`, the reaper requeue, `release_job_on_shutdown`) sets `payload = payload - 'rerun_requested' - 'rerun_priority'` and `priority = LEAST(priority, COALESCE((payload->>'rerun_priority')::int, priority))` in the same fenced `UPDATE`. Extend `1d-T09c` with (c): mark a running job for rerun, release it through the outage path, recover, and assert exactly one further enrichment that ran at the bumped priority.
+
+#### `W-07-F1` (Minor, inferred) — Truncation and drift checks may miss cache-reused prompt tokens
+
+**Location:** §4.2 step 5 (`prompt_tokens` from Ollama `prompt_eval_count`), §4.1.
+
+**Problem:** I believe, but did not verify in this session, that Ollama's `prompt_eval_count` counts only the prompt tokens actually evaluated, so a prefix reused from the KV cache is left out. That prefix is the shared system message and template across consecutive items, and the whole `[system, user]` prefix on parse-retry turns. llama.cpp similarly reports cached tokens separately (`timings.prompt_n` versus `cache_n`).
+
+If so, on warm-cache calls the reported count understates the real prompt length. The `prompt_tokens >= effective_num_ctx − max_output` truncation check can then miss real truncation, and the drift check can't detect undercounting at all. Accumulating `prompt_tokens` across attempts also double-counts or under-counts inconsistently in `stage_metrics`.
+
+**Expected fix:**
+- In `1d-T16`, record two back-to-back calls and one parse-retry call against `qwen3.5:35b-a3b-q8_0-ctx256k` to confirm the behaviour.
+- If confirmed, base the truncation and drift checks on a total-prompt figure: llama.cpp `timings.prompt_n + cache_n`, and for Ollama use only the first, cold attempt or skip the check when the count is implausibly low (below the system-prompt estimate).
+- Document which field feeds `stage_metrics.prompt_tokens` (evaluated versus total).
+- Add a recorded warm-cache fixture to `1d-T05`.
+
+### Residual risks for the owner
+
+None proposed for acceptance. `W-01-F1` is a Major that directly affects owner decision `Q-4`.
+
+### Status
+
+`Addressed — verification found follow-ups` (`W-01-F1` Major; `W-02-F1`, `W-07-F1` Minor; `W-01-F2` Nit). Hand back to Antigravity (`address-review-findings`) for these four items. After that, a second verification pass is needed before the owner's design-approval decision.
+
+
+---
+
+## Follow-up Resolutions (2026-11-28)
+
+All four verification-pass follow-ups (`W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1`) and the `W-13` `clock_timestamp()` note have been addressed in [`docs/design/1d-llm-adapter-and-enrichment.md`](../design/1d-llm-adapter-and-enrichment.md), [`docs/data-model.md`](../data-model.md), and [`docs/README.md`](../README.md):
+
+- **`W-01-F1` (Major)** — Fixed. Moved HTTP `401`/`403` into Class 1 as `LLMAuthError` (releases job without consuming an attempt via `release_job_without_attempt`, opens slot circuit breaker with `reason="auth_failed"`, persists worker-owned `llm_unavailable_since`/`llm_last_error`, surfaced as `unreachable` in health; §4.3, §6.4 step 5). Added a slot-level consecutive config-error guard for non-context HTTP `400` (`LLMClientError`): normalizes `(http_status, body_prefix_without_ids_or_numbers)` and tracks `(sig, item_id)` (cleared on any successful enrichment); the 1st item dead-letters (`permanent=True`), and if a 2nd distinct item in a row hits the same signature it escalates to Class 1 (releases without consuming an attempt, opens breaker with `reason="client_error"`, leaving at most 1 dead-letter across the backlog). Extended `1d-T05` (`LLMAuthError`) and `1d-T10d` with `(c)` HTTP `401` (`0` dead-letters) and `(d)` identical non-context `400` across 50 queued jobs (`< 2` dead-letters, breaker opens, remaining `>= 49` enrich on recovery), both proven to fail under the prior class-2 mapping.
+- **`W-01-F2` (Nit)** — Fixed. Scoped `app_settings.llm_unavailable_since` and `llm_last_error` strictly as **worker-owned** (`worker/llm_slot.py` only, §3.5, `docs/data-model.md` §4.9). `GET /api/v1/system/health` is strictly read-only (`C6`), combining its cached non-blocking live probe with worker-owned DB outage columns without ever writing to `app_settings` (§7.3).
+- **`W-02-F1` (Minor)** — Fixed. Specified in §6.4 step 5 that **every** requeue path (`release_job_without_attempt`, the non-permanent retry branch of `fail_job`, `reap_stale_leases` requeue, and `release_job_on_shutdown`) atomically strips stale rerun markers (`payload = COALESCE(payload, '{}'::jsonb) - 'rerun_requested' - 'rerun_priority'`) and carries over any bumped priority (`priority = LEAST(priority, COALESCE(CAST(payload->>'rerun_priority' AS int), priority))`) in the same fenced `UPDATE`. Extended `1d-T09c` with `(c)` testing a background job marked for manual rerun (`rerun_priority=10`), released via outage (plus coverage of `fail_job` retry, reaper requeue, and `release_job_on_shutdown`), verifying `priority == 10`, stripped flags, and exactly one further enrichment after recovery.
+- **`W-07-F1` (Minor, inferred)** — Fixed. Clarified in §4.1 & §4.2 steps 5–6 that `stage_metrics.prompt_tokens` / `item_enrichments.prompt_tokens` records **evaluated** prompt tokens (GPU prompt-eval work: Ollama `prompt_eval_count`, llama.cpp `timings.prompt_n` fallback `usage.prompt_tokens`), while drift/truncation checks run on **attempt `0` only** using `total_prompt_tokens` (llama.cpp `timings.prompt_n + cache_n`; Ollama `prompt_eval_count` only when plausible `>= estimate_tokens(system_msg) * 0.5`, skipping warm-cache partial hits with debug log `llm_prompt_cache_hit_detected`). Extended `1d-T05` with warm-cache fixtures for both Ollama and llama.cpp, and extended `1d-T16` (`pytest -m live_llm`) to record two back-to-back calls and one parse-retry call against `qwen3.5:35b-a3b-q8_0-ctx256k` to empirically confirm KV-cache reporting.
+- **`W-13` implementation note** — Noted `changed_at = clock_timestamp()` explicitly on migration `0004`'s `sync_changes` seed inserts (§3.2).
+
+### Verification (`make check`)
+- `make check` passed (exit 0): backend `ruff check`/`ruff format`/`mypy` clean, 219 pytest passed (92.94% total branch coverage, all 17 critical modules >= 90%); client-runner 32 passed (94.87% branch coverage); frontend lint/typecheck clean, 62 vitest passed (93.3% lines / 89.21% branches, all critical >= 90% and core >= 80% gates passed).

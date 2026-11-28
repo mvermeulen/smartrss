@@ -247,7 +247,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 - **`app_settings`** (single row, `id SMALLINT PK CHECK (id = 1)`):
   - `1a` columns: `default_expiration_days (INT NOT NULL DEFAULT 30)`, `backfill_cap (INT NOT NULL DEFAULT 10)`, `default_poll_interval_minutes (INT NOT NULL DEFAULT 60)`, `last_retention_cleanup_at (TIMESTAMPTZ NULL)`, `updated_at`.
   - `1d` synced columns: `llm_paused (BOOLEAN NOT NULL DEFAULT FALSE)`, `llm_quiet_hours_enabled (BOOLEAN NOT NULL DEFAULT FALSE)`, `llm_quiet_hours_start (SMALLINT NOT NULL DEFAULT 9)`, `llm_quiet_hours_end (SMALLINT NOT NULL DEFAULT 17)`, `enrichment_schedule_mode (TEXT NOT NULL DEFAULT 'continuous')`, `enrichment_cron_expression (TEXT NOT NULL DEFAULT '0 */2 * * *')`, `enrichment_window_minutes (INT NOT NULL DEFAULT 60)`, `enrichment_timezone (TEXT NOT NULL DEFAULT 'UTC')`.
-  - `1d` internal operational columns (never client-synced, no `sync_changes` event): `llm_unavailable_since (TIMESTAMPTZ NULL)`, `llm_last_error (TEXT NULL)`.
+  - `1d` internal operational columns (worker-owned only — never written by `GET /api/v1/system/health`, never client-synced, no `sync_changes` event): `llm_unavailable_since (TIMESTAMPTZ NULL)`, `llm_last_error (TEXT NULL)`.
   - Env vars (`DEFAULT_*`) seed the row only in the initial migration; the DB is authoritative thereafter (changed via `smartrss settings set` in `1a`, and via the sync/settings API from `1b`/`1c`).
   - `last_retention_cleanup_at`, `llm_unavailable_since`, and `llm_last_error` are **internal operational** columns: they are never client-synced and writing them does not emit an `app_settings` sync change. Clustering/research columns are added in `1e`–`1f`.
 
