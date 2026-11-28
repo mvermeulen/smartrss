@@ -11,7 +11,7 @@
   - the [`1a`–`1c` user-test review](2026-11-26-1a-1c-user-test-implementation-review.md) (`E-09`, `E-11`) and the [`1c` implementation review](2026-11-25-1c-implementation-review.md) (the `forceFullResync()` carry-forward).
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `O` (`O-01`–`O-11`)
-- **Status**: `Addressed (2026-11-27) — verification found follow-ups` (`O-01-F1`, `O-02-F1`, both minor)
+- **Status**: `Addressed (pass 2, 2026-11-27) — awaiting verification`
 
 ## Review outcome
 
@@ -329,3 +329,15 @@ Either way, add a test that a `muted` feed round-trips as documented.
 - *Process note:* `a857dcc` and `8b947b0` are local; `milestone/1d-ops` is 2 commits ahead of `origin`.
 
 **Status:** left at `Addressed — verification found follow-ups`. Handed back to Antigravity (`address-review-findings`) for `O-01-F1` and `O-02-F1`.
+
+## Follow-up resolutions (pass 2, 2026-11-27)
+
+*(Addressed 2026-11-27 on `milestone/1d-ops`; awaiting Claude Code pass-2 verification.)*
+
+- **`O-01-F1`** — Fixed. Updated `1d-ops-D07` and §3 in `docs/design/1d-ops-setup-and-cli.md` so **both** `api` and `worker` keep `build: { context: ./backend }` alongside the shared `image: smartrss-backend:local`. `docker compose build api web` in `setup-server.sh` and `make up` still builds `./backend` once during setup/upgrade, and if `smartrss-backend:local` is ever pruned locally, `docker compose run --rm -T worker ...` builds on demand rather than attempting a registry pull (`pull access denied`). Extended `1d-ops-T04` (a) to assert both the shared `image:` tag and `worker.build.context`, and added the optional `docker image rm smartrss-api smartrss-worker` cleanup note to §9.
+- **`O-02-F1`** — Fixed. Updated §6.2 step 5 and §6.3 in `docs/design/1d-ops-setup-and-cli.md` to track `lastCycleProgressed` across the `tryRunLockedCycle` drain loop and gate the post-release `scheduleDebouncedSync(0)` check strictly on `res.acquired && lastCycleProgressed && (await getFullResyncRequest(this.db)) !== null`. When a cycle returns `progressed === false` (`detached`, `misconfigured`, `auth_revoked`, `sync_error`), the holder does not reschedule, leaving recovery bounded to the 60 s poll timer and `online`/`visibilitychange` events. Extended `1d-ops-T12` (a) with a fake-timer test (for both `detached` and `misconfigured`) asserting reachability probes stay `<= 1` per 60 s poll tick and that full bootstrap runs once a probe succeeds.
+- Also noted the `set -e` wrapper requirement (`if ! ...; then OPML_FAILED=1; fi`) explicitly in §5.3 Step 2 (`O-03` implementation note).
+
+### Pass-2 design-only check summary
+
+- No application code changed; `make check` previously green on the same code (`205` backend passed, `91.86%` total, all 16 critical modules >= 90%; `32` runner passed, `94.87%`; `57` frontend passed, all gates OK). Ready for Claude Code pass-2 verification.
