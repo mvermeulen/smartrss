@@ -11,7 +11,7 @@
   - the [`1a`–`1c` user-test review](2026-11-26-1a-1c-user-test-implementation-review.md) (`E-09`, `E-11`) and the [`1c` implementation review](2026-11-25-1c-implementation-review.md) (the `forceFullResync()` carry-forward).
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `O` (`O-01`–`O-11`)
-- **Status**: `Open`
+- **Status**: `Addressed (2026-11-27) — awaiting verification`
 
 ## Review outcome
 
@@ -248,3 +248,26 @@ Either way, add a test that a `muted` feed round-trips as documented.
 - **Q-2 — OPML fidelity (`O-04`):** should the backup OPML be a portability-only snapshot (a), or carry SmartRSS extension attributes so that an OPML-only restore keeps status and per-feed settings (b)?
 - **Q-3 — Cron-mode scheduling default:** should setup install the systemd user timer by default in cron mode, which needs linger on a headless host (`O-06`), or keep documenting the crontab line? A timer gives journald logging and `Persistent=true` catch-up. A crontab works without linger.
 - **Q-4 — Shared backend image (`O-01`):** should `api` and `worker` share one image tag? That removes this whole class of version skew, but changes `docker-compose.yml` outside the design's stated file list.
+
+---
+
+## Resolutions
+
+*(Addressed 2026-11-27 on `milestone/1d-ops`; awaiting Claude Code verification pass and project owner decisions on `Q-1`–`Q-4`.)*
+
+- **O-01** — Fixed. Adopted shared `image: smartrss-backend:local` on both `api` (with `build: { context: ./backend }`) and `worker` in `docker-compose.yml` (`1d-ops-D07`, added `docker-compose.yml` to §3), and updated both `scripts/setup-server.sh` (§4.2 step 4) and `Makefile` `up` (§4.1) to run `docker compose build api web` explicitly before starting services so cron mode always upgrades the worker image. Added compose-config shared-image assertion and cron-mode rebuild assertions to `1d-ops-T04`. *(Owner confirmation requested under `Q-4`.)*
+- **O-02** — Fixed. Updated `sync_complete` handler in §6.2 step 2 to re-trigger when `outbox.count() > 0 || (await getFullResyncRequest(this.db)) !== null`. Replaced the broken `recheckOnSyncComplete` assignment in the holder tab (§6.2 step 5) with a post-release `getFullResyncRequest()` check calling `scheduleDebouncedSync(0)`. Reworded §6.3 interleaving rows accurately and extended `1d-ops-T10` with both (a) empty-outbox IDB-lease `sync_complete` re-trigger without advancing fake timers and (b) `MAX_DRAIN_LOOPS` exhaustion follow-up.
+- **O-03** — Fixed. Reordered `scripts/backup.sh` (§5.3, `1d-ops-D05`) so OPML export is best-effort *within* the run (logging error and recording `OPML_FAILED=1` without exiting early), local & remote `.dump` and `.opml` pruning run independently, off-host `rsync` always runs for a verified dump, and `backup.sh` exits `1` at the very end if OPML export failed. Extended `1d-ops-T05` with the OPML-failure + `BACKUP_RSYNC_TARGET` test case.
+- **O-04** — Fixed (option (a) proposed; *owner confirmation requested under `Q-2`*). Narrowed `NFR-OPS-02` (`docs/requirements.md`), `1d-ops-D05`, §5.1 item 5, §5.3, and `1d-ops-T07` to explicitly define the backup OPML file as a standard OPML 2.0 **portability snapshot** (subscriptions + categories only; `pg_dump` is authoritative for feed `status` and per-feed settings). Extended `1d-ops-T07` to test `muted`/`paused` feed behavior on both same-DB re-import and fresh-DB import.
+- **O-05** — Fixed. Changed `--create-category` default to `False` (opt-in) in `smartrss feeds add --category <name>` (§5.2), exiting `2` with a `--create-category` hint when missing. Wrapped new-category `INSERT` in `create_or_reactivate_feed` and `import_opml_subscriptions` (§5.1 items 3–4) in a savepoint (`session.begin_nested()`) catching `IntegrityError` on `uq_categories_active_name` and re-selecting the winning active category `FOR SHARE`. Added forced-overlap real-Postgres concurrency test (`T6` barrier) to `1d-ops-T06`.
+- **O-06** — Fixed. Added post-enable `loginctl show-user "$USER" -p Linger --value` check with prominent `WARNING` + exact `sudo loginctl enable-linger "$USER"` command in Step 7 (§4.2 step 5 & 7); added existing `crontab -l` detection for `smartrss worker run-once` with warning/confirmation; unified both the systemd unit and README crontab on the shared lock path `%h/.local/state/smartrss/worker.lock` (`~/.local/state/smartrss/worker.lock`); switched the unit to `flock -n -E 75` + `SuccessExitStatus=75`. Extended `1d-ops-T04` with mocked `loginctl` (`no`) and mocked `crontab -l` assertions. *(Owner confirmation on cron-mode timer default requested under `Q-3`.)*
+- **O-07** — Fixed. Defined primary LAN host deterministically in §4.2 step 3 (first `--lan-host` if provided, else detected IPv4, never bare short hostname), gated `<hostname>.local` inclusion on `getent hosts "$(hostname -s).local"` resolving, added a DHCP reservation reminder to Step 7, added existing-`.env` IP-change instructions to §9 (`README.md`), and added primary-host selection cases to `1d-ops-T01` / `1d-ops-T04`.
+- **O-08** — Fixed. Corrected `setSyncMeta()` key name from `"sync_meta"` to `"sync"` (`clientMeta.ts:38`) in §2 (`1d-ops-D06`), §6.1, and §6.2. Clarified §6.3 "Already `detached`" row and `1d-ops-T12` precondition (snapshot is already `detached` before clicking `forceFullResync()`; also documents the silent-drop-while-`online` fallback).
+- **O-09** — Fixed. Updated `_render_env.py` (`1d-ops-D04`, §4.2 step 3) to open `<output>.tmp.<pid>` with `O_WRONLY | O_CREAT | O_EXCL` (`0o600`), fsync, and commit via `os.link(tmp_path, output_path)` (handling `FileExistsError` cleanly as `"Preserved existing .env"`) before unlinking `tmp_path` in `finally`. Added concurrent pre-existing-target test case to `1d-ops-T01`.
+- **O-10** — Fixed. Updated §4.2 step 4 startup order to `docker compose build api web` → `docker compose up -d --wait db api` → `docker compose exec -T api smartrss db migrate` → `docker compose up -d --wait` (no pre-migration worker errors), made `/api/v1/health` JSON check a subset match (`status == "ok"` and `db == "ok"`), and dropped the no-op `After=network-online.target` line from `deploy/systemd/smartrss-worker.service` (§4.2 step 5).
+- **O-11** — Fixed. Specified `smartrss feeds add --if-not-exists` (§5.1 item 1, §5.2): prints existing status (e.g., `Already subscribed (status=paused)`), emits `"status"` and `"created": false` in `--json`, and returns exit `0` when `active` vs. exit `3` when `paused` or `muted`. Added both cases to `1d-ops-T06`.
+
+### Design-only check summary
+
+- No application code changed; `make check` re-verified green after doc updates.
+- Owner decisions needed before `Approved`: `Q-1` (`NFR-OPS-02` & `1d-ops` split), `Q-2` (`O-04` portability-only OPML option (a) vs. custom attributes (b)), `Q-3` (`O-06` cron-mode timer vs. crontab default), and `Q-4` (`O-01` shared `smartrss-backend:local` image in `docker-compose.yml`).
