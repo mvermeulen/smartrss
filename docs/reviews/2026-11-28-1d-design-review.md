@@ -11,7 +11,7 @@
   - the `1a`, `1b`, `1c` and `1d-ops` designs.
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `W` (`W-01`–`W-20`)
-- **Status**: `Addressed (2026-11-28, pass 2) — awaiting verification` (verification pass 2026-11-28 found follow-ups `W-01-F1`, `W-02-F1`, `W-07-F1`, `W-01-F2`; all 4 follow-ups addressed alongside `W-01`–`W-20` & `Q-1`–`Q-7`)
+- **Status**: `Verified (2026-11-28)` — pass 1: 17 resolved, 3 partial → follow-ups `W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1`; pass 2: all follow-ups resolved; owner decisions `Q-1`–`Q-7` incorporated; awaiting owner design-approval decision
 
 ## Review outcome
 
@@ -490,3 +490,32 @@ All four verification-pass follow-ups (`W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1
 
 ### Verification (`make check`)
 - `make check` passed (exit 0): backend `ruff check`/`ruff format`/`mypy` clean, 219 pytest passed (92.94% total branch coverage, all 17 critical modules >= 90%); client-runner 32 passed (94.87% branch coverage); frontend lint/typecheck clean, 62 vitest passed (93.3% lines / 89.21% branches, all critical >= 90% and core >= 80% gates passed).
+
+## Verification pass 2 (2026-11-28)
+
+- **Verifier**: Claude Code (Claude Opus 5.5).
+- **Scope**: follow-up resolution commit `e5792cd`. It changes only docs: the design, `data-model.md` §4.9, this review and `docs/README.md`. The pass covers `W-01-F1`, `W-01-F2`, `W-02-F1` and `W-07-F1`.
+- **`make check`**: green (exit 0).
+  - Backend: 219 passed, 93% total coverage, and every critical module is ≥ 90%.
+  - `client-runner`: 32 passed (95%).
+  - Frontend: 62 passed, with the critical and core gates passing.
+  - The figures are identical to pass 1, as expected for a docs-only change.
+- **Drift**: there is one index row for this review. The `1d` status agrees across the design header, `docs/design/README.md`, `AGENTS.md` and `docs/README.md` (`In Design Review`). The `data-model.md` §4.9 outage columns are now marked worker-owned.
+
+| ID | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `W-01-F1` | ✅ Resolved | `401`/`403` are now `LLMAuthError` in class 1. The job is released without using up an attempt and the breaker opens with `auth_failed` (§4.3, §6.4 step 5). The configuration-wide `400` guard escalates the second distinct item in a row with the same normalised signature to class 1 (`client_error`), so at most one item dead-letters. The signature memory is cleared only by a successful enrichment. So when a health-`ok` probe closes the breaker but the `400` continues (for example `/api/tags` is healthy but `/api/chat` rejects `format`), the next item escalates again rather than dead-lettering, with a backed-off retry cadence and no attempts used. That path is bounded. `1d-T10d` (c) and (d) cover `401` and the same `400` across 50 jobs, and both are required to fail under the old mapping. |
+| `W-01-F2` | ✅ Resolved | `llm_unavailable_since`/`llm_last_error` are written only by the worker (`worker/llm_slot.py`). `GET /api/v1/system/health` is specified as read-only (`C6`) (§3.5, §7.3, `data-model.md` §4.9). |
+| `W-02-F1` | ✅ Resolved | All four requeue paths (`release_job_without_attempt`, the `fail_job` retry branch, the `reap_stale_leases` requeue and `release_job_on_shutdown`) strip `rerun_requested`/`rerun_priority` and apply `priority = LEAST(priority, rerun_priority)` in the same fenced `UPDATE`. The SQL uses `CAST(... AS int)` (`D5`). Stripping these keys is harmless for other job types, which share these functions. `1d-T09c(c)` covers the outage release and names the other three paths. **Implementation-review note:** each of the four paths needs its own failing-without-fix test (`T1`, one path at a time), not one combined case. |
+| `W-07-F1` | ✅ Resolved (with a note carried to the implementation review) | Stored `prompt_tokens` is now defined as *evaluated* tokens (GPU work). Drift and truncation checks run only on attempt 0, on a *total* prompt figure: llama.cpp uses `prompt_n + cache_n`, which is correct. Warm-cache fixtures are added to `1d-T05`, and `1d-T16` measures real cache behaviour. **Note:** the Ollama plausibility threshold (`prompt_eval_count >= estimate_tokens(system_msg) * 0.5`) will rarely detect a cache hit. On a warm call, the evaluated count is roughly the user message (article up to about 3,800 tokens), which easily clears half the system estimate. So on Ollama, the default runtime, the post-call truncation check is in practice best-effort. It errs toward false negatives and never false positives, and the estimator plus the 256 + 400 token margins remain the main guard. This is acceptable for design approval. When `1d-T16` confirms the behaviour, the implementer should either compare against `estimated_prompt_tokens` (the total) or state in §4.2 that the check is best-effort on Ollama. I'll re-check this in the `1d` implementation review. |
+
+**Totals (all passes):** `W-01`–`W-20` and follow-ups `W-01-F1`, `W-01-F2`, `W-02-F1` and `W-07-F1` are all resolved. Owner decisions `Q-1`–`Q-7` are incorporated. There are no open follow-ups.
+
+**Residual risks for owner awareness (none need acceptance):**
+1. Ollama's post-call truncation detection is best-effort, as described under `W-07-F1` above.
+2. A configuration-wide `400` costs one dead-lettered item before the breaker engages (`W-01-F1`). Dead-letter retry in System Health recovers it.
+3. The Ollama/llama.cpp API details remain *inferred* until `1d-T05` fixtures are recorded from real servers and `1d-T16` runs against `qwen3.5:35b-a3b-q8_0-ctx256k`.
+
+### Status
+
+`Verified (2026-11-28)`. The `1d` component design is ready for the project owner's design-approval decision. The reviewer does not set `Approved`.
