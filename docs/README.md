@@ -6,10 +6,10 @@ This directory holds the requirements, architecture, design specifications, ADRs
 
 | Document | Purpose | Status |
 | :--- | :--- | :--- |
-| [Requirements](requirements.md) | User stories, requirement IDs, acceptance criteria, non-goals, and milestones (`1a`–`1g`) | Approved |
+| [Requirements](requirements.md) | User stories, requirement IDs, acceptance criteria, non-goals, and milestones (`1a`–`1g`, plus `1d-ops`) | Approved (`NFR-OPS-02` & `1d-ops` proposed 2026-11-27) |
 | [Architecture](architecture.md) | Container topology, `LLMAdapter`, capacity budgets, security, and backup/restore ops | Approved |
 | [Data Model](data-model.md) | Entities, state machines, sync surface, per-field conflict rules, job queue, and lifecycle | Approved |
-| [Component Designs](design/README.md) | Milestone-sequenced detailed subsystem specifications (`1a`–`1g`) | In Progress (`1a`–`1c` Implemented & Approved; user-test fixes approved 2026-11-27) |
+| [Component Designs](design/README.md) | Milestone-sequenced detailed subsystem specifications (`1a`–`1g`, plus `1d-ops`) | In Progress (`1a`–`1c` Implemented & Approved; user-test fixes approved 2026-11-27; `1d-ops` In Design Review) |
 | [Decisions (ADRs)](decisions/README.md) | Architecture Decision Records (`0001`–`0006` Accepted) | Accepted |
 | [Development Process](development-process.md) | Testing standards, invariant matrix, coverage, regression policy, doc hygiene, and approvals | Approved |
 | [Review Checklist](review-checklist.md) | Recurring failure classes (security, concurrency, long-running processes, DB, encoding, tests/docs) used by reviewer and implementer | Living |
