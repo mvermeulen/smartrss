@@ -1,0 +1,9 @@
+[Unit]
+Description=SmartRSS one-shot background worker batch
+
+[Service]
+Type=oneshot
+WorkingDirectory=__SMARTRSS_REPO_ROOT__
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/smartrss
+ExecStart=/usr/bin/flock -n -E 75 %h/.local/state/smartrss/worker.lock /usr/bin/docker compose run --rm -T worker smartrss worker run-once --stage all --max-duration 840 --json
+SuccessExitStatus=75

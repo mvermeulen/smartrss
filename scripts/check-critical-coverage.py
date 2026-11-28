@@ -26,6 +26,8 @@ CRITICAL_MODULES: tuple[str, ...] = (
     "src/smartrss/domain/fts_text.py",
     "src/smartrss/sync/service.py",
     "src/smartrss/search/fts.py",
+    # Milestone 1d-ops
+    "src/smartrss/feeds/service.py",
 )
 
 MIN_CRITICAL_PCT = 90.0

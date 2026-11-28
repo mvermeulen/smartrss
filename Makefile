@@ -1,6 +1,6 @@
 .PHONY: check check-prereqs lint format typecheck test test-unit test-int test-cov runner-test \
         frontend-install frontend-lint frontend-typecheck frontend-build frontend-test frontend-test-cov \
-        test-e2e install-client up down migrate backup restore-drill db-test-up db-test-down
+        test-e2e install-client setup up down migrate backup restore-drill db-test-up db-test-down
 
 UV ?= uv
 BACKEND_DIR := backend
@@ -90,11 +90,15 @@ test-e2e: db-test-up frontend-build
 check: check-prereqs lint typecheck test-cov runner-test frontend-lint frontend-typecheck frontend-test-cov
 
 install-client:
-	./scripts/install-client.sh $(INSTALL_CLIENT_ARGS)
+	./scripts/install-client.sh $(if $(API_ORIGIN),--api-origin "$(API_ORIGIN)") $(INSTALL_CLIENT_ARGS)
+
+setup:
+	./scripts/setup-server.sh $(SETUP_ARGS)
 
 up:
 	./scripts/check-prereqs.sh --mode server
-	docker compose up -d --build
+	docker compose build api web
+	docker compose up -d --wait
 
 down:
 	docker compose down

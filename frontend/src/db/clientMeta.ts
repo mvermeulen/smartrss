@@ -2,7 +2,9 @@
 
 import type { SyncAppSettingsDTO, SyncInterestProfileDTO } from "../types/sync";
 import type { StoragePersistenceStatus, UiPrefs } from "../types/ui";
-import type { AuthMeta, SmartRSSDB, SyncCursorMeta } from "./schema";
+import type { AuthMeta, FullResyncRequestMeta, SmartRSSDB, SyncCursorMeta } from "./schema";
+
+export type { FullResyncRequestMeta };
 
 export const DEFAULT_SYNC_META: SyncCursorMeta = {
   instance_epoch: null,
@@ -36,6 +38,22 @@ export async function getSyncMeta(db: SmartRSSDB): Promise<SyncCursorMeta> {
 
 export async function setSyncMeta(db: SmartRSSDB, meta: SyncCursorMeta): Promise<void> {
   await db.client_meta.put({ key: "sync", value: meta });
+}
+
+export async function getFullResyncRequest(db: SmartRSSDB): Promise<FullResyncRequestMeta | null> {
+  const row = await db.client_meta.get("full_resync_requested");
+  return (row?.value as FullResyncRequestMeta | null | undefined) ?? null;
+}
+
+export async function setFullResyncRequest(
+  db: SmartRSSDB,
+  req: FullResyncRequestMeta,
+): Promise<void> {
+  await db.client_meta.put({ key: "full_resync_requested", value: req });
+}
+
+export async function clearFullResyncRequest(db: SmartRSSDB): Promise<void> {
+  await db.client_meta.delete("full_resync_requested");
 }
 
 export async function getAppSettingsMeta(db: SmartRSSDB): Promise<SyncAppSettingsDTO | null> {

@@ -22,6 +22,17 @@ from smartrss.db.engine import build_engine, build_sessionmaker
 from smartrss.db.models import AppSettings, Device, SyncState
 from smartrss.db.recanonicalize import recanonicalize_all_items
 from smartrss.db.sync_log import APP_SETTINGS_ENTITY_ID, SyncEvent, sync_log
+from smartrss.feeds.service import (
+    MAX_OPML_BYTES,
+    FeedAlreadySubscribedError,
+    FeedCategoryNotFoundError,
+    FeedValidationError,
+    OpmlImportSummary,
+    create_or_reactivate_feed,
+    export_opml_xml,
+    import_opml_subscriptions,
+    list_feeds_query,
+)
 from smartrss.logging import configure_logging
 from smartrss.search.fts import reindex_all_items
 from smartrss.security.auth import create_pairing_code, revoke_device
@@ -35,6 +46,7 @@ worker_app = typer.Typer(help="Background worker commands", no_args_is_help=True
 settings_app = typer.Typer(help="Database app_settings commands", no_args_is_help=True)
 db_app = typer.Typer(help="Database migration and operational commands", no_args_is_help=True)
 search_app = typer.Typer(help="Full-text search index commands", no_args_is_help=True)
+feeds_app = typer.Typer(help="Headless feed management commands", no_args_is_help=True)
 
 app.add_typer(pair_app, name="pair")
 app.add_typer(devices_app, name="devices")
@@ -42,6 +54,7 @@ app.add_typer(worker_app, name="worker")
 app.add_typer(settings_app, name="settings")
 app.add_typer(db_app, name="db")
 app.add_typer(search_app, name="search")
+app.add_typer(feeds_app, name="feeds")
 
 EX_CONFIG = 78
 
@@ -430,6 +443,288 @@ def search_reindex(
 
     count = asyncio.run(_run())
     typer.echo(f"Reindexed {count} items using FTS_LANGUAGE={cfg.fts_language}.")
+
+
+@feeds_app.command("list")
+def feeds_list(
+    status_filter: Literal["active", "paused", "muted", "unsubscribed"] | None = typer.Option(
+        None, "--status", help="Filter by feed status"
+    ),
+    health_state: Literal["healthy", "degraded", "broken", "gone"] | None = typer.Option(
+        None, "--health", help="Filter by feed health state"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON array to stdout"),
+) -> None:
+    """List subscribed feeds (1d-ops, E-11)."""
+    cfg = get_settings()
+
+    async def _run() -> list[dict[str, str | None]]:
+        engine = build_engine(cfg.database_url)
+        factory = build_sessionmaker(engine)
+        try:
+            async with factory() as session:
+                rows = await list_feeds_query(
+                    session, status_filter=status_filter, health_state=health_state
+                )
+            return [
+                {
+                    "id": str(f.id),
+                    "status": f.status,
+                    "health_state": f.health_state,
+                    "title": f.title,
+                    "feed_url": f.feed_url,
+                    "category_id": str(f.category_id) if f.category_id else None,
+                }
+                for f in rows
+            ]
+        finally:
+            await engine.dispose()
+
+    items = asyncio.run(_run())
+    if json_output:
+        typer.echo(json.dumps(items, indent=2))
+        return
+    if not items:
+        typer.echo("No feeds found.")
+        return
+    for item in items:
+        typer.echo(
+            f"{item['id']}  {item['status']!s:<12}  {item['health_state']!s:<8}  "
+            f"{item['title']}  {item['feed_url']}"
+        )
+
+
+@feeds_app.command("add")
+def feeds_add(
+    url: str = typer.Argument(..., help="Feed URL (http/https)"),
+    title: str | None = typer.Option(None, "--title", help="Optional display title"),
+    category: str | None = typer.Option(
+        None, "--category", help="Category UUID or existing category name"
+    ),
+    create_category: bool = typer.Option(
+        False,
+        "--create-category",
+        help="Create the named category if it does not already exist (O-05)",
+    ),
+    poll_interval: int | None = typer.Option(
+        None, "--poll-interval", min=5, max=10080, help="Poll interval in minutes"
+    ),
+    no_full_text: bool = typer.Option(
+        False, "--no-full-text", help="Disable full-text extraction for this feed"
+    ),
+    if_not_exists: bool = typer.Option(
+        False,
+        "--if-not-exists",
+        help="Exit 0 if already active (or 3 if paused/muted) instead of failing",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON summary to stdout"),
+) -> None:
+    """Subscribe to a feed (or reactivate an unsubscribed feed) headlessly (1d-ops, E-11)."""
+    cfg = get_settings()
+    cat_id: uuid.UUID | None = None
+    cat_name: str | None = None
+    if category is not None:
+        try:
+            cat_id = uuid.UUID(category.strip())
+        except ValueError:
+            cat_name = category
+
+    fields_set: set[str] = set()
+    if no_full_text:
+        fields_set.add("fetch_full_text")
+
+    async def _run() -> tuple[int, dict[str, object], str | None]:
+        engine = build_engine(cfg.database_url, strict_sync_guard=cfg.synclog_strict_guard)
+        factory = build_sessionmaker(engine, strict_sync_guard=cfg.synclog_strict_guard)
+        policy = SSRFPolicy(extra_blocked_cidrs=cfg.ssrf_blocked_cidrs)
+        try:
+            async with factory() as session:
+                try:
+                    feed, reactivated = await create_or_reactivate_feed(
+                        session,
+                        policy,
+                        feed_url=url,
+                        title=title,
+                        category_id=cat_id,
+                        category_name=cat_name,
+                        create_category_if_missing=create_category,
+                        poll_interval_minutes=poll_interval,
+                        fetch_full_text=not no_full_text,
+                        fields_set=fields_set,
+                    )
+                    await session.commit()
+                except (FeedValidationError, FeedCategoryNotFoundError) as exc:
+                    return 2, {"error": str(exc)}, str(exc)
+                except FeedAlreadySubscribedError as exc:
+                    payload: dict[str, object] = {
+                        "id": str(exc.existing_feed_id),
+                        "feed_url": exc.feed_url,
+                        "status": exc.existing_status,
+                        "created": False,
+                        "reactivated": False,
+                    }
+                    if if_not_exists:
+                        code = 0 if exc.existing_status == "active" else 3
+                        return code, payload, None
+                    return 1, payload, str(exc)
+            return (
+                0,
+                {
+                    "id": str(feed.id),
+                    "feed_url": feed.feed_url,
+                    "title": feed.title,
+                    "status": feed.status,
+                    "category_id": str(feed.category_id) if feed.category_id else None,
+                    "created": not reactivated,
+                    "reactivated": reactivated,
+                },
+                None,
+            )
+        finally:
+            await engine.dispose()
+
+    exit_code, payload, err_msg = asyncio.run(_run())
+    if err_msg is not None:
+        if json_output:
+            typer.echo(json.dumps(payload))
+        else:
+            typer.echo(f"ERROR: {err_msg}", err=True)
+        raise typer.Exit(code=exit_code)
+
+    if json_output:
+        typer.echo(json.dumps(payload))
+    elif not payload.get("created") and not payload.get("reactivated"):
+        typer.echo(
+            f"Already subscribed (status={payload['status']}): "
+            f"{payload['id']} {payload['feed_url']}"
+        )
+    elif payload.get("reactivated"):
+        typer.echo(f"Reactivated feed {payload['id']} ({payload['title']}): {payload['feed_url']}")
+    else:
+        typer.echo(f"Added feed {payload['id']} ({payload['title']}): {payload['feed_url']}")
+
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
+
+
+def _read_bounded_opml_source(source: str) -> str:
+    """Read UTF-8 OPML from a file path or '-' (stdin), enforcing MAX_OPML_BYTES (S5)."""
+    if source == "-":
+        raw = sys.stdin.buffer.read(MAX_OPML_BYTES + 1)
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise FeedValidationError(f"OPML file not found: {source}")
+        with path.open("rb") as fh:
+            raw = fh.read(MAX_OPML_BYTES + 1)
+
+    if len(raw) > MAX_OPML_BYTES:
+        raise FeedValidationError(f"OPML input exceeds {MAX_OPML_BYTES} bytes limit")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FeedValidationError(f"OPML input is not valid UTF-8: {exc}") from exc
+
+
+@feeds_app.command("import-opml")
+def feeds_import_opml(
+    source: str = typer.Argument(..., help="Path to OPML file, or '-' to read from stdin"),
+    default_category: uuid.UUID | None = typer.Option(
+        None, "--default-category", help="Optional default category UUID for uncategorized feeds"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON summary to stdout"),
+) -> None:
+    """Import feeds from an OPML 2.0 file or stdin ('-') headlessly (1d-ops, E-11)."""
+    try:
+        opml_xml = _read_bounded_opml_source(source)
+    except FeedValidationError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    cfg = get_settings()
+
+    async def _run() -> OpmlImportSummary:
+        engine = build_engine(cfg.database_url, strict_sync_guard=cfg.synclog_strict_guard)
+        factory = build_sessionmaker(engine, strict_sync_guard=cfg.synclog_strict_guard)
+        policy = SSRFPolicy(extra_blocked_cidrs=cfg.ssrf_blocked_cidrs)
+        try:
+            async with factory() as session:
+                summary = await import_opml_subscriptions(
+                    session,
+                    policy,
+                    opml_xml=opml_xml,
+                    default_category_id=default_category,
+                )
+                await session.commit()
+                return summary
+        finally:
+            await engine.dispose()
+
+    try:
+        summary = asyncio.run(_run())
+    except (FeedValidationError, FeedCategoryNotFoundError) as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "imported": summary.imported,
+                    "reactivated": summary.reactivated,
+                    "skipped_duplicates": summary.skipped_duplicates,
+                    "rejected_invalid": summary.rejected_invalid,
+                }
+            )
+        )
+    else:
+        typer.echo(
+            f"imported={summary.imported} reactivated={summary.reactivated} "
+            f"skipped_duplicates={summary.skipped_duplicates} "
+            f"rejected_invalid={summary.rejected_invalid}"
+        )
+
+
+@feeds_app.command("export-opml")
+def feeds_export_opml(
+    output: str = typer.Option(
+        "-", "--output", "-o", help="Destination path, or '-' to write XML to stdout"
+    ),
+) -> None:
+    """Export active, paused, and muted feeds as a portability OPML 2.0 XML document (E-11)."""
+    cfg = get_settings()
+
+    async def _run() -> str:
+        engine = build_engine(cfg.database_url)
+        factory = build_sessionmaker(engine)
+        try:
+            async with factory() as session:
+                return await export_opml_xml(session)
+        finally:
+            await engine.dispose()
+
+    xml_str = asyncio.run(_run())
+    if output == "-":
+        sys.stdout.write(xml_str)
+        sys.stdout.flush()
+        return
+
+    dest = Path(output)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}")
+    data = xml_str.encode("utf-8")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, dest)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
 
 
 if __name__ == "__main__":

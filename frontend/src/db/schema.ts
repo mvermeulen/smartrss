@@ -45,10 +45,16 @@ export interface SyncLockMeta {
   expires_at: number;
 }
 
+export interface FullResyncRequestMeta {
+  request_id: string;
+  requested_at: number;
+}
+
 export type ClientMetaValue =
   | AuthMeta
   | SyncCursorMeta
   | SyncLockMeta
+  | FullResyncRequestMeta
   | SyncAppSettingsDTO
   | SyncInterestProfileDTO
   | UiPrefs

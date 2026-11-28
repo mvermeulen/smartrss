@@ -19,11 +19,14 @@ import {
   SmartRSSApiClient,
 } from "../api/client";
 import {
+  clearFullResyncRequest,
   DEFAULT_SYNC_META,
   getAuthMeta,
+  getFullResyncRequest,
   getSyncMeta,
   setAppSettingsMeta,
   setAuthMeta,
+  setFullResyncRequest,
   setInterestProfileMeta,
   setSyncMeta,
 } from "../db/clientMeta";
@@ -83,6 +86,7 @@ export interface SyncEngineSnapshot {
 
 type BroadcastMsg =
   | { type: "outbox_enqueued"; senderId: string }
+  | { type: "full_resync_requested"; senderId: string }
   | { type: "sync_complete"; senderId: string }
   | { type: "auth_changed"; senderId: string };
 
@@ -213,14 +217,21 @@ export class SyncEngine {
           if (!this.running) {
             this.scheduleDebouncedSync();
           }
+        } else if (msg.type === "full_resync_requested") {
+          this.dirty = true;
+          if (!this.running) {
+            void this.triggerSync();
+          }
         } else if (msg.type === "sync_complete") {
           if (this.recheckOnSyncComplete) {
             this.recheckOnSyncComplete = false;
-            void this.db.outbox.count().then((cnt) => {
-              if (cnt > 0) {
-                void this.triggerSync();
-              }
-            });
+            void Promise.all([this.db.outbox.count(), getFullResyncRequest(this.db)]).then(
+              ([cnt, resyncReq]) => {
+                if (cnt > 0 || resyncReq !== null) {
+                  void this.triggerSync();
+                }
+              },
+            );
           }
         } else if (msg.type === "auth_changed") {
           void this.refreshAuthState();
@@ -466,16 +477,26 @@ export class SyncEngine {
   }
 
   async forceFullResync(): Promise<void> {
+    if (
+      this.snapshot.connectionState === "origin_confirm" ||
+      this.snapshot.connectionState === "auth_revoked"
+    ) {
+      return;
+    }
     const auth = await getAuthMeta(this.db);
     if (!auth) {
       return;
     }
-    await this.db.transaction("rw", [this.db.bootstrap_meta, this.db.bootstrap_items], async () => {
-      await this.db.bootstrap_meta.clear();
-      await this.db.bootstrap_items.clear();
+    // Persist request in its own client_meta row so an in-flight pull's setSyncMeta()
+    // can never clobber it, and execute the reset strictly under withSyncLock (1d-ops §6).
+    await setFullResyncRequest(this.db, {
+      request_id: uuidv4(),
+      requested_at: this.now(),
     });
-    const syncMeta = await getSyncMeta(this.db);
-    await setSyncMeta(this.db, { ...syncMeta, sync_cursor: null });
+    if (this.running) {
+      this.dirty = true;
+    }
+    this.postBroadcast({ type: "full_resync_requested", senderId: this.tabId });
     await this.triggerSync();
   }
 
@@ -526,6 +547,7 @@ export class SyncEngine {
   }
 
   private async tryRunLockedCycle(ifAvailable: boolean): Promise<{ acquired: boolean }> {
+    let lastCycleProgressed = false;
     const res = await withSyncLock(
       {
         db: this.db,
@@ -541,16 +563,19 @@ export class SyncEngine {
           while (loops < MAX_DRAIN_LOOPS) {
             this.dirty = false;
             const progressed = await this.executeSingleCycle(lock);
+            lastCycleProgressed = progressed;
             loops += 1;
             if (!progressed) {
               break;
             }
             const remaining = await this.db.outbox.count();
-            if (!this.dirty && remaining === 0) {
+            const pendingResync = (await getFullResyncRequest(this.db)) !== null;
+            if (!this.dirty && remaining === 0 && !pendingResync) {
               break;
             }
           }
         } catch (err) {
+          lastCycleProgressed = false;
           if (err instanceof SyncLockLostError) {
             return;
           }
@@ -570,6 +595,11 @@ export class SyncEngine {
     if (res.acquired) {
       // Broadcast AFTER releasing the lock so waiting tabs can acquire immediately (U-09-F1)
       this.postBroadcast({ type: "sync_complete", senderId: this.tabId });
+      // Post-release holder follow-up gated on lastCycleProgressed so offline/misconfigured
+      // tabs never spin-reschedule (O-02, O-02-F1).
+      if (lastCycleProgressed && (await getFullResyncRequest(this.db)) !== null) {
+        this.scheduleDebouncedSync(0);
+      }
     }
     return { acquired: res.acquired };
   }
@@ -600,6 +630,27 @@ export class SyncEngine {
         });
         return false;
       }
+    }
+
+    // Consume any pending forceFullResync() request strictly inside a fenced lock tx (1d-ops §6)
+    const resyncReq = await getFullResyncRequest(this.db);
+    if (resyncReq !== null) {
+      await this.db.transaction(
+        "rw",
+        [this.db.client_meta, this.db.bootstrap_meta, this.db.bootstrap_items],
+        async () => {
+          await lock.assertAndRenewInTx();
+          await this.db.bootstrap_meta.clear();
+          await this.db.bootstrap_items.clear();
+          const currentMeta = await getSyncMeta(this.db);
+          await setSyncMeta(this.db, { ...currentMeta, sync_cursor: null });
+          // Clear only if no newer forceFullResync() arrived after resyncReq was read
+          const latestReq = await getFullResyncRequest(this.db);
+          if (latestReq?.request_id === resyncReq.request_id) {
+            await clearFullResyncRequest(this.db);
+          }
+        },
+      );
     }
 
     const syncMeta = await getSyncMeta(this.db);
