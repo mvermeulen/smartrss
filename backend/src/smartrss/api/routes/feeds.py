@@ -29,7 +29,7 @@ from smartrss.domain.sync_merge import (
 )
 from smartrss.domain.url_canon import canonicalize_url, default_title_from_url
 from smartrss.jobs.queue import enqueue_job
-from smartrss.security.safe_http import SafeHttpError, SSRFPolicy
+from smartrss.security.safe_http import SafeHttpError, SSRFPolicy, validate_feed_url_syntax
 
 router = APIRouter(prefix="/api/v1/feeds", tags=["feeds"])
 
@@ -83,6 +83,7 @@ def _sanitize_site_url(raw: str | None) -> str | None:
 
 async def _validate_feed_url(policy: SSRFPolicy, url: str) -> str:
     cleaned = url.strip()
+    validate_feed_url_syntax(cleaned)
     _scheme, host, port = policy.validate_url(cleaned)
     await policy.resolve_and_validate(host, port)
     return cleaned
@@ -198,8 +199,9 @@ async def import_opml_endpoint(
         seen_in_opml.add(url)
 
         try:
-            # I-10: Syntax + literal IP check only during bulk OPML import (avoid serial DNS
-            # inside the DB transaction; full DNS + IP pinning runs in SafeHttpClient at fetch)
+            # I-10 / E-10-F1: Entry-time syntax + literal IP check only during bulk OPML import
+            # (avoid serial DNS inside the DB tx; full DNS + IP pinning runs at fetch)
+            validate_feed_url_syntax(url)
             ssrf_policy.validate_url_and_literal_ip(url)
         except (SafeHttpError, ValueError):
             rejected_invalid += 1

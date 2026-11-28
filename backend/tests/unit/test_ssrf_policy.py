@@ -6,7 +6,12 @@ import ipaddress
 
 import pytest
 
-from smartrss.security.safe_http import SSRFBlockedError, SSRFConnectionError, SSRFPolicy
+from smartrss.security.safe_http import (
+    SSRFBlockedError,
+    SSRFConnectionError,
+    SSRFPolicy,
+    validate_feed_url_syntax,
+)
 
 
 @pytest.mark.parametrize(
@@ -39,41 +44,41 @@ def test_validate_url_accepts_http_and_https_default_ports() -> None:
 @pytest.mark.parametrize(
     "bad_url",
     [
+        "",
         "https://www.latent.space/feed](https://www.latent.space/feed",
+        "[Latent Space](https://www.latent.space/feed)",
+        "<https://www.latent.space/feed>",
         "https://example.com/feed with space",
         "https://example.com/feed<tag>",
         'https://example.com/feed"quote',
-        "https://example.com/feed{brace}",
-        "https://example.com/feed|pipe",
-        "https://example.com/feed\\slash",
-        "https://example.com/feed^caret",
-        "https://example.com/feed`tick",
         "https://example.com/feed[0]",
-        "https://example.com/feed?a=b]",
-        "https://example.com/feed#frag[1]",
-        "https://example.com/feed/https://other.example/rss",
-        "https://example.com/feed?next=http://other.example/rss",
+        "https://example.com/feed)(https://example.com/feed",
+        "https://example.com/feed?a=1)(http://other.example/rss",
     ],
 )
-def test_e10_validate_url_rejects_markdown_and_rfc3986_disallowed_chars(bad_url: str) -> None:
-    policy = SSRFPolicy()
+def test_e10_f1_validate_feed_url_syntax_rejects_paste_artifacts(bad_url: str) -> None:
     with pytest.raises(SSRFBlockedError):
-        policy.validate_url(bad_url)
+        validate_feed_url_syntax(bad_url)
 
 
-def test_e10_validate_url_accepts_percent_encoded_and_ipv6_hosts() -> None:
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "https://example.com/feed%5D?q=a%20b&src=https%3A%2F%2Fother.test",
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/feed.xml",
+        "https://rss-bridge.example.org/?action=display&bridge=Mastodon&url=https://mastodon.social/@x&format=Atom",
+        "https://web.archive.org/web/2024/https://example.com/post",
+        "https://example.com/feed?tags[]=python&filter[category]=news",
+        "https://example.com/a?x=1|2",
+    ],
+)
+def test_e10_f1_validate_url_and_entry_syntax_accept_legitimate_urls(good_url: str) -> None:
     policy = SSRFPolicy()
-    encoded_url = "https://example.com/feed%5D?q=a%20b&src=https%3A%2F%2Fother.test"
-    assert policy.validate_url(encoded_url) == (
-        "https",
-        "example.com",
-        443,
-    )
-    assert policy.validate_url("https://[2606:2800:220:1:248:1893:25c8:1946]/feed.xml") == (
-        "https",
-        "2606:2800:220:1:248:1893:25c8:1946",
-        443,
-    )
+    validate_feed_url_syntax(good_url)
+    scheme, host, port = policy.validate_url(good_url)
+    assert scheme == "https"
+    assert host
+    assert port == 443
 
 
 @pytest.mark.parametrize(

@@ -298,40 +298,176 @@ async def test_e07_api_responses_include_cache_control_no_store(
 async def test_e10_feed_url_validation_all_three_paths(
     api_env: dict[str, Any],
 ) -> None:
-    """E-10: Reject exact soak pasted Markdown URL on create, PATCH, and OPML import."""
+    """E-10 & E-10-F1 (d): Reject exact soak pasted Markdown URL on create, PATCH, and OPML
+    import, while accepting legitimate RSS-Bridge/query-bracket/pipe/archive URLs."""
     client: httpx.AsyncClient = api_env["client"]
     soak_bad_url = "https://www.latent.space/feed](https://www.latent.space/feed"
+    rss_bridge_url = (
+        "https://rss-bridge.example.org/"
+        "?action=display&bridge=Mastodon&url=https://mastodon.social/@x&format=Atom"
+    )
+    bracket_pipe_url = "https://valid.example.com/feed?tags[]=python&filter[category]=news&x=1|2"
+    archive_url = "https://web.archive.org/web/2024/https://example.com/rss.xml"
 
-    # 1. POST /api/v1/feeds -> 422
+    # 1. POST /api/v1/feeds -> 422 on soak paste, 201 on RSS-Bridge & percent-encoded URLs
     r_create = await client.post("/api/v1/feeds", json={"feed_url": soak_bad_url})
     assert r_create.status_code == 422
 
-    # Positive: valid percent-encoded path & query succeeds
+    r_bridge = await client.post("/api/v1/feeds", json={"feed_url": rss_bridge_url})
+    assert r_bridge.status_code == 201
+    assert r_bridge.json()["feed_url"] == rss_bridge_url
+
     valid_url = "https://valid.example.com/feed%5D?tag=a%20b"
     r_ok = await client.post("/api/v1/feeds", json={"feed_url": valid_url})
     assert r_ok.status_code == 201
     feed_id = r_ok.json()["id"]
 
-    # 2. PATCH /api/v1/feeds/{id} -> 422 and feed_url unchanged
+    # 2. PATCH /api/v1/feeds/{id} -> 422 on soak paste (unchanged), 200 on query brackets & pipe
     r_patch = await client.patch(f"/api/v1/feeds/{feed_id}", json={"feed_url": soak_bad_url})
     assert r_patch.status_code == 422
     r_get = await client.get(f"/api/v1/feeds/{feed_id}")
     assert r_get.status_code == 200
     assert r_get.json()["feed_url"] == valid_url
 
-    # 3. POST /api/v1/feeds/import-opml -> rejected_invalid == 1, imported == 0
+    r_patch_ok = await client.patch(f"/api/v1/feeds/{feed_id}", json={"feed_url": bracket_pipe_url})
+    assert r_patch_ok.status_code == 200
+    assert r_patch_ok.json()["feed_url"] == bracket_pipe_url
+
+    # 3. POST /api/v1/feeds/import-opml -> rejects soak paste, imports archive URL
     opml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
-  <head><title>Bad Paste</title></head>
+  <head><title>Mixed Import</title></head>
   <body>
     <outline text="Latent Space" type="rss" xmlUrl="{soak_bad_url}" />
+    <outline text="Archive Feed" type="rss" xmlUrl="{archive_url}" />
   </body>
 </opml>"""
     r_opml = await client.post("/api/v1/feeds/import-opml", json={"opml_xml": opml_xml})
     assert r_opml.status_code == 200
     body = r_opml.json()
-    assert body["imported"] == 0
+    assert body["imported"] == 1
     assert body["rejected_invalid"] == 1
+
+
+async def test_e10_f1_extract_content_allows_query_scheme_brackets_and_pipes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """E-10-F1 (c): extract_content of a raw_url with ?url=https://..., tags[]=, and x=1|2
+    succeeds with extraction_status='ok' (does not fall back to fallback_rss)."""
+    from smartrss.worker.stages.extract_content import run_extract_content
+
+    article_html = (
+        b"<!doctype html><html><head><title>Bridge Article</title></head><body>"
+        b"<article><h1>Bridge Article</h1>"
+        b"<p>This is a full-length article body fetched through a proxy query parameter "
+        b"containing an embedded scheme, bracket array notation, and a pipe filter so "
+        b"trafilatura extracts meaningful content cleanly without falling back to RSS.</p>"
+        b"<p>Additional paragraph ensuring the extracted text comfortably exceeds the "
+        b"minimum extracted character threshold required by extract_content.</p>"
+        b"</article></body></html>"
+    )
+    http_resp = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        + f"Content-Length: {len(article_html)}\r\nConnection: close\r\n\r\n".encode("ascii")
+        + article_html
+    )
+
+    class _StaticHtmlStream(httpcore.AsyncNetworkStream):
+        def __init__(self) -> None:
+            self._buf = http_resp
+
+        async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:  # noqa: ASYNC109
+            chunk, self._buf = self._buf[:max_bytes], self._buf[max_bytes:]
+            return chunk
+
+        async def write(self, buffer: bytes, timeout: float | None = None) -> None:  # noqa: ASYNC109
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+        async def start_tls(
+            self,
+            ssl_context: Any,
+            server_hostname: str | None = None,
+            timeout: float | None = None,  # noqa: ASYNC109
+        ) -> httpcore.AsyncNetworkStream:
+            return self
+
+        def get_extra_info(self, info: str) -> Any:
+            return None
+
+    class _StaticHtmlBackend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,  # noqa: ASYNC109
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            return _StaticHtmlStream()
+
+        async def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,  # noqa: ASYNC109
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            raise AssertionError("unreachable")
+
+        async def sleep(self, seconds: float) -> None:
+            pass
+
+    feed_id = uuid.uuid4()
+    item_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    complex_raw_url = (
+        "http://proxy.example.org/article?url=https://mastodon.social/@x&tags[]=python&x=1|2"
+    )
+    async with session_factory() as s:
+        s.add(Feed(id=feed_id, feed_url="https://proxy.example.org/rss", title="Proxy Feed"))
+        await s.flush()
+        s.add(
+            Item(
+                id=item_id,
+                feed_id=feed_id,
+                guid="complex-article-1",
+                raw_url=complex_raw_url,
+                canonical_url=complex_raw_url,
+                title="Bridge Article",
+                fetched_at=now,
+                extraction_status="pending",
+                state="unread",
+                is_starred=False,
+                read_state_updated_at=now,
+                starred_updated_at=now,
+            )
+        )
+        await s.flush()
+        await sync_log.record(
+            s, [SyncEvent("feed", feed_id, "upsert"), SyncEvent("item", item_id, "upsert")]
+        )
+        await s.commit()
+
+    policy = SSRFPolicy(resolver=_make_dns({"proxy.example.org": ["93.184.216.34"]}))
+    limiter = DomainRateLimiter(min_interval_seconds=0.0)
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(policy, network_backend=_StaticHtmlBackend()),
+    ) as client:
+        outcome = await run_extract_content(session_factory, client, limiter, item_id=item_id)
+
+    assert outcome.metric_status == "ok"
+    assert outcome.extraction_status == "ok"
+    async with session_factory() as s:
+        item = await s.get(Item, item_id)
+        assert item is not None
+        assert item.extraction_status == "ok"
+        assert (
+            item.extracted_text and "trafilatura extracts meaningful content" in item.extracted_text
+        )
 
 
 async def test_e12_recanonicalize_and_poll_feed_guid_rotation_matches(

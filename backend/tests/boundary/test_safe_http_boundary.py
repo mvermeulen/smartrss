@@ -823,3 +823,94 @@ async def test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions() ->
     with pytest.raises(SSRFConnectionError) as close_exc:
         await pinned.aclose()
     assert isinstance(close_exc.value.__cause__, httpcore.ReadError)
+
+
+@pytest.mark.parametrize(
+    "pool_exc",
+    [httpcore.ReadError("pool close read err"), httpcore.ConnectError("pool close conn err")],
+)
+async def test_e01_f1_safe_transport_aclose_maps_httpcore_exceptions(
+    pool_exc: Exception,
+) -> None:
+    """E-01-F1: SafeTransport.aclose() maps httpcore pool.aclose() errors into SafeHttpError."""
+    from smartrss.security.safe_http import SafeHttpError, SSRFConnectionError
+
+    policy = SSRFPolicy(resolver=_make_dns({"close.example.com": ["93.184.216.34"]}))
+    transport = SafeTransport(policy)
+
+    async def _failing_pool_aclose() -> None:
+        raise pool_exc
+
+    transport._pool.aclose = _failing_pool_aclose  # type: ignore[method-assign]
+
+    with pytest.raises(SSRFConnectionError) as exc_info:
+        async with SafeHttpClient(policy=policy, transport=transport):
+            pass
+    assert isinstance(exc_info.value, SafeHttpError)
+    assert exc_info.value.__cause__ is pool_exc
+
+
+async def test_e10_f1_fetch_and_redirect_allow_query_schemes_brackets_and_pipes() -> None:
+    """E-10-F1 (a, b): SafeHttpClient.fetch() allows legitimate query params (?url=https://...,
+    ?tags[]=x, ?x=1|2) and archive paths both on direct fetches and redirect Locations."""
+    seen_targets: list[str] = []
+
+    def _responder(raw: bytes) -> list[bytes]:
+        first_line = raw.split(b"\r\n", 1)[0].decode("latin-1")
+        target = first_line.split(" ", 2)[1]
+        seen_targets.append(target)
+        if target.startswith("/start"):
+            return [
+                _http_response(
+                    302,
+                    b"",
+                    headers={
+                        "Location": (
+                            "http://proxy.example.org/step2"
+                            "?url=https://mastodon.social/@x&tags[]=python&filter[cat]=news&x=1|2"
+                        )
+                    },
+                )
+            ]
+        if target.startswith("/step2"):
+            return [
+                _http_response(
+                    302,
+                    b"",
+                    headers={
+                        "Location": "http://archive.example.org/web/2024/https://example.com/post"
+                    },
+                )
+            ]
+        return [_http_response(200, b"ok-complex-url")]
+
+    policy = SSRFPolicy(
+        resolver=_make_dns(
+            {
+                "proxy.example.org": ["93.184.216.34"],
+                "archive.example.org": ["93.184.216.34"],
+            }
+        )
+    )
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(
+            policy,
+            network_backend=_RecordingNetworkBackend(lambda _ip, _port, raw: _responder(raw)),
+        ),
+    ) as client:
+        # (a) Direct fetch with embedded scheme, brackets, and pipe in query
+        direct = await client.fetch(
+            "http://proxy.example.org/?action=display&url=https://mastodon.social/@x&tags[]=x&x=1|2"
+        )
+        assert direct.status_code == 200
+        assert direct.body_bytes == b"ok-complex-url"
+
+        # (b) Redirects carrying those query/path shapes are followed cleanly
+        redirected = await client.fetch("http://proxy.example.org/start")
+        assert redirected.status_code == 200
+        assert redirected.body_bytes == b"ok-complex-url"
+        assert (
+            redirected.final_url == "http://archive.example.org/web/2024/https://example.com/post"
+        )
+    assert len(seen_targets) == 4

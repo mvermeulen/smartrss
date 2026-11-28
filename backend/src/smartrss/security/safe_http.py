@@ -38,8 +38,29 @@ NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 NAT64_LOCAL_USE_PREFIX = ipaddress.ip_network("64:ff9b:1::/48")
 
 DEFAULT_USER_AGENT = "SmartRSS/0.1 (+https://github.com/smartrss)"
-_FORBIDDEN_URL_CHARS = frozenset(' <>"{}|\\^`')
-_EMBEDDED_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
+_FEED_ENTRY_DISALLOWED_CHARS = frozenset('<>"')
+_MARKDOWN_PASTE_SCHEME_RE = re.compile(r"(?:\]\(|\)\()https?://", re.IGNORECASE)
+
+
+def validate_feed_url_syntax(url: str) -> None:
+    """Reject common copy-paste artifacts at feed entry time (E-10, E-10-F1).
+
+    Used on POST /feeds, PATCH /feeds/{id}, and OPML import — NOT on SafeHttpClient.fetch(),
+    so legitimate fetched URLs, redirects, and query parameters (?url=https://..., ?tags[]=x,
+    ?x=1|2) or archive paths (/web/2024/https://...) remain accepted.
+    """
+    if not url or any(ch.isspace() or ch in _FEED_ENTRY_DISALLOWED_CHARS for ch in url):
+        raise SSRFBlockedError("URL contains disallowed whitespace or angle-bracket/quote chars")
+    parts = urlsplit(url)
+    if "[" in parts.path or "]" in parts.path:
+        raise SSRFBlockedError("URL path contains unescaped brackets")
+    non_host = (
+        f"{parts.path}"
+        f"{'?' + parts.query if parts.query else ''}"
+        f"{'#' + parts.fragment if parts.fragment else ''}"
+    )
+    if _MARKDOWN_PASTE_SCHEME_RE.search(non_host):
+        raise SSRFBlockedError("URL contains a pasted Markdown link")
 
 
 class SafeHttpError(Exception):
@@ -108,11 +129,9 @@ class SSRFPolicy:
         self.resolver: AsyncResolver = resolver or default_dns_resolver
 
     def validate_url(self, url: str) -> tuple[str, str, int]:
-        """Validate URL syntax, scheme, userinfo, port, and RFC 3986 path/query/fragment safety."""
+        """Validate URL syntax, scheme, userinfo, and port. Return (scheme, host, port)."""
         if not url or any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
             raise SSRFBlockedError("URL contains control characters or is empty")
-        if any(ch in _FORBIDDEN_URL_CHARS for ch in url):
-            raise SSRFBlockedError("URL contains disallowed unescaped characters")
 
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
@@ -122,18 +141,6 @@ class SSRFPolicy:
             raise SSRFBlockedError("Embedded URL credentials are forbidden")
         if not parts.hostname:
             raise SSRFBlockedError("URL is missing hostname")
-
-        # E-10: Reject unescaped '[' / ']' outside the host literal and embedded http(s)://
-        rest_parts = (parts.path, parts.query, parts.fragment)
-        if any("[" in part or "]" in part for part in rest_parts):
-            raise SSRFBlockedError("URL contains unescaped brackets outside host")
-        non_host = (
-            f"{parts.path}"
-            f"{'?' + parts.query if parts.query else ''}"
-            f"{'#' + parts.fragment if parts.fragment else ''}"
-        )
-        if _EMBEDDED_SCHEME_RE.search(non_host):
-            raise SSRFBlockedError("URL contains an embedded http(s):// scheme")
 
         try:
             port = parts.port or (443 if scheme == "https" else 80)

@@ -5,7 +5,7 @@
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `E-`
-- **Status**: `Addressed (2026-11-27) — awaiting verification`
+- **Status**: `Addressed (pass 2, 2026-11-27) — awaiting verification`
 
 ## Review outcome
 
@@ -430,3 +430,96 @@ The line used for this test is:
 ## Accepted residual risks
 
 *(None yet.)*
+
+## Verification pass (2026-11-27)
+
+**Verifier:** Claude Code, in a fresh session on `review/1a-1c-user-test` at `1987f2b`.
+
+**`make check`:** green. Backend: **200 passed**, **91.79%** branch coverage (claimed 91.78%), and all 16 critical modules ≥ 90%. Runner: **32 passed**, 94.87%. Frontend: **57 passed** (6 files), and all gates pass. The test counts match the resolution notes exactly.
+
+**Method.** I disabled each fixed path on its own with a minimal edit, ran the cited test (or the full suite where none was cited), restored the file, and confirmed the restore byte for byte (`git status` clean afterwards). That is 33 reverts in total, scripted.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `E-01` (Major) | ⚠️ resolved, with a test gap (`E-01-F1`) | Fix present on every path. `connect_tcp` catches `httpcore.ConnectError` / `ConnectTimeout` per IP, `_map_httpcore_exceptions()` wraps `handle_async_request`, `_PinnedStream.__aiter__` / `aclose` and `SafeTransport.aclose`, and `extract_content` now catches `SafeHttpError`. `poll_feed` already caught `SafeHttpError`. The sibling `SafeHttpClient` users (`cli.py` run-once / worker) all go through these two stages. Each revert failed its cited test: `connect_tcp` → both `test_e01_connect_tcp_failover…` / `test_e01_all_ips_fail…`; `handle_async_request`, `__aiter__`, `_PinnedStream.aclose` → `test_e01_safe_transport_and_pinned_stream…`; `extract_content` catch → `test_e01_poll_feed_and_extract_content_typed_paths…`. **Exception:** reverting the `SafeTransport.aclose` mapping leaves the **full suite green** (200 passed). |
+| `E-02` | ✅ | `backend/.python-version` = `3.12`; `requires-python = ">=3.12,<3.14"`; `uv lock --check` is clean; README updated. `test_e02_python_version_pin_present` is a config-presence check, which is adequate here. |
+| `E-03` | ✅ | `elif ! docker info` branch with `usermod` / `newgrp` hints. With the branch disabled, `test_e03_check_prereqs_rejects_inaccessible_docker_daemon` fails. |
+| `E-04` | ✅ | `--api-origin URL` / `=URL` is validated with `validate_api_origin` **before** any directory or config is touched, and replaces `SMARTRSS_API_ORIGIN` in place. Disabling the case arm, or the in-place replace, fails `test_e04_install_client_api_origin_flag`. README path, `mv` swap, Node 22+ and status line all fixed. |
+| `E-05` | ✅ | Docs only. README now shows the full `flock` / `-T` / `--max-duration 840` / log-redirect line, the `--json` stderr note and a `logrotate` stanza. |
+| `E-06` | ✅ | Disabling `feeds_polled += 1`, `feeds_not_modified += 1`, or `run.feeds_polled = …` in `finalize_pipeline_run` fails `test_e08_e06_…`. Reverting the CLI text fails `test_e06_e12_cli_text_summary…`. `data-model.md` defines the fields. |
+| `E-07` | ✅ | Removing the middleware registration fails `test_e07_api_responses_include_cache_control_no_store`. Forcing an overwrite of an existing `Cache-Control` fails `test_e07_no_store_middleware_preserves…`. Re-adding request-side `cache: "no-store"` fails the vitest `test_e07_api_client_omits…`. The `1c` CORS invariant text is updated. |
+| `E-08` | ✅ | Removing the 304 `outcome`, the 200 `outcome="fetched"`, `complete_job`'s `outcome=` pass-through, or the `not_modified_count` SQL filter each fails `test_e08_e06_…`. Removing the migration's data step fails `test_e08_e12_migration_0003…`. `ok_count` still includes 304s. `data-model.md` §4.9 is updated. |
+| `E-09` | ⏸ deferred | Future requirement plus design, as the finding itself proposed. The **owner still has to decide which milestone carries it** (for example alongside `1d`). |
+| `E-10` | ⚠️ partially resolved → **`E-10-F1` (Major, regression)** | The soak string is rejected on create, PATCH and OPML import, and the UI clean-up works. Every revert fails its cited test (`_FORBIDDEN_URL_CHARS`, bracket and embedded-scheme checks → `test_ssrf_policy.py` / `test_e10_feed_url_validation_all_three_paths`; Markdown and `<url>` clean-up → vitest). **But** the new checks were put in `SSRFPolicy.validate_url()`, which `SafeHttpClient.fetch()` runs on **every hop of every fetch**, so they also reject valid URLs. See `E-10-F1`. |
+| `E-11` | ⏸ deferred | The owner amended this finding (the UI export is sufficient). The headless CLI and the OPML copy in backups go with `E-09`. |
+| `E-12` | ✅ | Removing `at_medium` / `at_campaign` fails `test_url_canon.py` and `test_e12_recanonicalize…`. Disabling `compute_updated_canonical_url` or `sync_log.record` in `recanonicalize_all_items` fails `test_e12_recanonicalize…`. Disabling the migration data step fails `test_e08_e12_migration…`. Only explicit `at_*` names are stripped, never the bare prefix. `data-model.md` lists the strip set. |
+| `E-13` | ✅ | Every service uses `logging: *default-logging`; dropping it from `api` fails `test_e13_compose_services…`. The api healthcheck is now every 30 s. Not attaching `HealthCheckAccessFilter` fails a test in the full suite. I also checked it **under real uvicorn** (`--factory`, the same startup order as the `api` container): `GET /api/v1/health` is dropped while `GET /` and `/api/v1/sync/pull` are still logged. (Reverting only the `record.args` branch stays green, because the message-text fallback covers the same case. That is a redundant guard, not a gap.) |
+
+### Follow-ups
+
+- **`E-10-F1` (Major; a regression introduced by the `E-10` fix): the strict paste-error checks run on the fetch path, not just at feed entry.** `_FORBIDDEN_URL_CHARS`, the bracket check and `_EMBEDDED_SCHEME_RE` are in `SSRFPolicy.validate_url()`. `SafeHttpClient.fetch()` calls that for the initial URL and every redirect `Location` (`safe_http.py:566`), and `poll_feed` / `extract_content` both use it. Reproduced against `validate_url` directly; all of these were accepted before `1987f2b` and are rejected now:
+  - `https://rss-bridge.example.org/?action=display&bridge=Mastodon&url=https://mastodon.social/@x&format=Atom`: "embedded http(s):// scheme". RSS-Bridge, RSSHub-style proxies and `?url=` / `?ref=` parameters are common for a self-hosted reader.
+  - `https://web.archive.org/web/2024/https://example.com/post`: embedded scheme in the path, but a legitimate URL.
+  - `https://example.com/feed?tags[]=python` and `?filter[category]=news`: "unescaped brackets". PHP- and JSON:API-style query arrays, which browsers and httpx send as they are.
+  - `https://example.com/a?x=1|2`: "disallowed unescaped characters".
+
+  **Impact:** after upgrading, an **already-subscribed** feed with one of these URLs gets `SSRFBlockedError` → `_record_feed_poll_error` on every poll and ends up `degraded` / `broken`. Article URLs of these shapes, and redirects to them, silently drop to `fallback_rss` in `extract_content`. Such feeds can't be added at all. `1a` §7.2 now documents the behaviour as intended ("shared across … and `SafeHttpClient.fetch()`"). The original `E-10` suggestion ("keep it shared with `SSRFPolicy.validate_url` so they can't drift apart") was ambiguous on this point, and the reviewer shares the blame. The intent was a shared *entry-time* validator, not a stricter fetch policy.
+
+  **Expected fix:**
+  1. Restore `validate_url()` (fetch path) to its pre-`E-10` behaviour: control characters, scheme, userinfo, host and port.
+  2. Move the paste-error checks into a separate entry-time validator (for example `validate_feed_url_syntax()`), used by `POST` / `PATCH /feeds` and OPML import.
+  3. Narrow that validator so legitimate URLs pass. Reject whitespace and `<>"`, `[` / `]` in the **path**, and an embedded `http(s)://` in the **path** only, or only right after `](` / `)(`. That still rejects the soak string, which already fails on its `]`. Allow brackets, `|` and embedded schemes in the **query**. The lenient alternative is to percent-encode them before storing.
+  4. Update `1a` §7.2.
+
+  **Regression tests:**
+  - (a) `SafeHttpClient.fetch()` of a `?url=https://…&tags[]=x` URL succeeds against a local fixture;
+  - (b) a redirect whose `Location` carries such a query is followed;
+  - (c) `extract_content` of such a `raw_url` does not fall back;
+  - (d) `POST /feeds` with the RSS-Bridge URL → `201`, while the soak string still → `422` on all three paths.
+
+  Each must fail against `1987f2b`.
+- **`E-01-F1` (Nit, test gap):** the `_map_httpcore_exceptions()` wrapper on `SafeTransport.aclose()` (`safe_http.py:357`) is listed as fixed but no test reaches it; reverting it leaves all 200 tests green. Add a boundary case in which the pool's `aclose()` raises `httpcore.ReadError` / `ConnectError`, and assert that `SafeHttpClient.__aexit__` raises a `SafeHttpError` subclass. Alternatively, drop the wrapper and document that `aclose` errors are allowed to escape.
+
+### Observations (no action required)
+
+- Migration `0003`'s data step imports the live `smartrss.db.recanonicalize.compute_updated_canonical_url`, so it is not frozen. A later change to the strip list would change what `0003` does when it is replayed on an older restored database. This is acceptable because later strip-list changes are expected to ship with their own `db recanonicalize` step. If that ever matters, inline a frozen copy.
+- `cleanPastedFeedUrl` runs in `onChange`, so the URL input is trimmed on every keystroke. This is harmless for URLs.
+
+### Repo-wide drift
+
+- `docs/README.md` has exactly one row for this review (no duplicates). The review header and that row now agree.
+- `CRITICAL_MODULES` is unchanged (`1a` + `1b` lists). No new file needs adding: `recanonicalize.py` is at 100% but is not a critical module under the approved designs.
+- No untracked files. Nothing in the diff looks like a secret.
+
+**Status:** left at `Addressed — verification found follow-ups`. Handed back to Antigravity (`address-review-findings`) for `E-10-F1` and `E-01-F1`.
+
+## Follow-up resolutions (pass 2, 2026-11-27)
+
+*(Addressed 2026-11-27 on `review/1a-1c-user-test`; awaiting Claude Code pass-2 verification.)*
+
+- **E-10-F1** — Fixed.
+  - Restored `SSRFPolicy.validate_url()` (`backend/src/smartrss/security/safe_http.py:131-155`) to its pre-`E-10` fetch-path behavior (control characters, scheme, userinfo, host, and port only), so `SafeHttpClient.fetch()`, redirect hops, `poll_feed`, and `extract_content` accept legitimate query strings (`?url=https://…`, `?tags[]=python`, `?filter[category]=news`, `?x=1|2`) and archive paths (`/web/2024/https://…`).
+  - Added a dedicated entry-time validator `validate_feed_url_syntax()` (`backend/src/smartrss/security/safe_http.py:45-64`) that rejects whitespace, `<>"`, unescaped `[`/`]` in `parts.path` (not query/host), and pasted Markdown link joins (`](http(s)://` / `)(http(s)://`), wired into all three feed-entry paths: `POST /api/v1/feeds` and `PATCH /api/v1/feeds/{id}` via `_validate_feed_url()` (`backend/src/smartrss/api/routes/feeds.py:86`) and `POST /api/v1/feeds/import-opml` (`feeds.py:204`).
+  - Updated `docs/design/1a-backend-ingestion-and-security.md` §7.2 to document fetch-path `SSRFPolicy.validate_url` vs. entry-time `validate_feed_url_syntax` separately.
+  - Tests:
+    - `test_e10_f1_validate_feed_url_syntax_rejects_paste_artifacts` & `test_e10_f1_validate_url_and_entry_syntax_accept_legitimate_urls` (`backend/tests/unit/test_ssrf_policy.py`)
+    - `test_e10_f1_fetch_and_redirect_allow_query_schemes_brackets_and_pipes` (`backend/tests/boundary/test_safe_http_boundary.py`) — covers (a) direct fetch and (b) redirect `Location` hops.
+    - `test_e10_f1_extract_content_allows_query_scheme_brackets_and_pipes` (`backend/tests/integration/test_user_test_regressions.py`) — covers (c) full extraction (`extraction_status == "ok"`, no fallback).
+    - `test_e10_feed_url_validation_all_three_paths` (`backend/tests/integration/test_user_test_regressions.py`) — covers (d) RSS-Bridge `POST` → `201`, query-bracket/pipe `PATCH` → `200`, archive-URL OPML import → `imported == 1`, while soak string still → `422` / `rejected_invalid == 1` on all three paths.
+  - Evidence (reverted individually):
+    - Re-applying `1987f2b`'s strict checks to `SSRFPolicy.validate_url()` failed all 4 regression suites: (a, b) `SSRFBlockedError: URL contains disallowed unescaped characters`; (c) `assert 'fallback_rss' == 'ok'`; (d) `assert 422 == 201`; unit `SSRFBlockedError: URL contains an embedded http(s):// scheme`.
+    - Removing `validate_feed_url_syntax()` from `_validate_feed_url` (`feeds.py`) failed `test_e10_feed_url_validation_all_three_paths` (`assert 201 == 422`); removing it from `import_opml_endpoint` failed `test_e10_feed_url_validation_all_three_paths` (`assert 2 == 1`).
+    - Disabling each rule inside `validate_feed_url_syntax` (whitespace/`<>"`, path brackets, Markdown join) individually failed `test_e10_f1_validate_feed_url_syntax_rejects_paste_artifacts` (`DID NOT RAISE SSRFBlockedError`).
+    - Restored, all passed; all fixed lines in `safe_http.py` (92.34%) and `feeds.py` covered.
+
+- **E-01-F1** — Fixed. Added parametrized boundary test `test_e01_f1_safe_transport_aclose_maps_httpcore_exceptions` (`backend/tests/boundary/test_safe_http_boundary.py:828-851`) verifying that `httpcore.ReadError` and `httpcore.ConnectError` from `transport._pool.aclose()` are mapped to `SSRFConnectionError` (chained via `__cause__`) when exiting `async with SafeHttpClient(...)`.
+  - Evidence: removed `with _map_httpcore_exceptions():` from `SafeTransport.aclose()` → `test_e01_f1_safe_transport_aclose_maps_httpcore_exceptions` failed (`httpcore.ReadError: pool close read err`); restored, passed. Fixed lines covered.
+
+- **Owner decisions recorded (2026-11-27):**
+  - **`E-09` (guided first-time server setup)** and **`E-11` (headless feed OPML export CLI & backup OPML copy)** scheduled by the project owner alongside **Milestone `1d`** (recorded in `docs/design/README.md` item 4 alongside the `1c` `forceFullResync()` carry-forward).
+
+### Pass-2 verification summary (`make check`)
+
+- Backend: `ruff check` + `ruff format --check` clean; `mypy src` clean (54 source files); **205 passed**, **91.86%** total branch coverage; all 16 critical core modules **>= 90%** (`safe_http.py` 92.34%, `middleware.py` 92.66%, `url_canon.py` 100.00%, `poll_feed.py` 91.98%, `queue.py` 95.12%).
+- Client runner: **32 passed**, **94.87%** branch coverage (>= 90% gate).
+- Frontend: `eslint` + `prettier --check` clean; `tsc --noEmit` clean; **57 passed** across 6 test files, **93.13%** total line coverage; all critical (>= 90%) and core (>= 80%) coverage gates passed.
