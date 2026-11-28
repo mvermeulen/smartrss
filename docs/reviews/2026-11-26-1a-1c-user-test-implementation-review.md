@@ -5,7 +5,7 @@
 - **Checked against**: [`1a`](../design/1a-backend-ingestion-and-security.md), [`1c`](../design/1c-client-ui-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md), [`README.md`](../../README.md), [`review-checklist.md`](../review-checklist.md)
 - **Reviewer**: Claude Code (at the project owner's request)
 - **Finding prefix**: `E-`
-- **Status**: `Addressed (pass 2, 2026-11-27) — awaiting verification`
+- **Status**: `Verified (2026-11-27)` — user-test fixes **Approved by project owner 2026-11-27**; pass 2 confirmed `E-10-F1` and `E-01-F1` resolved; `E-09` / `E-11` scheduled alongside `1d`
 
 ## Review outcome
 
@@ -523,3 +523,30 @@ The line used for this test is:
 - Backend: `ruff check` + `ruff format --check` clean; `mypy src` clean (54 source files); **205 passed**, **91.86%** total branch coverage; all 16 critical core modules **>= 90%** (`safe_http.py` 92.34%, `middleware.py` 92.66%, `url_canon.py` 100.00%, `poll_feed.py` 91.98%, `queue.py` 95.12%).
 - Client runner: **32 passed**, **94.87%** branch coverage (>= 90% gate).
 - Frontend: `eslint` + `prettier --check` clean; `tsc --noEmit` clean; **57 passed** across 6 test files, **93.13%** total line coverage; all critical (>= 90%) and core (>= 80%) coverage gates passed.
+
+## Verification pass 2 (2026-11-27)
+
+**Verifier:** Claude Code, on `review/1a-1c-user-test` at `30e185b`.
+
+**`make check`:** green. Backend: **205 passed** (+5), **91.86%** branch coverage, and all 16 critical modules ≥ 90%. Runner: **32 passed**, 94.87%. Frontend: **57 passed**. The test counts match the pass-2 notes exactly.
+
+**Method.** I disabled each fixed path on its own, ran the cited test, restored the file, and confirmed the restore byte for byte. That is 10 reverts, scripted. `git status` was clean afterwards.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `E-10-F1` (Major) | ✅ | **Fetch path:** `SSRFPolicy.validate_url()` is byte-identical to its pre-`E-10` version at `c39d4f0`. The pass-1 probe URLs (RSS-Bridge `?url=https://…`, `/web/2024/https://…`, `?tags[]=`, `?filter[category]=`, `?x=1\|2`) are all accepted again. **Entry path:** `validate_feed_url_syntax()` runs on `POST` / `PATCH /feeds` (`_validate_feed_url`) and OPML import. Sync push never writes `feed_url`, and permanent-redirect URL updates are server-observed, so there is no other entry path. It still rejects the soak string (path `]`), whitespace, `<>"` and `)(https://` joins, and accepts query brackets, pipes and embedded schemes, archive paths and IPv6 hosts. **Reverts:** putting strict bracket, pipe or embedded-scheme checks back into `validate_url` fails `test_e10_f1_fetch_and_redirect…`, which covers both a direct fetch and redirect `Location` hops. It also fails `test_e10_f1_extract_content_allows…`, `test_e10_feed_url_validation_all_three_paths` (the positive `201` / `200` / `imported` cases) and the unit positives (5 failed). Removing `validate_feed_url_syntax` from POST/PATCH, or separately from OPML, fails `test_e10_feed_url_validation_all_three_paths`. Disabling each of its three rules separately fails `test_e10_f1_validate_feed_url_syntax_rejects_paste_artifacts`. `1a` §7.2 now documents the fetch-path and entry-time rules separately. |
+| `E-01-F1` (Nit) | ✅ | `test_e01_f1_safe_transport_aclose_maps_httpcore_exceptions` (parametrized `ReadError` / `ConnectError`) fails with the `SafeTransport.aclose` mapping removed (2 failed) and passes once it is restored. |
+| `E-09`, `E-11` | ⏸ scheduled | Recorded as an owner decision to carry them alongside `1d` (`docs/design/README.md` item 4). They are no longer open in this review. |
+
+All other findings stay ✅ as recorded in pass 1. The code paths for `E-01`–`E-08`, `E-12` and `E-13` are unchanged by `30e185b`.
+
+### Repo-wide drift
+
+- `docs/README.md` has one row for this review, and the review header and that row agree.
+- `docs/design/README.md` item 4 records the `1d` carry-forwards.
+- `CRITICAL_MODULES` is unchanged.
+- No untracked files.
+
+**Result:** no ⚠️ or ❌ remain, so the review is **`Verified (2026-11-27)`**. It is ready for the project owner's decision. No approval status was changed.
+
+**Owner decision (2026-11-27):** the project owner approved the `E-01`–`E-13` user-test fixes (including `E-10-F1` and `E-01-F1`). `E-09` and `E-11` are carried forward alongside `1d`.

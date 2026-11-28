@@ -1,6 +1,6 @@
 # Component Design 1a: Backend Foundation, Security, Polling & Extraction
 
-> **Status:** Approved & Implemented — implementation **Approved** by project owner 2026-11-25 *(Design approved 2026-11-24 after [`1a` review](../reviews/2026-11-24-1a-component-design-review.md); implemented & [code-review findings](../reviews/2026-11-25-1a-implementation-review.md) `I-01`–`I-24` addressed 2026-11-25)*
+> **Status:** Approved & Implemented — implementation **Approved** by project owner 2026-11-25 *(Design approved 2026-11-24 after [`1a` review](../reviews/2026-11-24-1a-component-design-review.md); implemented & [code-review findings](../reviews/2026-11-25-1a-implementation-review.md) `I-01`–`I-24` addressed 2026-11-25; live user-test fixes `E-01`–`E-13` from the [`1a`–`1c` user-test review](../reviews/2026-11-26-1a-1c-user-test-implementation-review.md) verified and **approved by project owner 2026-11-27**)*
 > **Milestone:** `1a` — Backend Foundation, Auth, Polling & Extraction ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-FEED-01`–`06`, `FR-LLM-05` (cron/batch scheduler & CLI), `FR-STATE-01`–`02`, `NFR-SEC-01`, `NFR-SEC-02`, `NFR-SEC-03` (isolated HTML extraction), `NFR-OPS-01`
 > **Related ADRs:** [ADR 0001](../decisions/0001-tech-stack-and-container-topology.md), [ADR 0003](../decisions/0003-postgres-backed-job-queue-and-async-llm-pipeline.md), [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)
