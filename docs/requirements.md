@@ -1,6 +1,6 @@
 # Requirements
 
-> **Status:** Approved *(2026-11-23, by project owner; `NFR-OPS-02` & `1d-ops` milestone row proposed 2026-11-27 for owner approval alongside [`1d-ops-setup-and-cli.md`](design/1d-ops-setup-and-cli.md))*
+> **Status:** Approved *(2026-11-23, by project owner; `NFR-OPS-02` & `1d-ops` milestone split approved by project owner 2026-11-27)*
 
 ## 1. Problem Statement
 Standard RSS readers fetch raw feeds chronologically and leave all triage, organization, and enrichment to the user. High-volume or overlapping feeds create noise and duplication, RSS entries often contain only short teasers or commentary pointing to deeper primary sources (such as research papers or technical reports), and client-only readers repeat fetching/processing across devices without shared intelligence.
@@ -108,7 +108,7 @@ Standard RSS readers fetch raw feeds chronologically and leave all triage, organ
   - Docker Compose deployment (`web`, `api`, `worker`, `db`) on Ubuntu.
   - Nightly local `pg_dump` with 14-day retention, optional simple `rsync`/SSH copy hook to another LAN host, OPML/config export, and a documented/tested restore drill.
   - Built-in System Health & Pipeline Metrics view (plus structured CLI/JSON output for cron logs) exposing: feed health, job queue depth/dead-letters, LLM startup connectivity, **per-stage latency distributions (`p50`/`p95`/`avg`/`max`) and failure rates** (`poll_feed`, `extract_content`, `cluster_item`, `mini_research`, `enrich_item`), **end-to-end item readiness lag** (`fetched_at` → `enriched_at`), **LLM phase timings & throughput** (`prompt_eval_ms`, `generation_ms`, tok/s, prompt/completion tokens, parse-retry rate by model/prompt), **per-feed processing cost rollups** (items/day, avg stage time, daily GPU seconds), and **batch/cron run history** (`pipeline_runs`) so schedules, models, and feed policies can be fine-tuned quantitatively.
-- **`NFR-OPS-02` Guided First-Time Server Setup & Headless Feed Administration** *(Proposed 2026-11-27, from `E-09`/`E-11`)*:
+- **`NFR-OPS-02` Guided First-Time Server Setup & Headless Feed Administration** *(Approved 2026-11-27, from `E-09`/`E-11`)*:
   - Provide an idempotent, re-runnable single-command server bootstrap (`make setup` / `scripts/setup-server.sh`) that takes a fresh Ubuntu LTS host with Docker installed to a running, migrated, health-checked SmartRSS server—generating a mode-`0600` `.env` atomically (only if absent; never overwriting an existing `.env` or running `sudo` unattended), rebuilding all required images regardless of worker mode, starting Docker Compose, optionally installing a `systemd` user timer in cron mode, optionally seeding feeds from an OPML file, and printing a fresh pairing code plus the exact laptop client install command.
   - Provide an in-container headless feed administration CLI (`smartrss feeds add|list|import-opml|export-opml`) sharing validation and sync semantics with the REST API, and export a mode-`0600` OPML portability snapshot (subscriptions and categories; `pg_dump` remains authoritative for feed status and per-feed settings) alongside nightly `pg_dump` backups in `scripts/backup.sh` with matching retention rotation.
 

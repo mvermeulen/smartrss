@@ -267,7 +267,13 @@ Either way, add a test that a `muted` feed round-trips as documented.
 - **O-10** — Fixed. Updated §4.2 step 4 startup order to `docker compose build api web` → `docker compose up -d --wait db api` → `docker compose exec -T api smartrss db migrate` → `docker compose up -d --wait` (no pre-migration worker errors), made `/api/v1/health` JSON check a subset match (`status == "ok"` and `db == "ok"`), and dropped the no-op `After=network-online.target` line from `deploy/systemd/smartrss-worker.service` (§4.2 step 5).
 - **O-11** — Fixed. Specified `smartrss feeds add --if-not-exists` (§5.1 item 1, §5.2): prints existing status (e.g., `Already subscribed (status=paused)`), emits `"status"` and `"created": false` in `--json`, and returns exit `0` when `active` vs. exit `3` when `paused` or `muted`. Added both cases to `1d-ops-T06`.
 
+### Owner decisions recorded (2026-11-27)
+
+- **`Q-1`:** Approved `NFR-OPS-02` and the `1d-ops` milestone split in `docs/requirements.md`.
+- **`Q-2` (`O-04`):** Approved option **(a)** — portability-only OPML 2.0 snapshot (subscriptions + categories; `pg_dump` authoritative for feed status and per-feed settings).
+- **`Q-3` (`O-06`):** Approved opt-in `systemd` user timer in `make setup` (with `loginctl` linger check + prominent warning, crontab duplicate detection, shared lock path, and `flock -n -E 75` / `SuccessExitStatus=75`) while keeping crontab documented in `README.md`.
+- **`Q-4` (`O-01`):** Approved sharing `image: smartrss-backend:local` between `api` and `worker` in `docker-compose.yml` (`1d-ops-D07`).
+
 ### Design-only check summary
 
-- No application code changed; `make check` re-verified green after doc updates.
-- Owner decisions needed before `Approved`: `Q-1` (`NFR-OPS-02` & `1d-ops` split), `Q-2` (`O-04` portability-only OPML option (a) vs. custom attributes (b)), `Q-3` (`O-06` cron-mode timer vs. crontab default), and `Q-4` (`O-01` shared `smartrss-backend:local` image in `docker-compose.yml`).
+- No application code changed; `make check` verified green (`205` backend passed, `91.86%` total, all 16 critical modules >= 90%; `32` runner passed, `94.87%`; `57` frontend passed, all gates OK). Ready for Claude Code verification pass.
