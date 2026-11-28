@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 MUTATION_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -30,6 +30,30 @@ def _get_header(scope: Scope, name: bytes) -> str | None:
         if key.lower() == name:
             return bytes(value).decode("latin-1")
     return None
+
+
+class NoStoreResponseHeaderMiddleware:
+    """Ensure API responses carry Cache-Control: no-store so clients can drop request-side
+    cache: 'no-store' and let browsers reuse CORS preflight cache (E-07)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def _send_with_no_store(message: Message) -> None:
+            if message.get("type") == "http.response.start":
+                raw_headers: list[tuple[bytes, bytes]] = list(message.get("headers", []))
+                has_cc = any(k.lower() == b"cache-control" for k, _ in raw_headers)
+                if not has_cc:
+                    raw_headers.append((b"cache-control", b"no-store"))
+                    message = {**message, "headers": raw_headers}
+            await send(message)
+
+        await self.app(scope, receive, _send_with_no_store)
 
 
 class HostAllowListMiddleware:

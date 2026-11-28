@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiHttpError, ApiNetworkError, SmartRSSApiClient } from "../../api/client";
+import {
+  ApiHttpError,
+  ApiNetworkError,
+  fetchClientRuntimeConfig,
+  SmartRSSApiClient,
+} from "../../api/client";
+import { cleanPastedFeedUrl } from "../../components/feeds/feedUrlInput";
 import {
   normalizeBootstrapResponse,
   normalizeCategoryResponse,
@@ -1134,6 +1140,46 @@ describe("1c Implementation Review Regressions (V-01..V-10)", () => {
       putSpy.mockRestore();
       engine2.stop();
     }
+  });
+
+  it("test_e07_api_client_omits_request_cache_no_store_while_config_keeps_it", async () => {
+    const seenInits: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const spyFetch: typeof fetch = async (input, init) => {
+      seenInits.push({ url: String(input), init });
+      if (String(input).endsWith("/client-config.json")) {
+        return jsonResp({ mode: "localhost", api_origin: "http://localhost:8080" });
+      }
+      if (String(input).endsWith("/api/v1/feeds")) {
+        return jsonResp([]);
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const cfg = await fetchClientRuntimeConfig(spyFetch);
+    expect(cfg?.api_origin).toBe("http://localhost:8080");
+    expect(seenInits[0]?.init?.cache).toBe("no-store");
+
+    const api = new SmartRSSApiClient("http://localhost:8080", "tok", spyFetch);
+    await api.health();
+    await api.listFeeds();
+    expect(seenInits[1]?.init?.cache).toBeUndefined();
+    expect(seenInits[1]?.init?.credentials).toBe("omit");
+    expect(seenInits[2]?.init?.cache).toBeUndefined();
+    expect(seenInits[2]?.init?.credentials).toBe("omit");
+  });
+
+  it("test_e10_clean_pasted_feed_url_extracts_markdown_and_angle_brackets", () => {
+    expect(cleanPastedFeedUrl("  [Latent Space](https://www.latent.space/feed)  ")).toBe(
+      "https://www.latent.space/feed",
+    );
+    expect(cleanPastedFeedUrl("<https://lwn.net/headlines/rss>")).toBe(
+      "https://lwn.net/headlines/rss",
+    );
+    expect(cleanPastedFeedUrl("https://example.com/rss.xml")).toBe("https://example.com/rss.xml");
+    // Malformed partial paste is passed through untouched so server validation rejects with 422
+    expect(cleanPastedFeedUrl("https://www.latent.space/feed](https://www.latent.space/feed")).toBe(
+      "https://www.latent.space/feed](https://www.latent.space/feed",
+    );
   });
 });
 

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from smartrss.config import get_settings
 from smartrss.db.engine import build_engine, build_sessionmaker
 from smartrss.db.models import AppSettings, Device, SyncState
+from smartrss.db.recanonicalize import recanonicalize_all_items
 from smartrss.db.sync_log import APP_SETTINGS_ENTITY_ID, SyncEvent, sync_log
 from smartrss.logging import configure_logging
 from smartrss.search.fts import reindex_all_items
@@ -216,7 +217,8 @@ def worker_run_once_cmd(
         else:
             typer.echo(
                 f"status={summary.status} duration_ms={summary.duration_ms} "
-                f"polled={summary.items_polled} extracted={summary.items_extracted} "
+                f"feeds_polled={summary.feeds_polled} not_modified={summary.feeds_not_modified} "
+                f"ingested={summary.items_ingested} extracted={summary.items_extracted} "
                 f"failed={summary.jobs_failed} deferred={summary.jobs_deferred}"
             )
         return summary.exit_code
@@ -386,6 +388,25 @@ def db_rotate_epoch(
             await engine.dispose()
 
     asyncio.run(_run())
+
+
+@db_app.command("recanonicalize")
+def db_recanonicalize(
+    batch_size: int = typer.Option(500, "--batch-size", min=1, max=5000, help="Rows per commit"),
+) -> None:
+    """Recompute items.canonical_url under current url_canon rules and emit sync upserts (E-12)."""
+    cfg = get_settings()
+
+    async def _run() -> int:
+        engine = build_engine(cfg.database_url, strict_sync_guard=cfg.synclog_strict_guard)
+        factory = build_sessionmaker(engine, strict_sync_guard=cfg.synclog_strict_guard)
+        try:
+            return await recanonicalize_all_items(factory, batch_size=batch_size)
+        finally:
+            await engine.dispose()
+
+    updated = asyncio.run(_run())
+    typer.echo(f"Recanonicalized {updated} items.")
 
 
 @search_app.command("reindex")

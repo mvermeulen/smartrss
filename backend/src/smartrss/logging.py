@@ -55,6 +55,20 @@ class JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+class HealthCheckAccessFilter(logging.Filter):
+    """Drop noisy GET /api/v1/health lines from uvicorn.access; keep other routes (E-13)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            method = str(args[1]).upper()
+            path = str(args[2]).split("?", 1)[0]
+            if method == "GET" and path == "/api/v1/health":
+                return False
+        msg = record.getMessage()
+        return not ('"GET /api/v1/health ' in msg or '"GET /api/v1/health?' in msg)
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Configure root logger for structured JSON output to stdout."""
     handler = logging.StreamHandler(sys.stdout)
@@ -63,3 +77,7 @@ def configure_logging(level: str = "INFO") -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, HealthCheckAccessFilter) for f in access_logger.filters):
+        access_logger.addFilter(HealthCheckAccessFilter())

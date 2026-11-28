@@ -263,7 +263,7 @@ export function SystemHealthView({
                   <tr>
                     <th className="py-1.5 pr-3">Stage</th>
                     <th className="py-1.5 pr-3">Total</th>
-                    <th className="py-1.5 pr-3">OK / Fail</th>
+                    <th className="py-1.5 pr-3">OK (304) / Fail</th>
                     <th className="py-1.5 pr-3">Fail %</th>
                     <th className="py-1.5 pr-3">Avg (ms)</th>
                     <th className="py-1.5 pr-3">p50 (ms)</th>
@@ -285,7 +285,11 @@ export function SystemHealthView({
                         <td className="py-1.5 pr-3 font-mono font-medium">{s.job_type}</td>
                         <td className="py-1.5 pr-3">{s.total_count}</td>
                         <td className="py-1.5 pr-3">
-                          {s.ok_count} / {s.failed_count}
+                          {s.ok_count}
+                          {(s.not_modified_count ?? 0) > 0
+                            ? ` (${s.not_modified_count} 304)`
+                            : ""}{" "}
+                          / {s.failed_count}
                         </td>
                         <td className="py-1.5 pr-3">{(s.failure_rate * 100).toFixed(1)}%</td>
                         <td className="py-1.5 pr-3">{s.avg_duration_ms.toFixed(1)}</td>
@@ -360,14 +364,15 @@ export function SystemHealthView({
                     <th className="py-1.5 pr-3">Status</th>
                     <th className="py-1.5 pr-3">Started</th>
                     <th className="py-1.5 pr-3">Duration (ms)</th>
-                    <th className="py-1.5 pr-3">Polled / Extracted / Enriched</th>
+                    <th className="py-1.5 pr-3">Feeds (304)</th>
+                    <th className="py-1.5 pr-3">Ingested / Extracted / Enriched</th>
                     <th className="py-1.5">Failed</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {health.recent_runs.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-2 text-slate-500">
+                      <td colSpan={8} className="py-2 text-slate-500">
                         No pipeline runs recorded yet.
                       </td>
                     </tr>
@@ -379,6 +384,10 @@ export function SystemHealthView({
                         <td className="py-1.5 pr-3 capitalize">{run.status}</td>
                         <td className="py-1.5 pr-3">{new Date(run.started_at).toLocaleString()}</td>
                         <td className="py-1.5 pr-3">{run.duration_ms ?? "—"}</td>
+                        <td className="py-1.5 pr-3">
+                          {run.feeds_polled ?? 0}
+                          {(run.feeds_not_modified ?? 0) > 0 ? ` (${run.feeds_not_modified})` : ""}
+                        </td>
                         <td className="py-1.5 pr-3">
                           {run.items_polled} / {run.items_extracted} / {run.items_enriched}
                         </td>

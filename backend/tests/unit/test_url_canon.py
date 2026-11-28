@@ -50,3 +50,20 @@ def test_derive_fallback_guid_uses_raw_url_and_title() -> None:
 def test_default_title_from_url() -> None:
     assert default_title_from_url("https://Example.COM/rss.xml") == "example.com/rss.xml"
     assert default_title_from_url("https://Example.COM/") == "example.com"
+
+
+def test_e12_canonicalize_strips_bbc_at_tracking_params_and_preserves_other_at_params() -> None:
+    # Exact BBC link format observed in the 1a–1c live soak
+    bbc_url = "https://www.bbc.com/news/articles/c3pw4yrr8kz9o?at_medium=RSS&at_campaign=rss"
+    assert canonicalize_url(bbc_url) == "https://www.bbc.com/news/articles/c3pw4yrr8kz9o"
+
+    # Other documented AT Internet / Piano Analytics params stripped while meaningful params stay
+    extended = (
+        "https://www.bbc.com/news/articles/c3pw4yrr8kz9o"
+        "?at_medium=RSS&at_campaign=rss&at_custom1=a&at_format=link&at_link=top&id=42"
+    )
+    assert canonicalize_url(extended) == "https://www.bbc.com/news/articles/c3pw4yrr8kz9o?id=42"
+
+    # Non-tracking `at_` params must NOT be stripped (no blanket `at_` prefix)
+    meaningful = "https://example.com/schedule?at_home=1&at_time=noon"
+    assert canonicalize_url(meaningful) == "https://example.com/schedule?at_home=1&at_time=noon"

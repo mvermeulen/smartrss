@@ -237,6 +237,8 @@ class PipelineRun(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
+    feeds_polled: Mapped[int] = mapped_column(sa.Integer(), nullable=False, default=0)
+    feeds_not_modified: Mapped[int] = mapped_column(sa.Integer(), nullable=False, default=0)
     items_polled: Mapped[int] = mapped_column(sa.Integer(), nullable=False, default=0)
     items_extracted: Mapped[int] = mapped_column(sa.Integer(), nullable=False, default=0)
     items_clustered: Mapped[int] = mapped_column(sa.Integer(), nullable=False, default=0)
@@ -314,6 +316,8 @@ class StageMetric(Base):
         postgresql.UUID(as_uuid=True), nullable=True
     )
     status: Mapped[str] = mapped_column(sa.Text(), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    http_status: Mapped[int | None] = mapped_column(sa.SmallInteger(), nullable=True)
     queue_wait_ms: Mapped[int] = mapped_column(sa.Integer(), nullable=False)
     duration_ms: Mapped[int] = mapped_column(sa.Integer(), nullable=False)
     llm_prompt_ms: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)

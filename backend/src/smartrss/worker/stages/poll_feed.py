@@ -65,6 +65,8 @@ class PollFeedOutcome:
     items_ingested: int = 0
     items_updated: int = 0
     repoll_needed: bool = False
+    outcome: str | None = None  # "fetched" | "not_modified" | None (E-08)
+    http_status: int | None = None
 
 
 class PollFeedUnexpectedError(Exception):
@@ -439,7 +441,7 @@ async def _poll_after_precheck(
                         force_broken=True,
                     )
                     await session.commit()
-                    return PollFeedOutcome(metric_status="failed")
+                    return PollFeedOutcome(metric_status="failed", http_status=304)
                 effective_feed_url = new_feed_url
 
             delay = compute_next_poll_delay(
@@ -476,7 +478,11 @@ async def _poll_after_precheck(
             if events:
                 await sync_log.record(session, events)
             await session.commit()
-        return PollFeedOutcome(metric_status="ok")
+        return PollFeedOutcome(
+            metric_status="ok",
+            outcome="not_modified",
+            http_status=304,
+        )
 
     if status_code == 410:
         async with session_factory() as session:
@@ -528,7 +534,7 @@ async def _poll_after_precheck(
                     if events:
                         await sync_log.record(session, events)
             await session.commit()
-        return PollFeedOutcome(metric_status="failed")
+        return PollFeedOutcome(metric_status="failed", http_status=410)
 
     if status_code == 429:
         async with session_factory() as session:
@@ -545,6 +551,7 @@ async def _poll_after_precheck(
         return PollFeedOutcome(
             metric_status="skipped" if repoll else "failed",
             repoll_needed=repoll,
+            http_status=429,
         )
 
     if not (200 <= status_code < 300):
@@ -560,6 +567,7 @@ async def _poll_after_precheck(
         return PollFeedOutcome(
             metric_status="skipped" if repoll else "failed",
             repoll_needed=repoll,
+            http_status=status_code,
         )
 
     # 3. Parse & Normalize off the event loop (I-01, I-06, I-19)
@@ -584,6 +592,7 @@ async def _poll_after_precheck(
         return PollFeedOutcome(
             metric_status="skipped" if repoll else "failed",
             repoll_needed=repoll,
+            http_status=status_code,
         )
 
     feed_title = parsed_feed.feed_title
@@ -614,6 +623,7 @@ async def _poll_after_precheck(
             return PollFeedOutcome(
                 metric_status="skipped" if repoll else "failed",
                 repoll_needed=repoll,
+                http_status=status_code,
             )
 
     # 4. Persist Transaction (short DB tx + SyncLogWriter at end)
@@ -682,7 +692,7 @@ async def _poll_after_precheck(
                     force_broken=True,
                 )
                 await session.commit()
-                return PollFeedOutcome(metric_status="failed")
+                return PollFeedOutcome(metric_status="failed", http_status=status_code)
             effective_feed_url = new_feed_url
 
         settings_row = await session.get(AppSettings, 1)
@@ -1003,4 +1013,6 @@ async def _poll_after_precheck(
         metric_status="ok",
         items_ingested=items_ingested,
         items_updated=items_updated,
+        outcome="fetched",
+        http_status=status_code,
     )

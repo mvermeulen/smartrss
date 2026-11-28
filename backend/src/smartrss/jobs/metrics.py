@@ -25,6 +25,7 @@ class StageLatencyRow:
     job_type: str
     total_count: int
     ok_count: int
+    not_modified_count: int
     failed_count: int
     skipped_count: int
     failure_rate: float
@@ -69,6 +70,8 @@ async def finalize_pipeline_run(
     *,
     run_id: uuid.UUID,
     status: str,
+    feeds_polled: int = 0,
+    feeds_not_modified: int = 0,
     items_polled: int = 0,
     items_extracted: int = 0,
     jobs_failed: int = 0,
@@ -82,6 +85,8 @@ async def finalize_pipeline_run(
     run.status = status
     run.finished_at = finished
     run.duration_ms = duration_ms
+    run.feeds_polled = feeds_polled
+    run.feeds_not_modified = feeds_not_modified
     run.items_polled = items_polled
     run.items_extracted = items_extracted
     run.jobs_failed = jobs_failed
@@ -107,6 +112,7 @@ async def query_metrics_summary(
             job_type,
             COUNT(*)::int AS total_count,
             COUNT(*) FILTER (WHERE status = 'ok')::int AS ok_count,
+            COUNT(*) FILTER (WHERE outcome = 'not_modified')::int AS not_modified_count,
             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count,
             COUNT(*) FILTER (WHERE status = 'skipped')::int AS skipped_count,
             COALESCE(AVG(duration_ms), 0)::float8 AS avg_duration_ms,
@@ -135,6 +141,7 @@ async def query_metrics_summary(
                 "job_type": row["job_type"],
                 "total_count": total,
                 "ok_count": int(row["ok_count"]),
+                "not_modified_count": int(row["not_modified_count"]),
                 "failed_count": failed,
                 "skipped_count": int(row["skipped_count"]),
                 "failure_rate": round(failed / total, 4) if total > 0 else 0.0,

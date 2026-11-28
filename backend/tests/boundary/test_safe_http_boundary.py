@@ -532,3 +532,385 @@ async def test_https_tls_sni_pinning_chunked_identity_cap_and_limiter_pruning() 
     assert "h1.example.com" not in limiter._locks
     assert "h2.example.com" not in limiter._locks
     assert "h3.example.com" in limiter._locks
+
+
+async def test_e01_connect_tcp_failover_httpcore_errors_and_real_anyio() -> None:
+    """E-01 (a): SafeNetworkBackend fails over on httpcore.ConnectError / ConnectTimeout
+    and with real httpcore.AnyIOBackend against a local IPv4-only server."""
+    attempts: list[str] = []
+
+    class _HttpcoreFailFirstBackend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,  # noqa: ASYNC109
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            attempts.append(host)
+            if host == "93.184.216.34":
+                raise httpcore.ConnectError("All connection attempts failed")
+            if host == "1.0.0.1":
+                raise httpcore.ConnectTimeout("timed out")
+            return _FakeNetworkStream(lambda _raw: [_http_response(200, b"httpcore-failover-ok")])
+
+        async def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,  # noqa: ASYNC109
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            raise AssertionError("unreachable")
+
+        async def sleep(self, seconds: float) -> None:
+            await asyncio.sleep(seconds)
+
+    policy = SSRFPolicy(
+        resolver=_make_dns({"dual.example.com": ["93.184.216.34", "1.0.0.1", "1.1.1.1"]})
+    )
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(policy, network_backend=_HttpcoreFailFirstBackend()),
+    ) as client:
+        res = await client.fetch("http://dual.example.com/feed")
+        assert res.status_code == 200
+        assert res.body_bytes == b"httpcore-failover-ok"
+    assert attempts == ["93.184.216.34", "1.0.0.1", "1.1.1.1"]
+
+    # Real httpcore.AnyIOBackend failover: bind IPv4-only server on 127.0.0.1:<port>,
+    # resolver returns [::1 (refused/unreachable on that port), 127.0.0.1 (listening)].
+    async def _serve_once(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(4096)
+            writer.write(_http_response(200, b"real-anyio-v4-ok"))
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(_serve_once, host="127.0.0.1", port=0)
+    try:
+        sock = server.sockets[0]
+        port = int(sock.getsockname()[1])
+
+        class _TestPermissiveLoopbackPolicy(SSRFPolicy):
+            def ip_block_reason(
+                self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address
+            ) -> str | None:
+                return None
+
+        real_policy = _TestPermissiveLoopbackPolicy(
+            allowed_ports=(port,),
+            resolver=_make_dns({"local-dual.test": ["::1", "127.0.0.1"]}),
+        )
+        async with SafeHttpClient(
+            policy=real_policy,
+            transport=SafeTransport(real_policy, network_backend=httpcore.AnyIOBackend()),
+        ) as real_client:
+            res_real = await real_client.fetch(f"http://local-dual.test:{port}/rss")
+            assert res_real.status_code == 200
+            assert res_real.body_bytes == b"real-anyio-v4-ok"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_e01_all_ips_fail_with_httpcore_errors_raises_ssrf_connection_error() -> None:
+    """E-01 (b): When all validated IPs fail with real httpcore errors, SSRFConnectionError
+    is raised chained from the last httpcore exception."""
+    from smartrss.security.safe_http import SafeNetworkBackend, SSRFConnectionError
+
+    class _AllHttpcoreFailBackend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,  # noqa: ASYNC109
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            if host == "93.184.216.34":
+                raise httpcore.ConnectError("first refused")
+            raise httpcore.ConnectTimeout("second timed out")
+
+        async def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,  # noqa: ASYNC109
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            raise AssertionError("unreachable")
+
+        async def sleep(self, seconds: float) -> None:
+            await asyncio.sleep(seconds)
+
+    policy = SSRFPolicy(resolver=_make_dns({"dead.example.com": ["93.184.216.34", "1.1.1.1"]}))
+    backend = SafeNetworkBackend(policy=policy, inner=_AllHttpcoreFailBackend())
+    with pytest.raises(SSRFConnectionError) as exc_info:
+        await backend.connect_tcp("dead.example.com", 80)
+    assert isinstance(exc_info.value.__cause__, httpcore.ConnectTimeout)
+
+    # Also verify via full SafeHttpClient.fetch() with real AnyIOBackend against a closed port
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        closed_port = int(s.getsockname()[1])
+
+    class _PermissivePolicy(SSRFPolicy):
+        def ip_block_reason(self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+            return None
+
+    closed_policy = _PermissivePolicy(
+        allowed_ports=(closed_port,),
+        resolver=_make_dns({"closed.test": ["127.0.0.1"]}),
+    )
+    async with SafeHttpClient(
+        policy=closed_policy,
+        transport=SafeTransport(closed_policy, network_backend=httpcore.AnyIOBackend()),
+    ) as client:
+        with pytest.raises(SSRFConnectionError) as real_exc:
+            await client.fetch(f"http://closed.test:{closed_port}/rss")
+        assert "Unable to connect to any validated IP" in str(real_exc.value)
+        assert "ConnectError" in str(real_exc.value)
+
+
+async def test_e01_safe_transport_and_pinned_stream_map_httpcore_exceptions() -> None:
+    """E-01 (c): SafeTransport and _PinnedStream map httpcore errors into SafeHttpError."""
+    from smartrss.security.safe_http import (
+        SafeHttpError,
+        SafeHttpTimeoutError,
+        SSRFConnectionError,
+        _PinnedStream,
+    )
+
+    policy = SSRFPolicy(resolver=_make_dns({"err.example.com": ["93.184.216.34"]}))
+
+    # 1. TLS start_tls raises httpcore.ConnectError (exact 03:30 soak path) -> SSRFConnectionError
+    class _FailTlsStream(_FakeNetworkStream):
+        async def start_tls(
+            self,
+            ssl_context: Any,
+            server_hostname: str | None = None,
+            timeout: float | None = None,  # noqa: ASYNC109
+        ) -> httpcore.AsyncNetworkStream:
+            raise httpcore.ConnectError("TLS handshake failed")
+
+    class _FailTlsBackend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,  # noqa: ASYNC109
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            return _FailTlsStream(lambda _raw: [])
+
+        async def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,  # noqa: ASYNC109
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            raise AssertionError("unreachable")
+
+        async def sleep(self, seconds: float) -> None:
+            await asyncio.sleep(seconds)
+
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(policy, network_backend=_FailTlsBackend()),
+    ) as client:
+        with pytest.raises(SSRFConnectionError) as tls_exc:
+            await client.fetch("https://err.example.com/rss")
+        assert isinstance(tls_exc.value.__cause__, httpcore.ConnectError)
+
+    # 2. ReadTimeout and RemoteProtocolError from pool -> SafeHttpTimeoutError / SafeHttpError
+    class _RaiseOnReadStream(_FakeNetworkStream):
+        def __init__(self, exc: Exception, *, fail_after_headers: bool = False) -> None:
+            super().__init__(lambda _raw: [])
+            self._exc = exc
+            self._fail_after_headers = fail_after_headers
+            self._sent_headers = False
+
+        async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:  # noqa: ASYNC109
+            if self._fail_after_headers and not self._sent_headers:
+                self._sent_headers = True
+                return b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello"
+            raise self._exc
+
+    class _SingleStreamBackend(httpcore.AsyncNetworkBackend):
+        def __init__(self, stream_factory: Callable[[], httpcore.AsyncNetworkStream]) -> None:
+            self._stream_factory = stream_factory
+
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,  # noqa: ASYNC109
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            return self._stream_factory()
+
+        async def connect_unix_socket(
+            self,
+            path: str,
+            timeout: float | None = None,  # noqa: ASYNC109
+            socket_options: Any = None,
+        ) -> httpcore.AsyncNetworkStream:
+            raise AssertionError("unreachable")
+
+        async def sleep(self, seconds: float) -> None:
+            await asyncio.sleep(seconds)
+
+    # ReadTimeout during response headers (handle_async_request)
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(
+            policy,
+            network_backend=_SingleStreamBackend(
+                lambda: _RaiseOnReadStream(httpcore.ReadTimeout("header timeout"))
+            ),
+        ),
+    ) as client:
+        with pytest.raises(SafeHttpTimeoutError) as rt_exc:
+            await client.fetch("http://err.example.com/timeout")
+        assert isinstance(rt_exc.value, SafeHttpError)
+        assert isinstance(rt_exc.value.__cause__, httpcore.ReadTimeout)
+
+    # RemoteProtocolError from server sending garbage HTTP
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(
+            policy,
+            network_backend=_SingleStreamBackend(
+                lambda: _FakeNetworkStream(lambda _raw: [b"NOT-HTTP-GARBAGE\r\n\r\n"])
+            ),
+        ),
+    ) as client:
+        with pytest.raises(SafeHttpError) as proto_exc:
+            await client.fetch("http://err.example.com/bad-proto")
+        assert isinstance(proto_exc.value.__cause__, httpcore.RemoteProtocolError)
+
+    # ReadTimeout mid-body during _PinnedStream.__aiter__
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(
+            policy,
+            network_backend=_SingleStreamBackend(
+                lambda: _RaiseOnReadStream(
+                    httpcore.ReadTimeout("body timeout"), fail_after_headers=True
+                )
+            ),
+        ),
+    ) as client:
+        with pytest.raises(SafeHttpTimeoutError) as body_rt_exc:
+            await client.fetch("http://err.example.com/body-timeout")
+        assert isinstance(body_rt_exc.value.__cause__, httpcore.ReadTimeout)
+
+    # _PinnedStream.aclose maps httpcore.ReadError -> SSRFConnectionError
+    class _BrokenCloseCoreResponse:
+        async def aiter_stream(self) -> Any:
+            yield b""
+
+        async def aclose(self) -> None:
+            raise httpcore.ReadError("close error")
+
+    pinned = _PinnedStream(_BrokenCloseCoreResponse())  # type: ignore[arg-type]
+    with pytest.raises(SSRFConnectionError) as close_exc:
+        await pinned.aclose()
+    assert isinstance(close_exc.value.__cause__, httpcore.ReadError)
+
+
+@pytest.mark.parametrize(
+    "pool_exc",
+    [httpcore.ReadError("pool close read err"), httpcore.ConnectError("pool close conn err")],
+)
+async def test_e01_f1_safe_transport_aclose_maps_httpcore_exceptions(
+    pool_exc: Exception,
+) -> None:
+    """E-01-F1: SafeTransport.aclose() maps httpcore pool.aclose() errors into SafeHttpError."""
+    from smartrss.security.safe_http import SafeHttpError, SSRFConnectionError
+
+    policy = SSRFPolicy(resolver=_make_dns({"close.example.com": ["93.184.216.34"]}))
+    transport = SafeTransport(policy)
+
+    async def _failing_pool_aclose() -> None:
+        raise pool_exc
+
+    transport._pool.aclose = _failing_pool_aclose  # type: ignore[method-assign]
+
+    with pytest.raises(SSRFConnectionError) as exc_info:
+        async with SafeHttpClient(policy=policy, transport=transport):
+            pass
+    assert isinstance(exc_info.value, SafeHttpError)
+    assert exc_info.value.__cause__ is pool_exc
+
+
+async def test_e10_f1_fetch_and_redirect_allow_query_schemes_brackets_and_pipes() -> None:
+    """E-10-F1 (a, b): SafeHttpClient.fetch() allows legitimate query params (?url=https://...,
+    ?tags[]=x, ?x=1|2) and archive paths both on direct fetches and redirect Locations."""
+    seen_targets: list[str] = []
+
+    def _responder(raw: bytes) -> list[bytes]:
+        first_line = raw.split(b"\r\n", 1)[0].decode("latin-1")
+        target = first_line.split(" ", 2)[1]
+        seen_targets.append(target)
+        if target.startswith("/start"):
+            return [
+                _http_response(
+                    302,
+                    b"",
+                    headers={
+                        "Location": (
+                            "http://proxy.example.org/step2"
+                            "?url=https://mastodon.social/@x&tags[]=python&filter[cat]=news&x=1|2"
+                        )
+                    },
+                )
+            ]
+        if target.startswith("/step2"):
+            return [
+                _http_response(
+                    302,
+                    b"",
+                    headers={
+                        "Location": "http://archive.example.org/web/2024/https://example.com/post"
+                    },
+                )
+            ]
+        return [_http_response(200, b"ok-complex-url")]
+
+    policy = SSRFPolicy(
+        resolver=_make_dns(
+            {
+                "proxy.example.org": ["93.184.216.34"],
+                "archive.example.org": ["93.184.216.34"],
+            }
+        )
+    )
+    async with SafeHttpClient(
+        policy=policy,
+        transport=SafeTransport(
+            policy,
+            network_backend=_RecordingNetworkBackend(lambda _ip, _port, raw: _responder(raw)),
+        ),
+    ) as client:
+        # (a) Direct fetch with embedded scheme, brackets, and pipe in query
+        direct = await client.fetch(
+            "http://proxy.example.org/?action=display&url=https://mastodon.social/@x&tags[]=x&x=1|2"
+        )
+        assert direct.status_code == 200
+        assert direct.body_bytes == b"ok-complex-url"
+
+        # (b) Redirects carrying those query/path shapes are followed cleanly
+        redirected = await client.fetch("http://proxy.example.org/start")
+        assert redirected.status_code == 200
+        assert redirected.body_bytes == b"ok-complex-url"
+        assert (
+            redirected.final_url == "http://archive.example.org/web/2024/https://example.com/post"
+        )
+    assert len(seen_targets) == 4

@@ -6,7 +6,12 @@ import ipaddress
 
 import pytest
 
-from smartrss.security.safe_http import SSRFBlockedError, SSRFConnectionError, SSRFPolicy
+from smartrss.security.safe_http import (
+    SSRFBlockedError,
+    SSRFConnectionError,
+    SSRFPolicy,
+    validate_feed_url_syntax,
+)
 
 
 @pytest.mark.parametrize(
@@ -34,6 +39,46 @@ def test_validate_url_accepts_http_and_https_default_ports() -> None:
     policy = SSRFPolicy()
     assert policy.validate_url("https://example.com/rss.xml") == ("https", "example.com", 443)
     assert policy.validate_url("http://example.com/rss.xml") == ("http", "example.com", 80)
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "",
+        "https://www.latent.space/feed](https://www.latent.space/feed",
+        "[Latent Space](https://www.latent.space/feed)",
+        "<https://www.latent.space/feed>",
+        "https://example.com/feed with space",
+        "https://example.com/feed<tag>",
+        'https://example.com/feed"quote',
+        "https://example.com/feed[0]",
+        "https://example.com/feed)(https://example.com/feed",
+        "https://example.com/feed?a=1)(http://other.example/rss",
+    ],
+)
+def test_e10_f1_validate_feed_url_syntax_rejects_paste_artifacts(bad_url: str) -> None:
+    with pytest.raises(SSRFBlockedError):
+        validate_feed_url_syntax(bad_url)
+
+
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "https://example.com/feed%5D?q=a%20b&src=https%3A%2F%2Fother.test",
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/feed.xml",
+        "https://rss-bridge.example.org/?action=display&bridge=Mastodon&url=https://mastodon.social/@x&format=Atom",
+        "https://web.archive.org/web/2024/https://example.com/post",
+        "https://example.com/feed?tags[]=python&filter[category]=news",
+        "https://example.com/a?x=1|2",
+    ],
+)
+def test_e10_f1_validate_url_and_entry_syntax_accept_legitimate_urls(good_url: str) -> None:
+    policy = SSRFPolicy()
+    validate_feed_url_syntax(good_url)
+    scheme, host, port = policy.validate_url(good_url)
+    assert scheme == "https"
+    assert host
+    assert port == 443
 
 
 @pytest.mark.parametrize(
