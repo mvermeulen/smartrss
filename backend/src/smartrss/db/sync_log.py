@@ -268,6 +268,11 @@ def _after_flush_postexec(session: Session, flush_context: Any) -> None:
 def _before_commit(session: Session) -> None:
     if _bypass_sync_guard.get():
         return
+    if session.in_nested_transaction():
+        stack: list[Any] = session.info.get("synclog_savepoint_stack", [])
+        if stack:
+            stack[-1][5] = True
+        return
     _collect_orm_required(session)
     required: set[tuple[str, uuid.UUID]] = set()
     required.update(session.info.get("synclog_required_orm", set()))
@@ -283,10 +288,26 @@ def _before_commit(session: Session) -> None:
         )
 
 
+def _after_transaction_create(session: Session, transaction: SessionTransaction) -> None:
+    if transaction.nested:
+        stack: list[Any] = session.info.setdefault("synclog_savepoint_stack", [])
+        stack.append(
+            [
+                id(transaction),
+                set(session.info.get("synclog_required_orm", set())),
+                set(session.info.get("synclog_required_core", set())),
+                set(session.info.get("synclog_recorded", set())),
+                len(session.info.get("_orm_flush_tokens", [])),
+                False,
+            ]
+        )
+
+
 def _clear_tracking(session: Session, *_args: Any) -> None:
     session.info.pop("synclog_recorded", None)
     session.info.pop("synclog_required_orm", None)
     session.info.pop("synclog_required_core", None)
+    session.info.pop("synclog_savepoint_stack", None)
     tokens: list[Any] = session.info.pop("_orm_flush_tokens", [])
     while tokens:
         _in_orm_flush.reset(tokens.pop())
@@ -295,6 +316,17 @@ def _clear_tracking(session: Session, *_args: Any) -> None:
 def _after_transaction_end(session: Session, transaction: SessionTransaction) -> None:
     if transaction.parent is None:
         _clear_tracking(session)
+    elif transaction.nested:
+        stack: list[Any] = session.info.get("synclog_savepoint_stack", [])
+        if stack and stack[-1][0] == id(transaction):
+            _, req_orm, req_core, recorded, token_depth, committed = stack.pop()
+            if not committed:
+                session.info["synclog_required_orm"] = req_orm
+                session.info["synclog_required_core"] = req_core
+                session.info["synclog_recorded"] = recorded
+                tokens: list[Any] = session.info.get("_orm_flush_tokens", [])
+                while len(tokens) > token_depth:
+                    _in_orm_flush.reset(tokens.pop())
 
 
 def _before_cursor_execute(
@@ -335,6 +367,8 @@ def install_sync_guards(
             event.listen(target, "after_flush_postexec", _after_flush_postexec)
         if not event.contains(target, "before_commit", _before_commit):
             event.listen(target, "before_commit", _before_commit)
+        if not event.contains(target, "after_transaction_create", _after_transaction_create):
+            event.listen(target, "after_transaction_create", _after_transaction_create)
         if not event.contains(target, "after_transaction_end", _after_transaction_end):
             event.listen(target, "after_transaction_end", _after_transaction_end)
 
@@ -355,6 +389,7 @@ def remove_sync_guards(
             ("before_flush", _before_flush),
             ("after_flush_postexec", _after_flush_postexec),
             ("before_commit", _before_commit),
+            ("after_transaction_create", _after_transaction_create),
             ("after_transaction_end", _after_transaction_end),
         ):
             if event.contains(target, evt, fn):

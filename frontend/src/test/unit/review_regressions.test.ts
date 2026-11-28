@@ -25,7 +25,13 @@ import {
   normalizeSystemMetrics,
   toCanonicalIso,
 } from "../../api/normalize";
-import { getSyncMeta, setAuthMeta, setSyncMeta } from "../../db/clientMeta";
+import {
+  getFullResyncRequest,
+  getSyncMeta,
+  setAuthMeta,
+  setFullResyncRequest,
+  setSyncMeta,
+} from "../../db/clientMeta";
 import { SmartRSSDB, type OutboxRow } from "../../db/schema";
 import { sanitizeFeedHtmlToFragment } from "../../security/sanitizeHtml";
 import { precacheShellUrls } from "../../sw/sw";
@@ -1180,6 +1186,821 @@ describe("1c Implementation Review Regressions (V-01..V-10)", () => {
     expect(cleanPastedFeedUrl("https://www.latent.space/feed](https://www.latent.space/feed")).toBe(
       "https://www.latent.space/feed](https://www.latent.space/feed",
     );
+  });
+
+  it("test_1d_ops_t09_force_full_resync_same_tab_inflight_pull_barrier", async () => {
+    const { itemId } = await seedPairedReady();
+    await setSyncMeta(db, {
+      instance_epoch: EPOCH_1,
+      sync_cursor: 10,
+      active_gen: 1,
+      last_sync_at: "2026-11-27T12:00:00.000Z",
+      last_server_now: "2026-11-27T12:00:00.000Z",
+      clock_drift_ms: 0,
+    });
+
+    let resolvePullStarted!: () => void;
+    const pullStarted = new Promise<void>((resolve) => {
+      resolvePullStarted = resolve;
+    });
+    let releasePull!: () => void;
+    const pullBarrier = new Promise<void>((resolve) => {
+      releasePull = resolve;
+    });
+
+    let pullCalls = 0;
+    let bootstrapCalls = 0;
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/sync/pull")) {
+        pullCalls += 1;
+        if (pullCalls === 1) {
+          resolvePullStarted();
+          await pullBarrier;
+          return jsonResp({
+            instance_epoch: EPOCH_1,
+            server_now: "2026-11-27T12:01:00.000Z",
+            resync_required: false,
+            resync_reason: null,
+            watermark: 50,
+            next_seq: 50,
+            has_more: false,
+            changes: [],
+          } satisfies SyncPullResponse);
+        }
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:02:00.000Z",
+          resync_required: false,
+          resync_reason: null,
+          watermark: 120,
+          next_seq: 120,
+          has_more: false,
+          changes: [],
+        } satisfies SyncPullResponse);
+      }
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        bootstrapCalls += 1;
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:01:30.000Z",
+          watermark: 120,
+          categories: [],
+          feeds: [],
+          clusters: [],
+          interest_profile: null,
+          app_settings: {
+            default_expiration_days: 30,
+            backfill_cap: 10,
+            default_poll_interval_minutes: 60,
+            updated_at: "2026-11-27T12:00:00.000Z",
+          },
+          items: [],
+          has_more: false,
+        });
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const engine = new SyncEngine({ db, fetchImpl, forceIdbLockFallback: true });
+    try {
+      const firstCycle = engine.triggerSync();
+      await pullStarted;
+
+      // Call forceFullResync() while pull is in flight — must NOT clobber sync_cursor unlocked
+      const resyncCall = engine.forceFullResync();
+      await resyncCall;
+
+      expect(await getFullResyncRequest(db)).not.toBeNull();
+      expect((await getSyncMeta(db)).sync_cursor).toBe(10);
+      expect(await db.items.get(itemId)).toBeDefined();
+
+      releasePull();
+      await firstCycle;
+
+      expect(bootstrapCalls).toBe(1);
+      expect(await getFullResyncRequest(db)).toBeNull();
+      // Final cursor reflects bootstrap watermark 120, NOT stuck at in-flight pull's 50
+      expect((await getSyncMeta(db)).sync_cursor).toBe(120);
+    } finally {
+      engine.stop();
+    }
+  });
+
+  it("test_1d_ops_t10_force_full_resync_cross_tab_idb_empty_outbox_and_max_drain_loops", async () => {
+    await seedPairedReady();
+    await setSyncMeta(db, {
+      instance_epoch: EPOCH_1,
+      sync_cursor: 10,
+      active_gen: 1,
+      last_sync_at: "2026-11-27T12:00:00.000Z",
+      last_server_now: "2026-11-27T12:00:00.000Z",
+      clock_drift_ms: 0,
+    });
+
+    // (a) Cross-tab under IDB lease fallback with EMPTY outbox: Tab B holds lock, Tab A
+    // calls forceFullResync(), Tab B releases lock and broadcasts sync_complete -> Tab A
+    // must immediately trigger bootstrap without waiting for the 60 s poll timer.
+    let resolveBootstrapDone!: () => void;
+    const bootstrapDone = new Promise<void>((resolve) => {
+      resolveBootstrapDone = resolve;
+    });
+    let tabABootstraps = 0;
+
+    const tabAFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/client-config.json")) {
+        return jsonResp({ mode: "localhost", api_origin: "http://localhost:8080" });
+      }
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        tabABootstraps += 1;
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:05:00.000Z",
+          watermark: 200,
+          categories: [],
+          feeds: [],
+          clusters: [],
+          interest_profile: null,
+          app_settings: {
+            default_expiration_days: 30,
+            backfill_cap: 10,
+            default_poll_interval_minutes: 60,
+            updated_at: "2026-11-27T12:00:00.000Z",
+          },
+          items: [],
+          has_more: false,
+        });
+      }
+      if (url.includes("/api/v1/sync/pull")) {
+        if (tabABootstraps > 0) {
+          resolveBootstrapDone();
+        }
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:05:01.000Z",
+          resync_required: false,
+          resync_reason: null,
+          watermark: 200,
+          next_seq: 200,
+          has_more: false,
+          changes: [],
+        } satisfies SyncPullResponse);
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const tabA = new SyncEngine({ db, fetchImpl: tabAFetch, forceIdbLockFallback: true });
+    let releaseTabB!: () => void;
+    const holdTabB = new Promise<void>((resolve) => {
+      releaseTabB = resolve;
+    });
+    let tabBHeld!: () => void;
+    const waitTabBHeld = new Promise<void>((resolve) => {
+      tabBHeld = resolve;
+    });
+
+    try {
+      await tabA.start();
+      // Ensure outbox is completely empty
+      expect(await db.outbox.count()).toBe(0);
+
+      // Tab B acquires IDB lease directly (simulating final cleanup after drain check)
+      const tabBLock = withSyncLock(
+        { db, tabId: "tab-b-holder", forceIdbFallback: true },
+        async () => {
+          tabBHeld();
+          await holdTabB;
+        },
+      );
+      await waitTabBHeld;
+
+      // Tab A requests full resync while Tab B holds the lease
+      await tabA.forceFullResync();
+      expect(await getFullResyncRequest(db)).not.toBeNull();
+      expect(tabABootstraps).toBe(0);
+
+      // Tab B releases lease and broadcasts sync_complete
+      releaseTabB();
+      await tabBLock;
+      const bc = new BroadcastChannel("smartrss-sync");
+      bc.postMessage({ type: "sync_complete", senderId: "tab-b-holder" });
+      bc.close();
+
+      await Promise.race([
+        bootstrapDone,
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error("Tab A did not resync on sync_complete")), 2_000),
+        ),
+      ]);
+      // Allow cycle completion
+      await new Promise((r) => setTimeout(r, 20));
+      expect(tabABootstraps).toBe(1);
+      expect((await getSyncMeta(db)).sync_cursor).toBe(200);
+      expect(await getFullResyncRequest(db)).toBeNull();
+    } finally {
+      tabA.stop();
+    }
+
+    // (b) MAX_DRAIN_LOOPS exhaustion in holder tab while a resync request is pending:
+    // holder's post-release follow-up (lastCycleProgressed === true) must schedule & run bootstrap.
+    await setSyncMeta(db, {
+      instance_epoch: EPOCH_1,
+      sync_cursor: 200,
+      active_gen: 1,
+      last_sync_at: "2026-11-27T12:06:00.000Z",
+      last_server_now: "2026-11-27T12:06:00.000Z",
+      clock_drift_ms: 0,
+    });
+    let drainPulls = 0;
+    let drainBootstraps = 0;
+    let resolveDrainBootstrap!: () => void;
+    const drainBootstrapDone = new Promise<void>((resolve) => {
+      resolveDrainBootstrap = resolve;
+    });
+
+    const holderRef: { current?: SyncEngine } = {};
+    const drainFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/sync/pull")) {
+        drainPulls += 1;
+        if (drainPulls < 5) {
+          // Keep drain loop iterating through MAX_DRAIN_LOOPS (5) via in-tab re-entrancy
+          // (sets dirty=true without arming any debounce timer that could mask post-release)
+          await holderRef.current?.triggerSync();
+        } else if (drainPulls === 5) {
+          // On the 5th (final) iteration, queue a full resync so it remains pending at loop exit
+          await holderRef.current?.forceFullResync();
+        }
+        const seq = drainBootstraps > 0 ? 300 : 200 + drainPulls;
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:07:00.000Z",
+          resync_required: false,
+          resync_reason: null,
+          watermark: seq,
+          next_seq: seq,
+          has_more: false,
+          changes: [],
+        } satisfies SyncPullResponse);
+      }
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        drainBootstraps += 1;
+        resolveDrainBootstrap();
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:08:00.000Z",
+          watermark: 300,
+          categories: [],
+          feeds: [],
+          clusters: [],
+          interest_profile: null,
+          app_settings: {
+            default_expiration_days: 30,
+            backfill_cap: 10,
+            default_poll_interval_minutes: 60,
+            updated_at: "2026-11-27T12:00:00.000Z",
+          },
+          items: [],
+          has_more: false,
+        });
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const engineHolder = new SyncEngine({ db, fetchImpl: drainFetch, forceIdbLockFallback: true });
+    holderRef.current = engineHolder;
+    try {
+      await engineHolder.triggerSync();
+      // Post-release scheduleDebouncedSync(0) runs asynchronously right after lock release
+      await Promise.race([
+        drainBootstrapDone,
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error("Holder post-release follow-up did not fire")), 2_000),
+        ),
+      ]);
+      await new Promise((r) => setTimeout(r, 25));
+      expect(drainPulls).toBeGreaterThanOrEqual(6);
+      expect(drainBootstraps).toBe(1);
+      expect((await getSyncMeta(db)).sync_cursor).toBe(300);
+      expect(await getFullResyncRequest(db)).toBeNull();
+    } finally {
+      engineHolder.stop();
+    }
+  });
+
+  it("test_1d_ops_t11_force_full_resync_idb_lease_stolen_aborts_atomically", async () => {
+    await seedPairedReady();
+    await setSyncMeta(db, {
+      instance_epoch: EPOCH_1,
+      sync_cursor: 42,
+      active_gen: 1,
+      last_sync_at: "2026-11-27T12:00:00.000Z",
+      last_server_now: "2026-11-27T12:00:00.000Z",
+      clock_drift_ms: 0,
+    });
+    await db.bootstrap_meta.put({
+      key: "active",
+      phase: "fetching",
+      target_gen: 2,
+      page1_epoch: EPOCH_1,
+      page1_watermark: 42,
+      server_now: "2026-11-27T12:00:00.000Z",
+      next_cursor: "c1",
+      categories: [],
+      feeds: [],
+      clusters: [],
+      interest_profile: null,
+      app_settings: null,
+      pages_fetched: 1,
+      items_staged: 0,
+    });
+
+    // Force initial detached state so executeSingleCycle runs health probe before fenced reset tx
+    let stealOnNextHealth = false;
+    let stolenBootstrapCalls = 0;
+    const victimFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/client-config.json")) {
+        return jsonResp({ mode: "localhost", api_origin: "http://localhost:8080" });
+      }
+      if (!stealOnNextHealth) {
+        throw new TypeError("offline during startup");
+      }
+      if (url.endsWith("/api/v1/health")) {
+        // Inside forceFullResync cycle's health probe, steal the IDB lease right before
+        // the fenced reset transaction runs!
+        await db.client_meta.put({
+          key: "sync_lock",
+          value: {
+            owner_tab_id: "winning-tab",
+            fencing_token: 999,
+            acquired_at: Date.now(),
+            expires_at: Date.now() + 60_000,
+          },
+        });
+        return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+      }
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        stolenBootstrapCalls += 1;
+      }
+      return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+    };
+
+    const victim = new SyncEngine({ db, fetchImpl: victimFetch, forceIdbLockFallback: true });
+    try {
+      await victim.start();
+      expect(victim.getSnapshot().connectionState).toBe("detached");
+
+      stealOnNextHealth = true;
+      await victim.forceFullResync();
+
+      // Fenced tx aborted atomically on SyncLockLostError: cursor, bootstrap_meta, and
+      // full_resync_requested must all remain untouched!
+      expect(stolenBootstrapCalls).toBe(0);
+      expect((await getSyncMeta(db)).sync_cursor).toBe(42);
+      expect(await db.bootstrap_meta.get("active")).toBeDefined();
+      expect(await getFullResyncRequest(db)).not.toBeNull();
+    } finally {
+      victim.stop();
+    }
+
+    // Clear thief lease and verify the winning tab consumes the persisted request & bootstraps
+    await db.client_meta.delete("sync_lock");
+    let winnerBootstraps = 0;
+    const winnerFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        winnerBootstraps += 1;
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:10:00.000Z",
+          watermark: 400,
+          categories: [],
+          feeds: [],
+          clusters: [],
+          interest_profile: null,
+          app_settings: {
+            default_expiration_days: 30,
+            backfill_cap: 10,
+            default_poll_interval_minutes: 60,
+            updated_at: "2026-11-27T12:00:00.000Z",
+          },
+          items: [],
+          has_more: false,
+        });
+      }
+      return jsonResp({
+        instance_epoch: EPOCH_1,
+        server_now: "2026-11-27T12:10:01.000Z",
+        resync_required: false,
+        resync_reason: null,
+        watermark: 400,
+        next_seq: 400,
+        has_more: false,
+        changes: [],
+      } satisfies SyncPullResponse);
+    };
+
+    const winner = new SyncEngine({ db, fetchImpl: winnerFetch, forceIdbLockFallback: true });
+    try {
+      await winner.triggerSync();
+      expect(winnerBootstraps).toBe(1);
+      expect((await getSyncMeta(db)).sync_cursor).toBe(400);
+      expect(await getFullResyncRequest(db)).toBeNull();
+    } finally {
+      winner.stop();
+    }
+  });
+
+  it("test_1d_ops_t12_force_full_resync_detached_no_spin_double_click_and_guards", async () => {
+    // (a) Offline / detached & misconfigured no-spin test under fake timers (O-08, O-02-F1)
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    try {
+      await seedPairedReady();
+      await setSyncMeta(db, {
+        instance_epoch: EPOCH_1,
+        sync_cursor: 77,
+        active_gen: 1,
+        last_sync_at: "2026-11-27T12:00:00.000Z",
+        last_server_now: "2026-11-27T12:00:00.000Z",
+        clock_drift_ms: 0,
+      });
+
+      let serverMode: "offline" | "misconfigured" | "online" = "offline";
+      let healthProbes = 0;
+      let bootstrapCalls = 0;
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/client-config.json")) {
+          return jsonResp({ mode: "localhost", api_origin: "http://localhost:8080" });
+        }
+        if (url.endsWith("/api/v1/health")) {
+          if (init?.mode !== "no-cors") {
+            healthProbes += 1;
+          }
+          if (serverMode === "offline") {
+            throw new TypeError("Failed to fetch");
+          }
+          if (serverMode === "misconfigured") {
+            if (init?.mode === "no-cors") {
+              return new Response("", { status: 200 });
+            }
+            throw new TypeError("CORS blocked");
+          }
+          return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+        }
+        if (url.endsWith("/api/v1/devices")) {
+          return new Response(JSON.stringify({ detail: "unauthorized" }), { status: 401 });
+        }
+        if (serverMode === "offline") {
+          throw new TypeError("Failed to fetch");
+        }
+        if (serverMode === "misconfigured") {
+          return new Response("Invalid Host header", { status: 400 });
+        }
+        if (url.includes("/api/v1/sync/bootstrap")) {
+          bootstrapCalls += 1;
+          return jsonResp({
+            instance_epoch: EPOCH_1,
+            server_now: "2026-11-27T12:20:00.000Z",
+            watermark: 500,
+            categories: [],
+            feeds: [],
+            clusters: [],
+            interest_profile: null,
+            app_settings: {
+              default_expiration_days: 30,
+              backfill_cap: 10,
+              default_poll_interval_minutes: 60,
+              updated_at: "2026-11-27T12:00:00.000Z",
+            },
+            items: [],
+            has_more: false,
+          });
+        }
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:20:01.000Z",
+          resync_required: false,
+          resync_reason: null,
+          watermark: 500,
+          next_seq: 500,
+          has_more: false,
+          changes: [],
+        } satisfies SyncPullResponse);
+      };
+
+      const engine = new SyncEngine({
+        db,
+        fetchImpl,
+        forceIdbLockFallback: true,
+        now: () => Date.now(),
+      });
+      try {
+        await engine.start();
+        expect(engine.getSnapshot().connectionState).toBe("detached");
+
+        healthProbes = 0;
+        await engine.forceFullResync();
+        expect((await getSyncMeta(db)).sync_cursor).toBe(77);
+        expect(await getFullResyncRequest(db)).not.toBeNull();
+        expect(healthProbes).toBe(1);
+
+        // Advance 5 s: zero spin-reschedule (must remain 1 probe!)
+        await vi.advanceTimersByTimeAsync(5_000);
+        for (let i = 0; i < 5; i += 1) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        expect(healthProbes).toBe(1);
+
+        // Switch server to misconfigured and advance 60 s poll tick: bounded <= 1 probe, no spin
+        serverMode = "misconfigured";
+        await vi.advanceTimersByTimeAsync(60_000);
+        for (let i = 0; i < 10; i += 1) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        expect(engine.getSnapshot().connectionState).toBe("misconfigured");
+        const probesAfterMisconfig = healthProbes;
+        expect(probesAfterMisconfig).toBe(2);
+        await engine.forceFullResync();
+        expect(healthProbes).toBe(probesAfterMisconfig + 1);
+        await vi.advanceTimersByTimeAsync(5_000);
+        for (let i = 0; i < 5; i += 1) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        expect(healthProbes).toBe(probesAfterMisconfig + 1);
+
+        // Now bring server online and verify reconnect runs full bootstrap
+        serverMode = "online";
+        await engine.triggerSync();
+        expect(bootstrapCalls).toBe(1);
+        expect((await getSyncMeta(db)).sync_cursor).toBe(500);
+        expect(await getFullResyncRequest(db)).toBeNull();
+      } finally {
+        engine.stop();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // (b) Second forceFullResync() arriving during runStreamingBootstrap (after first fenced
+    // reset committed) persists and triggers a follow-up full bootstrap (G-05)
+    await setSyncMeta(db, {
+      instance_epoch: EPOCH_1,
+      sync_cursor: 500,
+      active_gen: 1,
+      last_sync_at: "2026-11-27T12:21:00.000Z",
+      last_server_now: "2026-11-27T12:21:00.000Z",
+      clock_drift_ms: 0,
+    });
+    let doubleClickBootstraps = 0;
+    const doubleRef: { current?: SyncEngine } = {};
+    const doubleFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/sync/bootstrap")) {
+        doubleClickBootstraps += 1;
+        if (doubleClickBootstraps === 1) {
+          // Simulate a second rapid click arriving during the first bootstrap (after reset committed)
+          await doubleRef.current?.forceFullResync();
+        }
+        return jsonResp({
+          instance_epoch: EPOCH_1,
+          server_now: "2026-11-27T12:22:00.000Z",
+          watermark: 500 + doubleClickBootstraps,
+          categories: [],
+          feeds: [],
+          clusters: [],
+          interest_profile: null,
+          app_settings: {
+            default_expiration_days: 30,
+            backfill_cap: 10,
+            default_poll_interval_minutes: 60,
+            updated_at: "2026-11-27T12:00:00.000Z",
+          },
+          items: [],
+          has_more: false,
+        });
+      }
+      const seq = 500 + doubleClickBootstraps;
+      return jsonResp({
+        instance_epoch: EPOCH_1,
+        server_now: "2026-11-27T12:22:01.000Z",
+        resync_required: false,
+        resync_reason: null,
+        watermark: seq,
+        next_seq: seq,
+        has_more: false,
+        changes: [],
+      } satisfies SyncPullResponse);
+    };
+
+    const engineDouble = new SyncEngine({ db, fetchImpl: doubleFetch, forceIdbLockFallback: true });
+    doubleRef.current = engineDouble;
+    try {
+      await engineDouble.forceFullResync();
+      expect(doubleClickBootstraps).toBe(2);
+      expect(await getFullResyncRequest(db)).toBeNull();
+    } finally {
+      engineDouble.stop();
+    }
+
+    // (c) Guard states: unpaired, auth_revoked, origin_confirm must all be no-ops
+    let guardFetches = 0;
+    const guardFetch: typeof fetch = async (input) => {
+      guardFetches += 1;
+      const url = String(input);
+      if (url.endsWith("/client-config.json")) {
+        return jsonResp({ mode: "localhost", api_origin: "http://192.168.1.99:8080" });
+      }
+      return new Response(JSON.stringify({ detail: "revoked" }), { status: 401 });
+    };
+
+    // Unpaired
+    await db.client_meta.delete("auth");
+    const unpairedEngine = new SyncEngine({
+      db,
+      fetchImpl: guardFetch,
+      forceIdbLockFallback: true,
+    });
+    try {
+      await unpairedEngine.forceFullResync();
+      expect(await getFullResyncRequest(db)).toBeNull();
+      expect(guardFetches).toBe(0);
+    } finally {
+      unpairedEngine.stop();
+    }
+
+    // origin_confirm (client-config origin differs from paired auth origin)
+    await setAuthMeta(db, {
+      device_id: "11111111-1111-4111-8111-111111111111",
+      bearer_token: "tok",
+      api_origin: "http://localhost:8080",
+      device_name: "Laptop",
+      platform: "ubuntu",
+      paired_at: "2026-11-27T00:00:00.000Z",
+    });
+    const originEngine = new SyncEngine({ db, fetchImpl: guardFetch, forceIdbLockFallback: true });
+    try {
+      await originEngine.start();
+      expect(originEngine.getSnapshot().connectionState).toBe("origin_confirm");
+      const before = guardFetches;
+      await originEngine.forceFullResync();
+      expect(await getFullResyncRequest(db)).toBeNull();
+      expect(guardFetches).toBe(before);
+    } finally {
+      originEngine.stop();
+    }
+
+    // auth_revoked
+    const revokedFetch: typeof fetch = async (input) => {
+      guardFetches += 1;
+      const url = String(input);
+      if (url.endsWith("/client-config.json")) {
+        return jsonResp({ mode: "localhost", api_origin: "http://localhost:8080" });
+      }
+      return new Response(JSON.stringify({ detail: "revoked" }), { status: 401 });
+    };
+    const revokedEngine = new SyncEngine({
+      db,
+      fetchImpl: revokedFetch,
+      forceIdbLockFallback: true,
+    });
+    try {
+      await revokedEngine.start();
+      expect(revokedEngine.getSnapshot().connectionState).toBe("auth_revoked");
+      const before = guardFetches;
+      await revokedEngine.forceFullResync();
+      expect(await getFullResyncRequest(db)).toBeNull();
+      expect(guardFetches).toBe(before);
+    } finally {
+      revokedEngine.stop();
+    }
+  });
+
+  it("test_g04_force_full_resync_cross_tab_no_broadcast_drain_loop_picks_up_in_same_lock_hold", async () => {
+    // G-04 / T10(c) regression: BroadcastChannel disabled, Tab B holds IDB lease mid-pull with
+    // empty outbox and dirty=false; Tab A writes full_resync_requested BEFORE Tab B's drain check.
+    // Tab B must run the fenced reset + bootstrap within the EXACT SAME lock hold (1 lock
+    // acquisition, 0 scheduleDebouncedSync calls). Fails if `&& !pendingResync` is removed.
+    vi.stubGlobal("BroadcastChannel", undefined);
+    try {
+      await seedPairedReady();
+      await setSyncMeta(db, {
+        instance_epoch: EPOCH_1,
+        sync_cursor: 10,
+        active_gen: 1,
+        last_sync_at: "2026-11-27T12:00:00.000Z",
+        last_server_now: "2026-11-27T12:00:00.000Z",
+        clock_drift_ms: 0,
+      });
+
+      let resolvePullStarted!: () => void;
+      const pullStarted = new Promise<void>((resolve) => {
+        resolvePullStarted = resolve;
+      });
+      let releasePull!: () => void;
+      const pullBarrier = new Promise<void>((resolve) => {
+        releasePull = resolve;
+      });
+
+      let pullCalls = 0;
+      let bootstrapCalls = 0;
+      let tokenDuringPull1: number | null = null;
+      let tokenDuringBootstrap: number | null = null;
+
+      const fetchImpl: typeof fetch = async (input) => {
+        const url = String(input);
+        if (url.includes("/api/v1/sync/pull")) {
+          pullCalls += 1;
+          if (pullCalls === 1) {
+            const lockRow = await db.client_meta.get("sync_lock");
+            tokenDuringPull1 =
+              (lockRow?.value as { fencing_token?: number } | undefined)?.fencing_token ?? null;
+            resolvePullStarted();
+            await pullBarrier;
+            return jsonResp({
+              instance_epoch: EPOCH_1,
+              server_now: "2026-11-27T12:30:00.000Z",
+              resync_required: false,
+              resync_reason: null,
+              watermark: 50,
+              next_seq: 50,
+              has_more: false,
+              changes: [],
+            } satisfies SyncPullResponse);
+          }
+          return jsonResp({
+            instance_epoch: EPOCH_1,
+            server_now: "2026-11-27T12:31:00.000Z",
+            resync_required: false,
+            resync_reason: null,
+            watermark: 350,
+            next_seq: 350,
+            has_more: false,
+            changes: [],
+          } satisfies SyncPullResponse);
+        }
+        if (url.includes("/api/v1/sync/bootstrap")) {
+          bootstrapCalls += 1;
+          const lockRow = await db.client_meta.get("sync_lock");
+          tokenDuringBootstrap =
+            (lockRow?.value as { fencing_token?: number } | undefined)?.fencing_token ?? null;
+          return jsonResp({
+            instance_epoch: EPOCH_1,
+            server_now: "2026-11-27T12:30:30.000Z",
+            watermark: 350,
+            categories: [],
+            feeds: [],
+            clusters: [],
+            interest_profile: null,
+            app_settings: {
+              default_expiration_days: 30,
+              backfill_cap: 10,
+              default_poll_interval_minutes: 60,
+              updated_at: "2026-11-27T12:00:00.000Z",
+            },
+            items: [],
+            has_more: false,
+          });
+        }
+        return jsonResp({ status: "ok", db: "ok", version: "0.1.0" });
+      };
+
+      const engineB = new SyncEngine({ db, fetchImpl, forceIdbLockFallback: true });
+      const scheduleSpy = vi.spyOn(engineB, "scheduleDebouncedSync");
+      try {
+        const cycle = engineB.triggerSync();
+        await pullStarted;
+
+        // Tab A writes full_resync_requested directly to IDB while Tab B is mid-pull
+        // (BroadcastChannel is disabled, so engineB.dirty stays false and outbox stays empty)
+        expect(await db.outbox.count()).toBe(0);
+        await setFullResyncRequest(db, {
+          request_id: "00000000-0000-4000-8000-111111111111",
+          requested_at: Date.now(),
+        });
+
+        releasePull();
+        await cycle;
+
+        // Must have executed bootstrap inside the EXACT SAME lock hold (same fencing_token,
+        // zero scheduleDebouncedSync follow-ups)
+        expect(bootstrapCalls).toBe(1);
+        expect(tokenDuringPull1).not.toBeNull();
+        expect(tokenDuringBootstrap).toBe(tokenDuringPull1);
+        expect(scheduleSpy).not.toHaveBeenCalled();
+        expect((await getSyncMeta(db)).sync_cursor).toBe(350);
+        expect(await getFullResyncRequest(db)).toBeNull();
+      } finally {
+        scheduleSpy.mockRestore();
+        engineB.stop();
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

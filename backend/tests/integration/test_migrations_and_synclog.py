@@ -211,3 +211,93 @@ async def test_strict_sync_guards_catch_unlogged_orm_and_core_writes(
         with pytest.raises(MissingSyncEventError):
             await s.commit()
         await s.rollback()
+
+
+async def test_g03_synclog_savepoint_committed_recorded_rolled_back_and_nested(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """G-03 regression: strict SyncLogWriter guard across committed, rolled-back, and nested
+    savepoints. (a) fails if committed savepoints erroneously discard sync requirements."""
+    # (a) Synced ORM write inside a RELEASED savepoint without sync_log.record -> outer commit fails
+    async with session_factory() as s:
+        async with s.begin_nested():
+            s.add(Category(id=uuid.uuid4(), name="Savepoint Unlogged"))
+            await s.flush()
+        with pytest.raises(MissingSyncEventError):
+            await s.commit()
+        await s.rollback()
+
+    # (b) Same write inside a released savepoint WITH sync_log.record() inside the savepoint
+    cat_recorded_id = uuid.uuid4()
+    async with session_factory() as s:
+        async with s.begin_nested():
+            s.add(Category(id=cat_recorded_id, name="Savepoint Logged Inside"))
+            await s.flush()
+            await sync_log.record(s, [SyncEvent("category", cat_recorded_id, "upsert")])
+        await s.commit()
+
+    async with session_factory() as s:
+        changes = (
+            (await s.execute(sa.select(SyncChange).where(SyncChange.entity_id == cat_recorded_id)))
+            .scalars()
+            .all()
+        )
+        assert len(changes) == 1
+
+    # (c) Write inside a ROLLED-BACK savepoint (explicit rollback & IntegrityError) is discarded
+    async with session_factory() as s:
+        sp = await s.begin_nested()
+        s.add(Category(id=uuid.uuid4(), name="Savepoint Explicit Rollback"))
+        await s.flush()
+        await sp.rollback()
+        # Outer commit has zero surviving synced mutations -> succeeds cleanly
+        await s.commit()
+
+    from sqlalchemy.exc import IntegrityError
+
+    async with session_factory() as s:
+        with pytest.raises(IntegrityError):
+            async with s.begin_nested():
+                # Collides with cat_recorded_id ("Savepoint Logged Inside") on unique index
+                s.add(Category(id=uuid.uuid4(), name="Savepoint Logged Inside"))
+                await s.flush()
+        await s.commit()
+
+    # (d) Two-level nested savepoints:
+    # (d1) Outer savepoint releases cat_outer; inner savepoint rolls back cat_inner ->
+    #      recording ONLY cat_outer satisfies the guard; omitting cat_outer still raises.
+    cat_outer_unlogged = uuid.uuid4()
+    async with session_factory() as s:
+        async with s.begin_nested():
+            s.add(Category(id=cat_outer_unlogged, name="Nested Outer Unlogged"))
+            await s.flush()
+            sp_inner = await s.begin_nested()
+            s.add(Category(id=uuid.uuid4(), name="Nested Inner Rolled Back"))
+            await s.flush()
+            await sp_inner.rollback()
+        with pytest.raises(MissingSyncEventError):
+            await s.commit()
+        await s.rollback()
+
+    cat_outer_logged = uuid.uuid4()
+    async with session_factory() as s:
+        async with s.begin_nested():
+            s.add(Category(id=cat_outer_logged, name="Nested Outer Logged"))
+            await s.flush()
+            sp_inner = await s.begin_nested()
+            s.add(Category(id=uuid.uuid4(), name="Nested Inner Rolled Back 2"))
+            await s.flush()
+            await sp_inner.rollback()
+        await sync_log.record(s, [SyncEvent("category", cat_outer_logged, "upsert")])
+        await s.commit()
+
+    # (d2) Inner savepoint releases, then OUTER savepoint rolls back -> both discarded cleanly
+    async with session_factory() as s:
+        sp_outer = await s.begin_nested()
+        s.add(Category(id=uuid.uuid4(), name="Outer Rollback 1"))
+        await s.flush()
+        async with s.begin_nested():
+            s.add(Category(id=uuid.uuid4(), name="Inner Released Then Outer Rolled Back"))
+            await s.flush()
+        await sp_outer.rollback()
+        await s.commit()
