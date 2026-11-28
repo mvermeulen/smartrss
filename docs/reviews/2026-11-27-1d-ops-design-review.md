@@ -11,7 +11,7 @@
   - the [`1a`–`1c` user-test review](2026-11-26-1a-1c-user-test-implementation-review.md) (`E-09`, `E-11`) and the [`1c` implementation review](2026-11-25-1c-implementation-review.md) (the `forceFullResync()` carry-forward).
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `O` (`O-01`–`O-11`)
-- **Status**: `Addressed (2026-11-27) — awaiting verification`
+- **Status**: `Addressed (2026-11-27) — verification found follow-ups` (`O-01-F1`, `O-02-F1`, both minor)
 
 ## Review outcome
 
@@ -277,3 +277,55 @@ Either way, add a test that a `muted` feed round-trips as documented.
 ### Design-only check summary
 
 - No application code changed; `make check` verified green (`205` backend passed, `91.86%` total, all 16 critical modules >= 90%; `32` runner passed, `94.87%`; `57` frontend passed, all gates OK). Ready for Claude Code verification pass.
+
+## Verification pass (2026-11-27)
+
+**Verifier:** Claude Code, on `milestone/1d-ops` at `8b947b0`. The resolutions are in `a857dcc` and the owner decisions in `8b947b0`.
+
+**Scope:** both commits change the design only. There are no code changes, so there was nothing to revert. Each finding was checked against the revised text of `1d-ops-setup-and-cli.md`, the `requirements.md` diff and the test plan. Where a fix rests on tool behaviour, I tested the behaviour directly.
+
+**`make check`:** green. Backend: 205 passed, 91.83% coverage, and all 16 critical modules ≥ 90%. Runner: 32 passed, 94.87%. Frontend: 57 passed. These match the resolution notes; the 0.03-point coverage difference is run-to-run variation.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `O-01` (Major) | ⚠️ partially resolved → `O-01-F1` | `1d-ops-D07` adds a shared `image: smartrss-backend:local`, and `make up` and setup both run `build api web` before `up`. That fixes the reported skew: every `up` or setup re-run now rebuilds the image the cron worker uses. **New gap:** the worker no longer has a `build:` section. I tested this with a throwaway Compose project of the same shape (`api` with `image:` + `build:`; `worker` with the same `image:`, profile-gated). `docker compose up` builds through `api` correctly. But `docker compose run --rm worker …`, which is exactly what the timer and the crontab run, tries to **pull** the image when it is absent locally and fails: `pull access denied for … repository does not exist`. See `O-01-F1`. |
+| `O-02` | ⚠️ partially resolved → `O-02-F1` | The `sync_complete` handler now re-triggers on `outbox > 0 \|\| resyncReq !== null`. The `recheckOnSyncComplete` assignment in the holder tab is gone and replaced by a post-release check plus `scheduleDebouncedSync(0)`, and `T10` (a) and (b) are added. That covers the empty-outbox interleaving and the `MAX_DRAIN_LOOPS` case. **New gap:** the post-release check can spin without delay while detached. See `O-02-F1`. |
+| `O-03` | ✅ | §5.3 step order: the dump is fatal on error; the OPML export is best-effort with `OPML_FAILED`; `.dump` and `.opml` are pruned independently, locally and remotely; `rsync` always runs for a verified dump; the deferred `exit 1` comes last. `T05` (d) asserts that `rsync` is still called and nothing is left behind. *Implementation note:* `backup.sh` runs under `set -euo pipefail`, so the export pipeline must be wrapped (`if ! …; then OPML_FAILED=1; fi`). Otherwise `set -e` exits before `rsync` and reintroduces `O-03`. `T05` (d) would catch this. |
+| `O-04` | ✅ | The owner chose option (a) under `Q-2`. The portability contract is now stated in §5.1 item 5, D05 and `NFR-OPS-02`. `T07` now covers re-importing `muted` / `paused` feeds into the same DB, and the fresh-DB "`active` with defaults" behaviour. |
+| `O-05` | ✅ | `--create-category` defaults to `False` and exits `2` with a hint when the category is missing. The category insert runs in a savepoint (`begin_nested()`) on both `create_or_reactivate_feed` and `import_opml_subscriptions`. On `IntegrityError` it re-selects the winner `WHERE LOWER(name) = LOWER(:name)`, and a `category` upsert is emitted only by the creating transaction. Under READ COMMITTED, the unique index makes the second inserter wait for the first to commit, then raise; the re-select then sees the committed row, so the protocol is sound. The concurrency test is `T06` (b), a barrier-forced real-PG overlap. |
+| `O-06` | ✅ | The `loginctl … Linger` check is followed by a summary `WARNING` with the exact command. Setup detects an existing `smartrss worker run-once` crontab entry, warning when interactive and printing a `WARNING` when non-interactive. The unit and the README crontab now share the lock `%h/.local/state/smartrss/worker.lock`, with `ExecStartPre=mkdir -p`. The unit uses `flock -n -E 75` + `SuccessExitStatus=75` (I confirmed `-E` exists in util-linux `flock`). `T04` adds mocked `loginctl` / `crontab`. The owner chose an opt-in timer under `Q-3`. |
+| `O-07` | ✅ | The primary host is the first `--lan-host`, otherwise the detected IPv4, never a bare short hostname. `<hostname>.local` is added only when `getent` resolves it. The summary includes a DHCP-reservation note, and §9 adds the README instructions for an IP change. Cases are added in `T01` / `T04`. |
+| `O-08` | ✅ | The key is now `"sync"` (`clientMeta.ts:38`) in D06, §6.1 and §6.2. The §6.3 row is now "Already `detached`", and also describes the case where the network drops while the snapshot still reads `online`. The `T12` precondition is stated. |
+| `O-09` | ✅ | A temp file opened `O_EXCL` at `0o600` → `fsync` → `os.link(tmp, output)`. On `FileExistsError`, setup takes the dedicated "preserved" exit path, and the temp file is unlinked in `finally`. The `T01` concurrent-creation case is added. |
+| `O-10` | ✅ | The startup order is now `build api web` → `up -d --wait db api` → `db migrate` → `up -d --wait`. The health check is a subset match that tolerates `version`. `After=network-online.target` has been removed from the unit. |
+| `O-11` | ✅ | `--if-not-exists` on a `paused` / `muted` match prints the status, puts `"status"` and `"created": false` in the JSON, and exits `3`. `FeedAlreadySubscribedError` carries `existing_status`. Cases are added in `T06`. |
+
+### Follow-ups
+
+- **`O-01-F1` (Minor): `docker compose run worker` fails when the shared image is missing locally, because the worker no longer has a `build:` section.**
+  - **Failure scenario:** in cron mode, the owner runs `docker image prune -a` or `docker system prune -a`, or `make down` gets a `--rmi` option. Every 15 minutes the timer then fails with `pull access denied for smartrss-backend`, until someone runs `make up` or `make setup`. The `SuccessExitStatus=75` change hides overlap skips, but not this, so the unit shows as failed. Before `D07`, `run` would simply have built the image.
+  - **Expected fix:** give `worker` the same `build: { context: ./backend }` as `api`, keeping the shared `image:` tag, so `run` can build on demand. With BuildKit caching, a second build in daemon mode is close to free; confirm Compose doesn't build twice, or accept a cached second build. Alternatively, add `pull_policy: never` to `worker` and a pre-check in the unit (`ExecStartPre=` `docker image inspect smartrss-backend:local` with a clear message). That fails less confusingly but doesn't self-heal.
+  - **Test:** extend `T04` (a) with a compose-config assertion that the `worker` service can build (has `build:`) or has `pull_policy: never`, and a mocked or real `docker compose run` with the image absent that doesn't attempt a registry pull.
+- **`O-02-F1` (Minor): the holder tab's post-release check can spin without delay while detached.** §6.2 step 5 reschedules with `scheduleDebouncedSync(0)` when a request is pending after release, "if `loops >= MAX_DRAIN_LOOPS` (or if another request arrived between the final drain check and lock release)". The parenthetical can only be implemented as "a request is pending after release". But the "Already `detached`" row in §6.3 deliberately leaves the request pending, because the probe returns `detached` before consumption.
+  - **Failure scenario:**
+    1. The tab is detached with a pending request.
+    2. A cycle starts, the probe returns `detached`, and the lock is released.
+    3. The post-release check sees the request and calls `scheduleDebouncedSync(0)`.
+    4. The next cycle probes and fails again, and so on.
+
+    The result is a tight loop of reachability probes, with CPU and battery cost, for as long as the laptop is offline. The same happens with a `misconfigured` origin, which also returns before consumption.
+  - **Expected fix:** reschedule only when the request was **not** observed by the last `executeSingleCycle()`. For example, record the `request_id` that cycle read (or "none"), and compare it after release. Alternatively, reschedule only when the last cycle ended with `progressed === true`. Leave the detached, misconfigured and auth-revoked cases to the existing 60 s poll timer and the `online` / `visibilitychange` triggers. Reword step 5 without the open-ended parenthetical.
+  - **Test:** add a `T12` (or `T10` (c)) case with a pending request while `detached` under fake timers. Assert that the number of probe calls stays bounded (≤ 1 per poll tick) as the clock advances, and that the resync still runs once a probe succeeds.
+
+### Observations (no action required)
+
+- After `D07`, the old `smartrss-api:latest` and `smartrss-worker:latest` images stay as unused local images (about 330 MB each on this host). Consider a one-line README note (`docker image rm smartrss-api smartrss-worker`) in the §9 sync.
+
+### Repo-wide drift
+
+- `docs/README.md` (requirements and component-design rows), `docs/design/README.md` item 4, the design header and `AGENTS.md` all say `1d-ops` is `In Design Review`, so they agree.
+- `requirements.md` records `NFR-OPS-02` and the `1d-ops` split as approved by the owner on 2026-11-27 (`Q-1`).
+- There is one review row, with no duplicates. No untracked files.
+- *Process note:* `a857dcc` and `8b947b0` are local; `milestone/1d-ops` is 2 commits ahead of `origin`.
+
+**Status:** left at `Addressed — verification found follow-ups`. Handed back to Antigravity (`address-review-findings`) for `O-01-F1` and `O-02-F1`.
