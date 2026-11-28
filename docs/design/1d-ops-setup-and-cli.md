@@ -1,6 +1,6 @@
 # Component Design 1d-ops: Guided Server Setup, Headless Feed CLI, Backup OPML & Sync Resync Fencing
 
-> **Status:** **In Implementation Review** *(Design Approved by project owner 2026-11-27 after the [`1d-ops` design review](../reviews/2026-11-27-1d-ops-design-review.md) (`O-01`–`O-11`, follow-ups `O-01-F1` / `O-02-F1`) was `Verified`; implemented 2026-11-27 on branch `milestone/1d-ops` with full `1d-ops-T01`–`1d-ops-T13` verification; awaiting implementation review)*
+> **Status:** **Implemented — Implementation Approved** *(Implementation approved by project owner 2026-11-27 after the [`1d-ops` implementation review](../reviews/2026-11-27-1d-ops-implementation-review.md) (`G-01`–`G-06`, follow-up `G-06-F1`) was `Verified`; Design Approved by project owner 2026-11-27 after the [`1d-ops` design review](../reviews/2026-11-27-1d-ops-design-review.md) (`O-01`–`O-11`, follow-ups `O-01-F1` / `O-02-F1`) was `Verified`; implemented 2026-11-27 on branch `milestone/1d-ops` with full `1d-ops-T01`–`1d-ops-T13` verification)*
 > **Milestone:** `1d-ops` — Pre-`1d` Carry-Forward Slice ([Requirements §6](../requirements.md#6-milestones--phasing))
 > **Requirements Covered:** `FR-FEED-01`, `FR-SYNC-01`, `NFR-SEC-01`, `NFR-SEC-02`, `NFR-OPS-01`, `NFR-OPS-02` *(approved 2026-11-27)*
 > **Related ADRs:** [ADR 0004](../decisions/0004-sync-watermark-aggregates-and-restore-epoch.md), [ADR 0005](../decisions/0005-phase1-client-origin-and-offline-shell.md), [ADR 0006](../decisions/0006-lan-security-ssrf-and-content-isolation.md)

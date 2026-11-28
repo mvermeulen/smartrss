@@ -10,7 +10,7 @@
   - `1c` §6 / §11, [`review-checklist.md`](../review-checklist.md) and `development-process.md` §2 / §7.
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `G` (`G-01`–`G-06`)
-- **Status**: `Addressed (2026-11-27) — awaiting verification (pass 2)`
+- **Status**: `Verified (2026-11-27)` — project owner marked `1d-ops` **`Implementation Approved`** on 2026-11-27; pass 2 confirmed `G-06-F1` resolved; all `G-01`–`G-06` resolved
 
 ## Review outcome
 
@@ -304,3 +304,24 @@ What the guard actually does is keep the newer request, which costs a **second, 
 - **Backend**: `ruff check`, `ruff format --check`, and `mypy src` clean. **219 passed**, **92.94%** total branch+line coverage (`>= 80%`). All 17 critical modules pass `>= 90%` (`src/smartrss/feeds/service.py` **97.25%**, `src/smartrss/db/sync_log.py` **95.79%**, lowest critical module `src/smartrss/worker/stages/poll_feed.py` **91.98%**).
 - **Client runner**: **32 passed**, **94.87%** coverage (`>= 90%`).
 - **Frontend**: `eslint`, `prettier --check`, `tsc --noEmit` clean; **62 passed** (`vitest`), overall **93.30%** lines / **89.21%** branches; all critical (`>= 90%`) and core (`>= 80%`) coverage gates pass.
+
+## Verification pass 2 (2026-11-27)
+
+**Verifier:** Claude Code, on `milestone/1d-ops` at `b94fcf8`. *Process note:* `ba5c53e`, `0f681b6` and `b94fcf8` are local; the branch is 3 commits ahead of `origin`.
+
+**`make check`:** green. Backend: **219 passed** (matches the notes), 92.97%, and all 17 critical modules ≥ 90% (`feeds/service.py` 97.25%). Runner: 32 passed, 94.87%. Frontend: **62 passed**. All gates pass.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `G-06-F1` | ✅ | In `import_opml_subscriptions`, each new-feed insert and flush now runs inside `session.begin_nested()`. On `IntegrityError`, the import re-selects the winning row `FOR UPDATE` and updates `feeds_by_url`. An `active`, `paused` or `muted` winner counts as `skipped_duplicates`, and the import continues. An `unsubscribed` winner is reactivated through the shared `_apply_opml_reactivation()`, which the snapshot path also uses now, so the two can't drift.<br>**Sibling audit:** `grep` finds exactly two `Feed(` construction sites in `backend/src/smartrss/` (`service.py:355` for `G-06` and `:550` for `G-06-F1`), and no Core `insert(Feed)` / raw `INSERT INTO feeds`. Both are guarded.<br>**Reverts**, each run twice:<br>• disabling the import's `except IntegrityError:` fails `test_g06_f1_opml_import_concurrent_same_url_race_skips_duplicate_and_reactivates`;<br>• forcing the race path to always skip, which disables the unsubscribed-winner reactivation, fails the same test.<br>The test uses the deterministic interleaving from the pass-1 reproduction: an uncommitted competitor holds the unique key, the import blocks, then the competitor commits. `1d-ops` §5.1 / §8 are updated. |
+
+All other findings stay ✅ as recorded in pass 1.
+
+### Repo-wide drift
+
+- The design header, `docs/design/README.md` item 4 and `AGENTS.md` all say `In Implementation Review`. That is correct until the owner approves.
+- There is one row for this review in `docs/README.md`, now `Verified`. No untracked files.
+
+**Result:** no ⚠️ or ❌ remain, so the review is **`Verified (2026-11-27)`**. Milestone `1d-ops` is ready for the project owner's implementation-approval decision. No approval status was changed.
+
+**Owner decision (2026-11-27):** the project owner approved the `1d-ops` implementation (`Implementation Approved`). Milestone `1d-ops` is complete, and `1d` coding may start once its design is approved.
