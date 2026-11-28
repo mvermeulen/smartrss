@@ -21,6 +21,7 @@ from smartrss.db.models import Category, Feed, Job, SyncChange
 from smartrss.domain.opml import parse_opml
 from smartrss.feeds.service import (
     MAX_OPML_BYTES,
+    FeedAlreadySubscribedError,
     FeedCategoryNotFoundError,
     FeedValidationError,
     create_or_reactivate_feed,
@@ -567,3 +568,61 @@ async def test_1d_ops_t08_api_routes_parity_with_shared_feed_service(
         await s.commit()
         assert imp_re.reactivated == 1
         assert imp_re.imported == 1
+
+
+async def test_g06_concurrent_same_url_subscribe_raises_already_subscribed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """G-06 regression (forced-overlap real-PG race): two concurrent create_or_reactivate_feed
+    calls for the same new feed_url — one creates, the other receives FeedAlreadySubscribedError
+    instead of an unhandled IntegrityError."""
+    policy = _stub_policy()
+    race_url = "https://same-url-race.example.com/feed.xml"
+    barrier = asyncio.Barrier(2)
+
+    orig_execute = AsyncSession.execute
+
+    async def _coordinated_execute(
+        self: AsyncSession, statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = await orig_execute(self, statement, *args, **kwargs)
+        # Synchronize both sessions immediately after their initial SELECT Feed FOR UPDATE returns
+        stmt_sql = str(statement)
+        if (
+            "FROM feeds" in stmt_sql
+            and "FOR UPDATE" in stmt_sql
+            and not self.in_nested_transaction()
+            and not self.info.get("_g06_hit")
+        ):
+            self.info["_g06_hit"] = True
+            await barrier.wait()
+        return result
+
+    async def _attempt() -> tuple[str, uuid.UUID]:
+        async with session_factory() as s:
+            try:
+                feed_obj, _ = await create_or_reactivate_feed(s, policy, feed_url=race_url)
+                await s.commit()
+                return ("created", feed_obj.id)
+            except FeedAlreadySubscribedError as exc:
+                await s.rollback()
+                return ("conflict", exc.existing_feed_id)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(AsyncSession, "execute", _coordinated_execute)
+    try:
+        res_a, res_b = await asyncio.gather(_attempt(), _attempt())
+    finally:
+        mp.undo()
+
+    outcomes = sorted([res_a[0], res_b[0]])
+    assert outcomes == ["conflict", "created"]
+    assert res_a[1] == res_b[1]
+
+    async with session_factory() as s:
+        count = (
+            await s.execute(
+                sa.select(sa.func.count()).select_from(Feed).where(Feed.feed_url == race_url)
+            )
+        ).scalar_one()
+        assert count == 1

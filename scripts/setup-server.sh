@@ -8,8 +8,11 @@ RENDER_HELPER="$REPO_ROOT/scripts/_render_env.py"
 
 NON_INTERACTIVE=0
 WORKER_MODE=""
+EXPLICIT_WORKER_MODE=0
 LAN_PORT="8080"
+EXPLICIT_LAN_PORT=0
 SSRF_BLOCKED_CIDRS=""
+EXPLICIT_SSRF_CIDRS=0
 OPML_FILE=""
 DEVICE_NAME="Primary Laptop"
 DEVICE_PLATFORM="ubuntu"
@@ -50,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --worker-mode)
       [[ $# -ge 2 ]] || { echo "ERROR: --worker-mode requires daemon or cron" >&2; exit 2; }
       WORKER_MODE="$2"
+      EXPLICIT_WORKER_MODE=1
       shift 2
       ;;
     --lan-host)
@@ -60,11 +64,13 @@ while [[ $# -gt 0 ]]; do
     --lan-port)
       [[ $# -ge 2 ]] || { echo "ERROR: --lan-port requires a port number" >&2; exit 2; }
       LAN_PORT="$2"
+      EXPLICIT_LAN_PORT=1
       shift 2
       ;;
     --ssrf-blocked-cidrs)
       [[ $# -ge 2 ]] || { echo "ERROR: --ssrf-blocked-cidrs requires a value" >&2; exit 2; }
       SSRF_BLOCKED_CIDRS="$2"
+      EXPLICIT_SSRF_CIDRS=1
       shift 2
       ;;
     --opml)
@@ -136,6 +142,20 @@ if [[ -n "$OPML_FILE" ]]; then
   fi
 fi
 
+# Validate LAN hosts and SSRF CIDRs upfront on EVERY run before touching disk or Docker (G-01)
+if command -v python3 >/dev/null 2>&1; then
+  val_args=(
+    "$RENDER_HELPER" validate
+    --lan-port "$LAN_PORT"
+    --worker-mode "$WORKER_MODE"
+    --ssrf-blocked-cidrs "$SSRF_BLOCKED_CIDRS"
+  )
+  for h in "${LAN_HOSTS[@]}"; do
+    val_args+=(--lan-host "$h")
+  done
+  python3 "${val_args[@]}"
+fi
+
 # 2. Prerequisite checks (never runs sudo)
 "$REPO_ROOT/scripts/check-prereqs.sh" --mode server
 if ! command -v python3 >/dev/null 2>&1; then
@@ -193,11 +213,83 @@ inspect_existing_env() {
   if [[ "$placeholder" == "1" ]]; then
     echo "[setup] WARNING: ${ENV_FILE} still uses the default placeholder POSTGRES_PASSWORD!" >&2
   fi
+
+  # Check explicitly passed flags against preserved .env values (G-01)
+  local conflict_args=("$RENDER_HELPER" check-conflicts --env-file "$ENV_FILE")
+  if [[ "$EXPLICIT_WORKER_MODE" -eq 1 ]]; then
+    conflict_args+=(--worker-mode "$WORKER_MODE")
+  fi
+  if [[ "$EXPLICIT_LAN_PORT" -eq 1 ]]; then
+    conflict_args+=(--lan-port "$LAN_PORT")
+  fi
+  if [[ "$EXPLICIT_SSRF_CIDRS" -eq 1 ]]; then
+    conflict_args+=(--ssrf-blocked-cidrs "$SSRF_BLOCKED_CIDRS")
+  fi
+  if [[ "$INSTALL_WORKER_TIMER" == "yes" ]]; then
+    conflict_args+=(--install-worker-timer)
+  fi
+  for h in "${LAN_HOSTS[@]}"; do
+    conflict_args+=(--lan-host "$h")
+  done
+
+  local conf_rc=0
+  local conf_json=""
+  conf_json="$(python3 "${conflict_args[@]}")" || conf_rc=$?
+  if [[ "$conf_rc" -eq 3 ]]; then
+    python3 - "$conf_json" <<'PY' >&2
+import json, sys
+for msg in json.loads(sys.argv[1]).get("conflicts", []):
+    print(f"[setup] WARNING: {msg}")
+PY
+    if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+      echo "[setup] ERROR: Conflicting flags were passed against preserved ${ENV_FILE} under --non-interactive (edit ${ENV_FILE} manually or omit conflicting flags)." >&2
+      exit 2
+    fi
+  elif [[ "$conf_rc" -ne 0 ]]; then
+    exit "$conf_rc"
+  fi
+}
+
+check_existing_pgdata_volume() {
+  # Guard against generating a new POSTGRES_PASSWORD over an existing initialized pgdata volume (G-02)
+  local pgdata_vol=""
+  local cfg_json=""
+  cfg_json="$(cd "$REPO_ROOT" && POSTGRES_PASSWORD=probe-only docker compose config --format json 2>/dev/null || true)"
+  if [[ -n "$cfg_json" ]]; then
+    pgdata_vol="$(python3 - "$cfg_json" <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    vol = (data.get("volumes") or {}).get("pgdata") or {}
+    name = vol.get("name") or ""
+    if not name and data.get("name"):
+        name = f"{data['name']}_pgdata"
+    print(name)
+except Exception:
+    pass
+PY
+)"
+  fi
+  if [[ -z "$pgdata_vol" ]]; then
+    local proj
+    proj="${COMPOSE_PROJECT_NAME:-$(basename "$REPO_ROOT" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')}"
+    pgdata_vol="${proj}_pgdata"
+  fi
+  if docker volume inspect "$pgdata_vol" >/dev/null 2>&1; then
+    echo "[setup] ERROR: Existing PostgreSQL Docker volume '${pgdata_vol}' detected, but '${ENV_FILE}' is missing." >&2
+    echo "[setup]        Generating a fresh POSTGRES_PASSWORD would fail authentication against the existing database." >&2
+    echo "[setup]        To proceed safely, choose one of:" >&2
+    echo "[setup]          1. Restore your previous .env (or recreate ${ENV_FILE} with the original POSTGRES_PASSWORD)." >&2
+    echo "[setup]          2. Restore from backups/ after removing the old volume." >&2
+    echo "[setup]          3. Explicitly start fresh (DESTROYS ALL DATA): docker volume rm ${pgdata_vol}" >&2
+    exit 1
+  fi
 }
 
 if [[ -f "$ENV_FILE" ]]; then
   inspect_existing_env
 else
+  check_existing_pgdata_volume
   DETECTED_IPV4="$(detect_primary_ipv4)"
   MDNS_HOST="$(detect_mdns_host)"
 
@@ -291,9 +383,19 @@ then
 fi
 echo "[setup] Health check passed."
 
-# 5. Cron-mode systemd user timer (O-06)
+# 5. Cron-mode systemd user timer (O-06, G-01)
 LINGER_WARNING=0
+TIMER_INSTALLED=0
+EXISTING_CRON_FOUND=0
 if [[ "$EFFECTIVE_WORKER_MODE" == "cron" ]]; then
+  existing_cron=""
+  if command -v crontab >/dev/null 2>&1; then
+    existing_cron="$(crontab -l 2>/dev/null | grep -F 'smartrss worker run-once' || true)"
+  fi
+  if [[ -n "$existing_cron" ]]; then
+    EXISTING_CRON_FOUND=1
+  fi
+
   want_timer="$INSTALL_WORKER_TIMER"
   if [[ -z "$want_timer" ]]; then
     if [[ "$NON_INTERACTIVE" -eq 0 && -t 0 ]]; then
@@ -309,10 +411,6 @@ if [[ "$EFFECTIVE_WORKER_MODE" == "cron" ]]; then
   fi
 
   if [[ "$want_timer" == "yes" ]]; then
-    existing_cron=""
-    if command -v crontab >/dev/null 2>&1; then
-      existing_cron="$(crontab -l 2>/dev/null | grep -F 'smartrss worker run-once' || true)"
-    fi
     proceed_timer=1
     if [[ -n "$existing_cron" ]]; then
       echo "[setup] WARNING: Existing SmartRSS crontab entry detected:" >&2
@@ -336,6 +434,7 @@ if [[ "$EFFECTIVE_WORKER_MODE" == "cron" ]]; then
       install -m 0644 "$REPO_ROOT/deploy/systemd/smartrss-worker.timer" "$SYSTEMD_DIR/smartrss-worker.timer"
       systemctl --user daemon-reload
       systemctl --user enable --now smartrss-worker.timer
+      TIMER_INSTALLED=1
       echo "[setup] Installed and enabled smartrss-worker.timer."
 
       linger_val=""
@@ -377,6 +476,12 @@ echo "  make install-client API_ORIGIN=http://${PRIMARY_LAN_HOST}:${EFFECTIVE_PO
 echo ""
 echo "Note: Configure a DHCP reservation on your router for ${PRIMARY_LAN_HOST}"
 echo "      so LAN URLs, ALLOWED_HOSTS, and CORS_ALLOW_ORIGINS stay stable."
+if [[ "$EFFECTIVE_WORKER_MODE" == "cron" && "$TIMER_INSTALLED" -eq 0 && "$EXISTING_CRON_FOUND" -eq 0 ]]; then
+  echo ""
+  echo "WARNING: Worker is NOT scheduled (WORKER_MODE=cron, no smartrss-worker.timer"
+  echo "         installed and no SmartRSS crontab entry detected). Re-run with"
+  echo "         --install-worker-timer or add a host crontab entry to poll feeds."
+fi
 if [[ "$LINGER_WARNING" -eq 1 ]]; then
   echo ""
   echo "WARNING: systemd user linger is NOT enabled for '${USER:-$(id -un)}'."

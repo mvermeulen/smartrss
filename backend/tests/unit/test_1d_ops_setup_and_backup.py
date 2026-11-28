@@ -278,6 +278,9 @@ if [[ "$1" == "compose" && "$2" == "version" ]]; then
   echo "Docker Compose version v2.30.0"
   exit 0
 fi
+if [[ "$1" == "volume" && "$2" == "inspect" ]]; then
+  exit 1
+fi
 if [[ "$1" == "info" ]]; then
   exit 1
 fi
@@ -357,6 +360,9 @@ echo "$*" >> "{docker_log}"
 if [[ "$1" == "compose" && "$2" == "version" ]]; then
   echo "Docker Compose version v2.30.0"
   exit 0
+fi
+if [[ "$1" == "volume" && "$2" == "inspect" ]]; then
+  exit 1
 fi
 if [[ "$1" == "info" ]]; then
   echo "Server Version: 29.0"
@@ -633,3 +639,220 @@ def test_1d_ops_t13_make_install_client_api_origin_alias() -> None:
         check=True,
     )
     assert '--api-origin "http://192.168.1.50:8080"' in res.stdout
+
+
+def test_g01_setup_existing_env_validates_flags_warns_conflicts_and_cron_summary(
+    tmp_path: Path,
+) -> None:
+    """G-01 regression: with an existing .env, setup-server.sh still validates host/CIDR flags
+    before Docker, flags conflicting --worker-mode/--install-worker-timer/--lan-host/--lan-port/
+    --ssrf-blocked-cidrs (exit 2 under --non-interactive), and warns when cron mode has no
+    scheduler configured."""
+
+    class _HealthHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = json.dumps({"status": "ok", "db": "ok", "version": "0.1.0"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _HealthHandler)
+    health_port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    try:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        docker_log = tmp_path / "docker.log"
+        _make_executable(
+            bin_dir / "docker",
+            f"""#!/usr/bin/env bash
+echo "$*" >> "{docker_log}"
+if [[ "$1" == "compose" && "$2" == "version" ]]; then
+  echo "Docker Compose version v2.30.0"
+  exit 0
+fi
+if [[ "$1" == "volume" && "$2" == "inspect" ]]; then
+  exit 1
+fi
+exit 0
+""",
+        )
+        _make_executable(bin_dir / "crontab", "#!/usr/bin/env bash\nexit 1\n")
+
+        script = str(REPO_ROOT / "scripts" / "setup-server.sh")
+        run_env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            "SETUP_HEALTH_URL": f"http://127.0.0.1:{health_port}/api/v1/health",
+            "SETUP_HEALTH_TIMEOUT_SECONDS": "5",
+        }
+
+        daemon_env = tmp_path / "daemon.env"
+        daemon_env.write_text(
+            "POSTGRES_PASSWORD=strong-secret\n"
+            "LAN_PORT=8080\n"
+            "ALLOWED_HOSTS=localhost,192.168.1.50,192.168.1.50:8080\n"
+            "CORS_ALLOW_ORIGINS=http://localhost:8080,http://localhost:4180\n"
+            "SSRF_BLOCKED_CIDRS=\n"
+            "WORKER_MODE=daemon\n"
+            "COMPOSE_PROFILES=daemon\n",
+            encoding="utf-8",
+        )
+        os.chmod(daemon_env, 0o600)
+
+        # (a) Invalid CIDR and invalid host with existing .env -> exit 2 BEFORE any docker call
+        r_bad_cidr = subprocess.run(
+            [
+                script,
+                "--non-interactive",
+                "--env-file",
+                str(daemon_env),
+                "--ssrf-blocked-cidrs",
+                "not-a-cidr",
+                "--skip-pair",
+            ],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            check=False,
+        )
+        assert r_bad_cidr.returncode == 2
+        assert "Invalid CIDR" in r_bad_cidr.stderr
+        assert not docker_log.exists()
+
+        r_bad_host = subprocess.run(
+            [
+                script,
+                "--non-interactive",
+                "--env-file",
+                str(daemon_env),
+                "--lan-host",
+                "http://bad host:9",
+                "--skip-pair",
+            ],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            check=False,
+        )
+        assert r_bad_host.returncode == 2
+        assert "Invalid LAN host" in r_bad_host.stderr
+        assert not docker_log.exists()
+
+        # (b) Conflicting flags against preserved daemon .env under --non-interactive -> exit 2
+        # with explicit conflict warnings and NO docker compose build/up calls
+        r_conflict = subprocess.run(
+            [
+                script,
+                "--non-interactive",
+                "--env-file",
+                str(daemon_env),
+                "--worker-mode",
+                "cron",
+                "--install-worker-timer",
+                "--lan-port",
+                "9090",
+                "--lan-host",
+                "192.168.1.99",
+                "--ssrf-blocked-cidrs",
+                "203.0.113.5/32",
+                "--skip-pair",
+            ],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            check=False,
+        )
+        assert r_conflict.returncode == 2
+        assert "--worker-mode cron ignored" in r_conflict.stderr
+        assert "--install-worker-timer ignored" in r_conflict.stderr
+        assert "--lan-port 9090 ignored" in r_conflict.stderr
+        assert "--lan-host 192.168.1.99 ignored" in r_conflict.stderr
+        assert "--ssrf-blocked-cidrs" in r_conflict.stderr
+        cmds_conflict = docker_log.read_text(encoding="utf-8") if docker_log.exists() else ""
+        assert "compose build" not in cmds_conflict
+        assert "compose up" not in cmds_conflict
+
+        # (c) Cron mode with --non-interactive, no timer installed, empty crontab -> warns clearly
+        cron_env = tmp_path / "cron.env"
+        docker_log.unlink(missing_ok=True)
+        r_cron_unsched = subprocess.run(
+            [
+                script,
+                "--non-interactive",
+                "--worker-mode",
+                "cron",
+                "--lan-host",
+                "192.168.1.60",
+                "--env-file",
+                str(cron_env),
+                "--skip-pair",
+            ],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            check=False,
+        )
+        assert r_cron_unsched.returncode == 0, r_cron_unsched.stderr
+        assert "Worker is NOT scheduled" in r_cron_unsched.stdout
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_g02_setup_refuses_new_password_over_existing_pgdata_volume(tmp_path: Path) -> None:
+    """G-02 regression: when .env is absent but the pgdata Docker volume already exists,
+    setup-server.sh refuses with exit 1, creates no .env, skips compose build/up, and prints
+    recovery options."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    _make_executable(
+        bin_dir / "docker",
+        f"""#!/usr/bin/env bash
+echo "$*" >> "{docker_log}"
+if [[ "$1" == "compose" && "$2" == "version" ]]; then
+  echo "Docker Compose version v2.30.0"
+  exit 0
+fi
+if [[ "$1" == "compose" && "$2" == "config" ]]; then
+  echo '{{"name":"smartrss","volumes":{{"pgdata":{{"name":"smartrss_pgdata"}}}}}}'
+  exit 0
+fi
+if [[ "$1" == "volume" && "$2" == "inspect" && "$3" == "smartrss_pgdata" ]]; then
+  echo '[{{"Name":"smartrss_pgdata"}}]'
+  exit 0
+fi
+exit 0
+""",
+    )
+
+    env_file = tmp_path / "missing.env"
+    res = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts" / "setup-server.sh"),
+            "--non-interactive",
+            "--env-file",
+            str(env_file),
+            "--skip-pair",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
+        check=False,
+    )
+    assert res.returncode == 1
+    assert not env_file.exists()
+    assert "smartrss_pgdata" in res.stderr
+    assert "Restore your previous .env" in res.stderr
+    assert "backups/" in res.stderr
+    assert "docker volume rm smartrss_pgdata" in res.stderr
+    cmds = docker_log.read_text(encoding="utf-8")
+    assert "compose build" not in cmds
+    assert "compose up" not in cmds

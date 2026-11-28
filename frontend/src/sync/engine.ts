@@ -632,7 +632,9 @@ export class SyncEngine {
       }
     }
 
-    // Consume any pending forceFullResync() request strictly inside a fenced lock tx (1d-ops §6)
+    // Consume any pending forceFullResync() request strictly inside a fenced lock tx (1d-ops §6).
+    // Dexie serializes rw transactions on client_meta: any request written before this tx starts
+    // is satisfied by this reset, and any request written after it commits persists (G-05).
     const resyncReq = await getFullResyncRequest(this.db);
     if (resyncReq !== null) {
       await this.db.transaction(
@@ -644,11 +646,7 @@ export class SyncEngine {
           await this.db.bootstrap_items.clear();
           const currentMeta = await getSyncMeta(this.db);
           await setSyncMeta(this.db, { ...currentMeta, sync_cursor: null });
-          // Clear only if no newer forceFullResync() arrived after resyncReq was read
-          const latestReq = await getFullResyncRequest(this.db);
-          if (latestReq?.request_id === resyncReq.request_id) {
-            await clearFullResyncRequest(this.db);
-          }
+          await clearFullResyncRequest(this.db);
         },
       );
     }

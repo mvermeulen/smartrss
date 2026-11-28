@@ -238,25 +238,115 @@ def inspect_env_file(env_path: Path) -> dict[str, object]:
 
     primary_lan_host = "localhost"
     allowed_raw = data.get("ALLOWED_HOSTS", "")
+    allowed_hosts_list: list[str] = []
     for entry in allowed_raw.split(","):
         token = entry.strip()
         if not token:
             continue
+        allowed_hosts_list.append(token)
         host_only = (
             token.rsplit(":", 1)[0] if (":" in token and not token.startswith("[")) else token
         )
-        if host_only.lower() not in _LOOPBACK_HOSTS:
+        if primary_lan_host == "localhost" and host_only.lower() not in _LOOPBACK_HOSTS:
             primary_lan_host = host_only
-            break
+
+    raw_cidrs = data.get("SSRF_BLOCKED_CIDRS", "").strip()
+    try:
+        normalized_cidrs = validate_cidrs(raw_cidrs)
+    except ValueError:
+        normalized_cidrs = raw_cidrs
 
     return {
         "lan_port": lan_port,
         "worker_mode": worker_mode,
         "primary_lan_host": primary_lan_host,
+        "allowed_hosts": allowed_hosts_list,
+        "ssrf_blocked_cidrs": normalized_cidrs,
         "insecure_permissions": insecure_permissions,
         "mode_octal": f"{mode:04o}",
         "placeholder_password": placeholder_password,
     }
+
+
+def _flatten_hosts(raw_hosts: list[str] | None) -> list[str]:
+    flat: list[str] = []
+    for item in raw_hosts or []:
+        for part in item.split(","):
+            if part.strip():
+                flat.append(part.strip())
+    return flat
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Validate setup CLI arguments without touching disk or Docker (G-01)."""
+    if not (1 <= args.lan_port <= 65535):
+        print(f"ERROR: --lan-port must be 1..65535, got {args.lan_port}", file=sys.stderr)
+        return 2
+    if args.worker_mode and args.worker_mode not in ("daemon", "cron"):
+        print(
+            f"ERROR: --worker-mode must be daemon or cron, got {args.worker_mode!r}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        for host in _flatten_hosts(args.lan_host):
+            validate_host_token(host)
+        validate_cidrs(args.ssrf_blocked_cidrs or "")
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_check_conflicts(args: argparse.Namespace) -> int:
+    """Compare explicitly passed setup flags against an existing preserved .env (G-01)."""
+    env_path = Path(args.env_file)
+    if not env_path.is_file():
+        print(f"ERROR: .env file not found: {env_path}", file=sys.stderr)
+        return 2
+    meta = inspect_env_file(env_path)
+    conflicts: list[str] = []
+
+    existing_mode = str(meta["worker_mode"])
+    existing_port = int(meta["lan_port"])  # type: ignore[call-overload]
+    existing_hosts_lower = {
+        (h.rsplit(":", 1)[0] if (":" in h and not h.startswith("[")) else h).lower()
+        for h in meta["allowed_hosts"]  # type: ignore[attr-defined]
+    }
+    existing_cidrs = str(meta["ssrf_blocked_cidrs"])
+
+    if args.worker_mode and args.worker_mode != existing_mode:
+        conflicts.append(
+            f"--worker-mode {args.worker_mode} ignored: preserved .env has "
+            f"WORKER_MODE={existing_mode} (edit .env to change)"
+        )
+    if args.install_worker_timer and existing_mode != "cron":
+        conflicts.append(
+            f"--install-worker-timer ignored: preserved .env has "
+            f"WORKER_MODE={existing_mode} (edit .env to set WORKER_MODE=cron and empty "
+            "COMPOSE_PROFILES)"
+        )
+    if args.lan_port is not None and args.lan_port != existing_port:
+        conflicts.append(
+            f"--lan-port {args.lan_port} ignored: preserved .env has "
+            f"LAN_PORT={existing_port} (edit .env to change)"
+        )
+    for host in _flatten_hosts(args.lan_host):
+        if host.lower() not in existing_hosts_lower:
+            conflicts.append(
+                f"--lan-host {host} ignored: not present in preserved .env "
+                "ALLOWED_HOSTS (edit .env to change)"
+            )
+    if args.ssrf_blocked_cidrs is not None:
+        want_cidrs = validate_cidrs(args.ssrf_blocked_cidrs)
+        if want_cidrs != existing_cidrs:
+            conflicts.append(
+                f"--ssrf-blocked-cidrs {want_cidrs!r} ignored: preserved .env has "
+                f"SSRF_BLOCKED_CIDRS={existing_cidrs!r} (edit .env to change)"
+            )
+
+    print(json.dumps({"conflicts": conflicts}))
+    return 3 if conflicts else 0
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -358,6 +448,22 @@ def main(argv: list[str] | None = None) -> int:
     p_gen.add_argument("--mdns-host", default="")
     p_gen.add_argument("--ssrf-blocked-cidrs", default="")
     p_gen.set_defaults(func=cmd_generate)
+
+    p_val = sub.add_parser("validate")
+    p_val.add_argument("--lan-port", type=int, default=8080)
+    p_val.add_argument("--worker-mode", default="")
+    p_val.add_argument("--lan-host", action="append", default=[])
+    p_val.add_argument("--ssrf-blocked-cidrs", default="")
+    p_val.set_defaults(func=cmd_validate)
+
+    p_conf = sub.add_parser("check-conflicts")
+    p_conf.add_argument("--env-file", required=True)
+    p_conf.add_argument("--lan-port", type=int, default=None)
+    p_conf.add_argument("--worker-mode", default="")
+    p_conf.add_argument("--lan-host", action="append", default=[])
+    p_conf.add_argument("--ssrf-blocked-cidrs", default=None)
+    p_conf.add_argument("--install-worker-timer", action="store_true")
+    p_conf.set_defaults(func=cmd_check_conflicts)
 
     p_insp = sub.add_parser("inspect")
     p_insp.add_argument("--env-file", required=True)

@@ -195,6 +195,55 @@ async def list_feeds_query(
     return list((await session.execute(stmt)).scalars().all())
 
 
+def _reactivate_or_raise(
+    existing: Feed,
+    *,
+    now: datetime,
+    user_title: str | None,
+    resolved_category_id: uuid.UUID | None,
+    poll_interval_minutes: int | None,
+    expiration_days_override: int | None,
+    fetch_full_text: bool,
+    research_policy: dict[str, Any] | None,
+    curation_instructions: str,
+    fields_set: Collection[str],
+) -> Feed:
+    """Reactivate an unsubscribed feed preserving unspecified fields (D3), or raise conflict."""
+    if existing.status != "unsubscribed":
+        raise FeedAlreadySubscribedError(existing.id, existing.status, existing.feed_url)
+
+    field_ts = dict(existing.field_updated_at or {})
+    apply_feed_status_transition(existing, "active", now)
+    stamp_online_lww(field_ts, "status", now, existing.created_at)
+    if user_title is not None:
+        existing.title = user_title
+        stamp_online_lww(field_ts, "title", now, existing.created_at)
+    if resolved_category_id is not None:
+        existing.category_id = resolved_category_id
+        stamp_online_lww(field_ts, "category_id", now, existing.created_at)
+    if poll_interval_minutes is not None:
+        existing.poll_interval_minutes = poll_interval_minutes
+        stamp_online_lww(field_ts, "poll_interval_minutes", now, existing.created_at)
+    if expiration_days_override is not None:
+        existing.expiration_days_override = expiration_days_override
+        stamp_online_lww(field_ts, "expiration_days_override", now, existing.created_at)
+    if "fetch_full_text" in fields_set:
+        existing.fetch_full_text = fetch_full_text
+        stamp_online_lww(field_ts, "fetch_full_text", now, existing.created_at)
+    if research_policy is not None:
+        new_rp = dict(research_policy)
+        stamp_research_policy_fields(
+            field_ts, existing.research_policy, new_rp, now, existing.created_at
+        )
+        existing.research_policy = new_rp
+    if curation_instructions and curation_instructions != existing.curation_instructions:
+        existing.curation_instructions = curation_instructions
+        existing.config_version += 1
+    existing.field_updated_at = field_ts
+    existing.updated_at = now
+    return existing
+
+
 async def create_or_reactivate_feed(
     session: AsyncSession,
     ssrf_policy: SSRFPolicy,
@@ -281,39 +330,18 @@ async def create_or_reactivate_feed(
     ).scalar_one_or_none()
 
     if existing is not None:
-        if existing.status != "unsubscribed":
-            raise FeedAlreadySubscribedError(existing.id, existing.status, existing.feed_url)
-
-        field_ts = dict(existing.field_updated_at or {})
-        apply_feed_status_transition(existing, "active", now)
-        stamp_online_lww(field_ts, "status", now, existing.created_at)
-        if user_title is not None:
-            existing.title = user_title
-            stamp_online_lww(field_ts, "title", now, existing.created_at)
-        if resolved_category_id is not None:
-            existing.category_id = resolved_category_id
-            stamp_online_lww(field_ts, "category_id", now, existing.created_at)
-        if poll_interval_minutes is not None:
-            existing.poll_interval_minutes = poll_interval_minutes
-            stamp_online_lww(field_ts, "poll_interval_minutes", now, existing.created_at)
-        if expiration_days_override is not None:
-            existing.expiration_days_override = expiration_days_override
-            stamp_online_lww(field_ts, "expiration_days_override", now, existing.created_at)
-        if "fetch_full_text" in fields_set:
-            existing.fetch_full_text = fetch_full_text
-            stamp_online_lww(field_ts, "fetch_full_text", now, existing.created_at)
-        if research_policy is not None:
-            new_rp = dict(research_policy)
-            stamp_research_policy_fields(
-                field_ts, existing.research_policy, new_rp, now, existing.created_at
-            )
-            existing.research_policy = new_rp
-        if curation_instructions and curation_instructions != existing.curation_instructions:
-            existing.curation_instructions = curation_instructions
-            existing.config_version += 1
-        existing.field_updated_at = field_ts
-        existing.updated_at = now
-        feed = existing
+        feed = _reactivate_or_raise(
+            existing,
+            now=now,
+            user_title=user_title,
+            resolved_category_id=resolved_category_id,
+            poll_interval_minutes=poll_interval_minutes,
+            expiration_days_override=expiration_days_override,
+            fetch_full_text=fetch_full_text,
+            research_policy=research_policy,
+            curation_instructions=curation_instructions,
+            fields_set=fields_set,
+        )
         reactivated = True
     else:
         default_poll = await _get_default_poll_interval(session)
@@ -348,9 +376,33 @@ async def create_or_reactivate_feed(
             created_at=now,
             updated_at=now,
         )
-        session.add(feed)
-        await session.flush()
-        reactivated = False
+        try:
+            # Savepoint guards concurrent same-URL subscribe race on feeds.feed_url UNIQUE (G-06)
+            async with session.begin_nested():
+                session.add(feed)
+                await session.flush()
+            reactivated = False
+        except IntegrityError:
+            winner = (
+                await session.execute(
+                    sa.select(Feed).where(Feed.feed_url == cleaned_url).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            feed = _reactivate_or_raise(
+                winner,
+                now=now,
+                user_title=user_title,
+                resolved_category_id=resolved_category_id,
+                poll_interval_minutes=poll_interval_minutes,
+                expiration_days_override=expiration_days_override,
+                fetch_full_text=fetch_full_text,
+                research_policy=research_policy,
+                curation_instructions=curation_instructions,
+                fields_set=fields_set,
+            )
+            reactivated = True
 
     await enqueue_job(
         session,
