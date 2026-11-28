@@ -11,7 +11,7 @@
   - the [`1a`–`1c` user-test review](2026-11-26-1a-1c-user-test-implementation-review.md) (`E-09`, `E-11`) and the [`1c` implementation review](2026-11-25-1c-implementation-review.md) (the `forceFullResync()` carry-forward).
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `O` (`O-01`–`O-11`)
-- **Status**: `Addressed (pass 2, 2026-11-27) — awaiting verification`
+- **Status**: `Verified (2026-11-27)` — project owner marked the `1d-ops` design **`Approved`** on 2026-11-27; pass 2 confirmed `O-01-F1` and `O-02-F1` resolved; all `O-01`–`O-11` resolved; owner decisions `Q-1`–`Q-4` recorded
 
 ## Review outcome
 
@@ -341,3 +341,30 @@ Either way, add a test that a `muted` feed round-trips as documented.
 ### Pass-2 design-only check summary
 
 - No application code changed; `make check` previously green on the same code (`205` backend passed, `91.86%` total, all 16 critical modules >= 90%; `32` runner passed, `94.87%`; `57` frontend passed, all gates OK). Ready for Claude Code pass-2 verification.
+
+## Verification pass 2 (2026-11-27)
+
+**Verifier:** Claude Code, on `milestone/1d-ops` at `8a976f3`. That commit changes only the design, the review and the `docs/README.md` row.
+
+**`make check`:** green. Backend: 205 passed, 91.84%, and all 16 critical modules ≥ 90%. Runner: 32 passed, 94.87%. Frontend: 57 passed. The application code is unchanged since pass 1.
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `O-01-F1` | ✅ | D07 and §3 now give `api` **and** `worker` both `image: smartrss-backend:local` and `build: { context: ./backend }`. **Tested** with a throwaway Compose project of exactly this shape (both services sharing one `image:` tag and the same `build:`, with `worker` profile-gated):<br>• `COMPOSE_PROFILES= docker compose run --rm -T worker …` with the image **absent** prints a `pull access denied` *warning*, then builds locally and runs the command (`RUN_OK`). The timer path self-heals.<br>• `up --build` in daemon mode builds both services; the second build is a BuildKit cache hit.<br>• `docker compose build api` builds once, which matches setup's `build api web` claim.<br>`T04` (a) now asserts both the shared tag and `worker.build.context`. The §9 legacy-image cleanup note is added. |
+| `O-02-F1` | ✅ | §6.2 step 5 tracks `lastCycleProgressed` across the drain loop. The post-release `scheduleDebouncedSync(0)` is gated on `res.acquired && lastCycleProgressed && pending`. I checked the edge cases by reasoning:<br>• A `detached` or `misconfigured` cycle returns `progressed === false` before consuming the request, so there is no reschedule and probes stay limited to the poll timer and `online` / `visibilitychange` events.<br>• A progressing cycle always consumes the pending request at its start, so a request seen after release can only be a newer one. Reacting to it immediately is correct, and it can't recur unless yet another request arrives.<br>• If an exception is thrown after an earlier progressing iteration, `lastCycleProgressed` keeps its value from that iteration and can trigger **at most one** extra cycle. That cycle re-initializes the flag to `false`, so it can't loop.<br>The open-ended parenthetical is gone. `T12` (a) adds fake-timer probe-count assertions for `detached` and `misconfigured`, plus the eventual successful bootstrap. The §6.3 rows are updated. |
+| `O-03` implementation note | ✅ | §5.3 step 2 now states the `set -euo pipefail` wrapper rule (`if ! …; then OPML_FAILED=1; fi`). |
+
+All other findings stay ✅ as recorded in pass 1.
+
+### Observations (no action required)
+
+- With `build:` on both services, `docker compose run worker` prints a cosmetic `pull access denied` warning before it builds a missing image. Compose's default `pull_policy: missing` tries the registry first. This is harmless; if the warning bothers the owner in the journal, the implementer can consider `pull_policy: build` on `worker` only. I didn't test that.
+
+### Repo-wide drift
+
+- The design header, the `docs/design/README.md` item and the `AGENTS.md` phase line all say `In Design Review`. The `docs/README.md` review row now says `Verified`. These agree: the design stays `In Design Review` until the owner approves it.
+- There is one review row, with no duplicates. No untracked files. `requirements.md` records `NFR-OPS-02` as approved (`Q-1`).
+
+**Result:** no ⚠️ or ❌ remain, so the review is **`Verified (2026-11-27)`**. The `1d-ops` design is ready for the project owner's approval decision. No approval status was changed.
+
+**Owner decision (2026-11-27):** the project owner approved the `1d-ops` component design (`docs/design/1d-ops-setup-and-cli.md`). Implementation on `milestone/1d-ops` may begin.
