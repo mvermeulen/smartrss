@@ -11,7 +11,7 @@
   - the `1a`, `1b`, `1c` and `1d-ops` designs.
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `W` (`W-01`–`W-20`)
-- **Status**: `Verified (2026-11-28)` — pass 1: 17 resolved, 3 partial → follow-ups `W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1`; pass 2: all follow-ups resolved; owner decisions `Q-1`–`Q-7` incorporated; awaiting owner design-approval decision
+- **Status**: `Verified (2026-11-28)` — pass 1: 17 resolved, 3 partial → follow-ups `W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1`; pass 2: all follow-ups resolved; owner decisions `Q-1`–`Q-7` incorporated — project owner marked the `1d` design **`Approved`** on 2026-11-28
 
 ## Review outcome
 
@@ -519,3 +519,7 @@ All four verification-pass follow-ups (`W-01-F1`, `W-01-F2`, `W-02-F1`, `W-07-F1
 ### Status
 
 `Verified (2026-11-28)`. The `1d` component design is ready for the project owner's design-approval decision. The reviewer does not set `Approved`.
+
+### Owner decision (2026-11-28)
+
+The project owner **approved the `1d` design** on 2026-11-28. Note recorded with the approval: development and `1d-T16` benchmarking run on a Ryzen AI Max+ 495, which is slightly faster than the Ryzen AI Max+ 395 target. Benchmark capacity figures are therefore optimistic for the target (see design §11, "Test hardware").
