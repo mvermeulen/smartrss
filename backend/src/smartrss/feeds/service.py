@@ -417,6 +417,34 @@ async def create_or_reactivate_feed(
     return feed, reactivated
 
 
+def _apply_opml_reactivation(
+    existing: Feed,
+    *,
+    now: datetime,
+    title: str | None,
+    category_id: uuid.UUID | None,
+    safe_site_url: str | None,
+    events: list[SyncEvent],
+    poll_feed_ids: list[uuid.UUID],
+) -> None:
+    """Reactivate an unsubscribed feed during OPML import (shared by snapshot & race paths)."""
+    updated_fields = dict(existing.field_updated_at or {})
+    apply_feed_status_transition(existing, "active", now)
+    stamp_online_lww(updated_fields, "status", now, existing.created_at)
+    if title:
+        existing.title = title
+        stamp_online_lww(updated_fields, "title", now, existing.created_at)
+    if category_id is not None:
+        existing.category_id = category_id
+        stamp_online_lww(updated_fields, "category_id", now, existing.created_at)
+    if safe_site_url:
+        existing.site_url = safe_site_url
+    existing.field_updated_at = updated_fields
+    existing.updated_at = now
+    events.append(SyncEvent("feed", existing.id, "upsert"))
+    poll_feed_ids.append(existing.id)
+
+
 async def import_opml_subscriptions(
     session: AsyncSession,
     ssrf_policy: SSRFPolicy,
@@ -500,21 +528,15 @@ async def import_opml_subscriptions(
                 skipped_duplicates += 1
                 continue
 
-            updated_fields = dict(existing.field_updated_at or {})
-            apply_feed_status_transition(existing, "active", now)
-            stamp_online_lww(updated_fields, "status", now, existing.created_at)
-            if sub.title:
-                existing.title = sub.title
-                stamp_online_lww(updated_fields, "title", now, existing.created_at)
-            if category_id is not None:
-                existing.category_id = category_id
-                stamp_online_lww(updated_fields, "category_id", now, existing.created_at)
-            if safe_site_url:
-                existing.site_url = safe_site_url
-            existing.field_updated_at = updated_fields
-            existing.updated_at = now
-            events.append(SyncEvent("feed", existing.id, "upsert"))
-            poll_feed_ids.append(existing.id)
+            _apply_opml_reactivation(
+                existing,
+                now=now,
+                title=sub.title,
+                category_id=category_id,
+                safe_site_url=safe_site_url,
+                events=events,
+                poll_feed_ids=poll_feed_ids,
+            )
             reactivated += 1
             continue
 
@@ -544,8 +566,32 @@ async def import_opml_subscriptions(
             created_at=now,
             updated_at=now,
         )
-        session.add(feed)
-        await session.flush()
+        try:
+            # Savepoint guards concurrent same-URL insert race on uq_feeds_feed_url (G-06-F1)
+            async with session.begin_nested():
+                session.add(feed)
+                await session.flush()
+        except IntegrityError:
+            winner = (
+                await session.execute(sa.select(Feed).where(Feed.feed_url == url).with_for_update())
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            feeds_by_url[url] = winner
+            if winner.status != "unsubscribed":
+                skipped_duplicates += 1
+                continue
+            _apply_opml_reactivation(
+                winner,
+                now=now,
+                title=sub.title,
+                category_id=category_id,
+                safe_site_url=safe_site_url,
+                events=events,
+                poll_feed_ids=poll_feed_ids,
+            )
+            reactivated += 1
+            continue
         feeds_by_url[url] = feed
         events.append(SyncEvent("feed", feed.id, "upsert"))
         poll_feed_ids.append(feed.id)

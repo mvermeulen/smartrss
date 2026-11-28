@@ -10,7 +10,7 @@
   - `1c` §6 / §11, [`review-checklist.md`](../review-checklist.md) and `development-process.md` §2 / §7.
 - **Reviewer**: Claude Code (Claude Opus 5.5)
 - **Finding prefix**: `G` (`G-01`–`G-06`)
-- **Status**: `Addressed (2026-11-27) — awaiting verification`
+- **Status**: `Addressed (2026-11-27) — awaiting verification (pass 2)`
 
 ## Review outcome
 
@@ -248,3 +248,59 @@ What the guard actually does is keep the newer request, which costs a **second, 
 - **Backend**: `ruff check` + `ruff format --check` (93 files + `scripts/_render_env.py`), `bash -n scripts/setup-server.sh scripts/backup.sh`, `mypy src` (56 files) — all clean. **218 passed**, **92.92%** total branch+line coverage (`>= 80%`). All 17 critical modules pass `>= 90%` (`src/smartrss/feeds/service.py` **97.09%**, `src/smartrss/db/sync_log.py` **95.79%**, lowest critical module `src/smartrss/worker/stages/poll_feed.py` **91.98%**).
 - **Client runner**: **32 passed**, **94.87%** coverage (`>= 90%`).
 - **Frontend**: `eslint` + `prettier --check` + `tsc --noEmit` clean; **62 passed** (`vitest`), overall **93.30%** lines / **89.21%** branches; critical gates (`>= 90%`): `src/sync/engine.ts` **96.88%** lines / **90.41%** branches (lowest critical branch: `src/security/sanitizeHtml.ts` **90.00%**); core gates (`>= 80%`): `src/db/clientMeta.ts` **100.00%** lines / **87.80%** branches.
+
+## Verification pass (2026-11-27)
+
+**Verifier:** Claude Code, on `milestone/1d-ops` at `0f681b6`, with the fixes on top of `ba5c53e`. *Process note:* both commits are local; the branch is 2 commits ahead of `origin`.
+
+**`make check`:** green. Backend: **218 passed** (matches the notes), 92.93%, and all 17 critical modules ≥ 90%. Runner: 32 passed, 94.87%. Frontend: **62 passed** (matches). All gates pass.
+
+**Method.** I disabled each fixed path on its own with a minimal edit, ran the cited test, and restored the file, confirming the restore byte for byte (`git status` clean). That is 9 scripted reverts, plus repeats of the race tests. I also re-ran my original `G-01` stub-`PATH` reproduction and a `G-02` stub run, and added one temporary real-PG test for a sibling path (deleted afterwards).
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `G-01` | ✅ | The **original reproduction now fails correctly**: `--ssrf-blocked-cidrs not-a-cidr --lan-host "http://bad host:9"` → exit `2` with a clear `ERROR`, and **0** `docker` calls (validation now runs before the prerequisite check). Valid but conflicting flags (`--worker-mode cron --install-worker-timer` against a daemon `.env`) print one `WARNING` per flag, then exit `2` under `--non-interactive`, with no `build` / `up`. The existing `.env` is untouched. In cron mode with no scheduler, the summary prints `WARNING: Worker is NOT scheduled`. **Reverts:** removing the upfront `validate`, the conflict `exit 2`, or the unscheduled-worker summary each fails `test_g01_setup_existing_env_validates_flags_warns_conflicts_and_cron_summary`. |
+| `G-02` | ✅ | **Stub run:** no `.env` plus an existing `smartrss_pgdata` volume → exit `1` with three recovery choices; no `.env` is created and there are no `build` / `up` calls. The volume name comes from `docker compose config --format json`; on this repo that yields `{'pgdata': {'name': 'smartrss_pgdata'}}`, and there is a project-name fallback. **Revert:** removing the `check_existing_pgdata_volume` call fails `test_g02_setup_refuses_new_password_over_existing_pgdata_volume`. |
+| `G-03` | ✅ | The savepoint semantics are documented in `1a` (the sync-log guard section) and in `1d-ops` §5.1 (a deviation note). **Reverts:** the committed branch forced to always restore (`if True:`, which was green in the review), the rollback branch forced to always keep (`if False:`), and the nested `before_commit` early return disabled. Each fails `test_g03_synclog_savepoint_committed_recorded_rolled_back_and_nested`. |
+| `G-04` | ✅ | **Revert:** removing `&& !pendingResync` (green against the full suite in the review) now fails `test_g04_force_full_resync_cross_tab_no_broadcast_drain_loop_picks_up_in_same_lock_hold`. |
+| `G-05` (Nit) | ✅ | The guard was removed; `clearFullResyncRequest` is now unconditional inside the fenced transaction, with the reasoning in a comment. The design §6.2 / §6.3 / §8 and the `T12` (b) wording are updated. |
+| `G-06` (pre-existing) | ⚠️ partially resolved → `G-06-F1` | `create_or_reactivate_feed` now wraps the feed insert in a savepoint, re-selects the winner `FOR UPDATE` on `IntegrityError`, and raises `FeedAlreadySubscribedError` or reactivates. **Revert:** disabling the `except IntegrityError:` fails `test_g06_concurrent_same_url_subscribe_raises_already_subscribed` (3/3 runs). **But** the sibling insert path in `import_opml_subscriptions` (`service.py:547-548`) is still unguarded. See `G-06-F1`. |
+
+### Follow-ups
+
+- **`G-06-F1` (Minor): an OPML import racing a single add of the same URL aborts the whole import with a raw `IntegrityError`.**
+  - **Where:** `import_opml_subscriptions` loads its `feeds_by_url` snapshot once (`service.py`, `select(Feed)`), then inserts each new subscription with a plain `session.add(feed); await session.flush()` (`:547-548`), with no savepoint and no `IntegrityError` handling. This is the same shape `G-06` fixed in `create_or_reactivate_feed`.
+  - **Reproduced** with a deterministic temporary real-PG test (since deleted):
+    1. Session B calls `create_or_reactivate_feed(URL)` and does **not** commit.
+    2. Session A starts `import_opml_subscriptions` with an OPML containing URL. Its snapshot can't see B's uncommitted row, so it inserts and blocks on `uq_feeds_feed_url`.
+    3. B commits.
+
+    A then raises `psycopg.errors.UniqueViolation: duplicate key value violates unique constraint "uq_feeds_feed_url"` out of `import_opml_subscriptions`.
+  - **Impact:**
+    - The whole import transaction is lost, not just the one duplicate.
+    - `POST /feeds/import-opml` returns `500`, `smartrss feeds import-opml` prints a traceback, and `make setup --opml` fails under `set -e`.
+    - This is the bulk-variant sibling of `G-06` (the `K-01-F1` pattern).
+  - **Expected fix:** wrap each new-feed insert in the import loop in `async with session.begin_nested():`. On `IntegrityError`, re-select the row by `feed_url` and count it as `skipped_duplicates` if it is active, paused or muted. If it is `unsubscribed`, apply the same reactivation rules as the existing-row branch. The rest of the import continues.
+  - **Regression test:** the exact interleaving above (an uncommitted competitor, the import blocks, then the competitor commits). Assert that the import returns `skipped_duplicates ≥ 1` with the other subscriptions imported, that no exception escapes, and that there is a single row for URL. It must fail against `0f681b6`.
+
+### Repo-wide drift
+
+- The design header, `docs/design/README.md` item 4 and `AGENTS.md` all say `In Implementation Review`, so they agree.
+- There is one row for this review in `docs/README.md` (now updated).
+- `CRITICAL_MODULES` includes `src/smartrss/feeds/service.py`, matching `1d-ops` §8.
+- No untracked files. The temporary reproduction test was deleted, and `git status` is clean.
+
+**Status:** left at `Addressed — verification found follow-ups`. Handed back to Antigravity (`address-review-findings`) for `G-06-F1`.
+
+---
+
+## Follow-up Resolutions (2026-11-27)
+
+- **G-06-F1** — Fixed. Extracted `_apply_opml_reactivation()` in `backend/src/smartrss/feeds/service.py` and wrapped each new `Feed` insert + `flush()` inside `import_opml_subscriptions()` in a savepoint (`async with session.begin_nested():`), catching `IntegrityError` on `uq_feeds_feed_url`, re-selecting the winning row `FOR UPDATE`, updating `feeds_by_url[url]`, and counting `active`/`paused`/`muted` as `skipped_duplicates` or reactivating `unsubscribed` via `_apply_opml_reactivation()` while continuing the rest of the import cleanly. Audited all `Feed(` instantiation sites across `backend/src/smartrss/`: only `create_or_reactivate_feed` (`G-06`) and `import_opml_subscriptions` (`G-06-F1`) insert `Feed` rows. Synced `docs/design/1d-ops-setup-and-cli.md` §5.1 and §8.
+  - Test: `test_g06_f1_opml_import_concurrent_same_url_race_skips_duplicate_and_reactivates` in `backend/tests/integration/test_1d_ops_feeds_cli.py` (deterministic forced-overlap real-PG test where an uncommitted `create_or_reactivate_feed` holds the `uq_feeds_feed_url` lock, OPML import blocks on `INSERT INTO feeds`, competitor commits, and import skips the active duplicate while importing the sibling URL — plus a second scenario where the competitor commits `unsubscribed` and OPML import reactivates it).
+  - Evidence: disabled `except IntegrityError:` in `import_opml_subscriptions` → `test_g06_f1_…` failed with `IntegrityError` (`psycopg.errors.UniqueViolation: duplicate key value violates unique constraint "uq_feeds_feed_url"`); restored → passed. Both active-skip and unsubscribed-reactivation paths are covered (`src/smartrss/feeds/service.py` at **97.25%**).
+
+### Verification (`make check` after `G-06-F1` fix)
+- **Backend**: `ruff check`, `ruff format --check`, and `mypy src` clean. **219 passed**, **92.94%** total branch+line coverage (`>= 80%`). All 17 critical modules pass `>= 90%` (`src/smartrss/feeds/service.py` **97.25%**, `src/smartrss/db/sync_log.py` **95.79%**, lowest critical module `src/smartrss/worker/stages/poll_feed.py` **91.98%**).
+- **Client runner**: **32 passed**, **94.87%** coverage (`>= 90%`).
+- **Frontend**: `eslint`, `prettier --check`, `tsc --noEmit` clean; **62 passed** (`vitest`), overall **93.30%** lines / **89.21%** branches; all critical (`>= 90%`) and core (`>= 80%`) coverage gates pass.

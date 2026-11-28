@@ -626,3 +626,120 @@ async def test_g06_concurrent_same_url_subscribe_raises_already_subscribed(
             )
         ).scalar_one()
         assert count == 1
+
+
+async def test_g06_f1_opml_import_concurrent_same_url_race_skips_duplicate_and_reactivates(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """G-06-F1 regression: OPML import racing an uncommitted single subscribe on the same URL
+    blocks on uq_feeds_feed_url, catches IntegrityError in a savepoint when the competitor commits,
+    counts active/paused/muted as skipped_duplicates (or reactivates unsubscribed), and still
+    imports all other subscriptions cleanly."""
+    policy = _stub_policy()
+    race_active_url = "https://opml-race-active.example.com/rss"
+    other_url = "https://opml-race-other.example.com/rss"
+    race_unsub_url = "https://opml-race-unsub.example.com/rss"
+
+    async def _wait_for_blocked_insert(task: asyncio.Task[Any]) -> None:
+        for _ in range(100):
+            if task.done():
+                task.result()  # Surface any unexpected early error immediately
+                raise AssertionError("OPML import finished without blocking on uq_feeds_feed_url")
+            # Fresh session per poll so Postgres never returns a cached pg_stat_activity snapshot
+            async with session_factory() as s_probe:
+                waiting = (
+                    await s_probe.execute(
+                        sa.text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND pid <> pg_backend_pid() "
+                            "AND wait_event_type = 'Lock' "
+                            "AND state = 'active'"
+                        )
+                    )
+                ).scalar_one()
+            if waiting >= 1:
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("OPML import did not block on uq_feeds_feed_url as expected")
+
+    # (a) Competitor inserts active feed; OPML import races on the same URL + another new URL
+    opml_active = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        f'<outline text="Raced Active" xmlUrl="{race_active_url}"/>'
+        f'<outline text="Other Feed" xmlUrl="{other_url}"/>'
+        "</body></opml>"
+    )
+
+    async def _run_opml(xml: str) -> Any:
+        async with session_factory() as s_a:
+            summary = await import_opml_subscriptions(s_a, policy, opml_xml=xml)
+            await s_a.commit()
+            return summary
+
+    import_task: asyncio.Task[Any] | None = None
+    try:
+        async with session_factory() as s_b:
+            await create_or_reactivate_feed(
+                s_b, policy, feed_url=race_active_url, title="Competitor"
+            )
+            # s_b has flushed race_active_url but NOT committed yet
+            import_task = asyncio.create_task(_run_opml(opml_active))
+            await _wait_for_blocked_insert(import_task)
+            await s_b.commit()
+
+        summary_a = await import_task
+    finally:
+        if import_task is not None and not import_task.done():
+            import_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await import_task
+    assert summary_a.imported == 1
+    assert summary_a.skipped_duplicates == 1
+    assert summary_a.reactivated == 0
+    assert summary_a.rejected_invalid == 0
+
+    async with session_factory() as s:
+        active_cnt = (
+            await s.execute(
+                sa.select(sa.func.count()).select_from(Feed).where(Feed.feed_url == race_active_url)
+            )
+        ).scalar_one()
+        other_cnt = (
+            await s.execute(
+                sa.select(sa.func.count()).select_from(Feed).where(Feed.feed_url == other_url)
+            )
+        ).scalar_one()
+        assert active_cnt == 1
+        assert other_cnt == 1
+
+    # (b) Competitor inserts and transitions to unsubscribed before committing; OPML import
+    # catches IntegrityError and reactivates cleanly
+    opml_unsub = (
+        '<?xml version="1.0"?><opml version="2.0"><body>'
+        f'<outline text="Reactivated By OPML" xmlUrl="{race_unsub_url}"/>'
+        "</body></opml>"
+    )
+    import_task2: asyncio.Task[Any] | None = None
+    try:
+        async with session_factory() as s_b2:
+            f_unsub, _ = await create_or_reactivate_feed(s_b2, policy, feed_url=race_unsub_url)
+            f_unsub.status = "unsubscribed"
+            await s_b2.flush()
+            import_task2 = asyncio.create_task(_run_opml(opml_unsub))
+            await _wait_for_blocked_insert(import_task2)
+            await s_b2.commit()
+
+        summary_b = await import_task2
+    finally:
+        if import_task2 is not None and not import_task2.done():
+            import_task2.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await import_task2
+    assert summary_b.reactivated == 1
+    assert summary_b.imported == 0
+    assert summary_b.skipped_duplicates == 0
+    async with session_factory() as s:
+        row = (await s.execute(sa.select(Feed).where(Feed.feed_url == race_unsub_url))).scalar_one()
+        assert row.status == "active"
+        assert row.title == "Reactivated By OPML"
