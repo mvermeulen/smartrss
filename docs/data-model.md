@@ -191,9 +191,11 @@ stateDiagram-v2
 | `id` | `UUID` (PK) | |
 | `item_id` | `UUID` (FK → `items.id`, indexed) | |
 | `is_current` | `BOOLEAN` (DEFAULT TRUE) | Unique partial index `(item_id) WHERE is_current` |
-| `status` | `TEXT` (`pending`, `completed`, `inherited`, `failed`) | `inherited` = exact-URL duplicate referencing cluster primary |
-| `prompt_config_id` | `UUID` (FK → `prompt_configs.id`) | Exact prompt version |
-| `model_name` | `TEXT` | e.g., `qwen3:30b-a3b` |
+| `status` | `TEXT` (`pending`, `completed`, `inherited`, `failed`) | `inherited` = exact-URL duplicate referencing cluster primary; awaiting-enrichment items have no `is_current` row in `1d` |
+| `prompt_config_id` | `UUID` (NULL, FK → `prompt_configs.id`) | Exact `enrichment_system` prompt version |
+| `user_prompt_config_id` | `UUID` (NULL, FK → `prompt_configs.id`) | Exact `enrichment_user` prompt version (`1d`) |
+| `interest_profile_version` | `INT` (NULL) | Active `interest_profiles.version` used during enrichment (`1d`) |
+| `model_name` | `TEXT` | e.g., `qwen3.5:35b-a3b-q8_0-ctx256k` |
 | `tldr` | `TEXT` | Concise summary |
 | `takeaways` | `JSONB` | Array of 2–5 bullet strings |
 | `depth_type` | `TEXT` | `news-brief`, `deep-dive`, `paper-report`, `opinion`, `release-notes`, `discussion` |
@@ -201,6 +203,7 @@ stateDiagram-v2
 | `relevance_rationale` | `TEXT` | Concise "why" explanation |
 | `research_context` | `TEXT` (NULL) | Synthesized primary-source context |
 | `feed_instructions_hash` | `TEXT` (NULL) | SHA-256 of effective `curation_instructions` + active `feed_instruction` notes used during enrichment (for UI transparency & offline eval) |
+| `prompt_truncated` | `BOOLEAN` (NOT NULL DEFAULT FALSE) | `TRUE` when user-written `feed_instructions` or `interest_profile` exceeded its token budget (`1d`) |
 | `prompt_eval_ms` / `generation_ms` | `INT` (NULL) | Runtime-reported prompt evaluation & token generation durations (when provided by Ollama/`llama.cpp`) |
 | `latency_ms` / `prompt_tokens` / `completion_tokens` | `INT` | Total LLM call wall-clock latency and token counts |
 | `parse_retries` | `SMALLINT` (DEFAULT 0) | Number of JSON schema recovery retries required |
@@ -227,7 +230,7 @@ Separates vector storage from `item_enrichments` so changing the embedding model
 
 ### 4.9 `prompt_configs`, `interest_profiles`, `sync_mutations`, `jobs`, `pipeline_runs`, `stage_metrics`, `app_settings`
 - **`prompt_configs`**: `id`, `name` (`enrichment_system`, `enrichment_user`, `mini_research`, etc.), `version (INT)`, `origin` (`default` | `user`), `default_revision (TEXT NULL)`, `template_text`, `model_override`, `is_active`, `notes`, `created_at`.
-  - **Seeding & Upgrades**: Shipped prompt templates live in repo files and are seeded on startup with `origin = 'default'`. User edits create a new active row with `origin = 'user'`; future app upgrades add new `origin = 'default'` revisions without overwriting an active `origin = 'user'` prompt (surfacing an optional "View updated default" diff in the UI).
+  - **Seeding & Upgrades**: Shipped prompt templates live in repo files (`1d-v1` frozen in migration `0004`; subsequent revisions seeded by `smartrss db migrate` under `LOCK_PROMPT_SEED`, never blocking API startup). User edits create a new active row with `origin = 'user'`; future app upgrades add new `origin = 'default'` revisions without overwriting an active `origin = 'user'` prompt (surfacing an optional "View updated default" diff in the UI).
 - **`interest_profiles`**: `id`, `version (INT)`, `profile_markdown`, `is_active`, `created_at`. Online-only edit with optimistic `version` check.
 - **`sync_mutations`**: `client_mutation_id (UUID PK)`, `device_id (UUID FK → devices.id)`, `mutation_type`, `entity_type`, `entity_id (UUID NULL)`, `payload_sha256 (TEXT NOT NULL)`, `client_timestamp`, `effective_timestamp`, `server_applied_at`, `outcome` (`applied`, `superseded`, `rejected`), `rejection_reason (TEXT NULL)`, `affected_count (INT NULL)`. Pruned after 90 days.
 - **`jobs`**:
@@ -239,12 +242,14 @@ Separates vector storage from `item_enrichments` so changing the embedding model
   - `id (UUID PK)`, `trigger (TEXT)` (`scheduler_window` | `cron_cli` | `manual`), `stages (TEXT[])`, `status (TEXT)` (`running` | `completed` | `partial` | `failed`), `started_at (TIMESTAMPTZ NOT NULL)`, `finished_at (TIMESTAMPTZ NULL)`, `duration_ms (INT NULL)`, `feeds_polled (INT NOT NULL DEFAULT 0)` (feeds successfully polled, including HTTP `304`), `feeds_not_modified (INT NOT NULL DEFAULT 0)` (subset of `feeds_polled` answered with HTTP `304 Not Modified`), `items_polled (INT DEFAULT 0)` (new items ingested by `poll_feed`; exposed in `worker run-once --json` alongside `items_ingested`), `items_extracted (INT DEFAULT 0)`, `items_clustered (INT DEFAULT 0)`, `items_researched (INT DEFAULT 0)`, `items_enriched (INT DEFAULT 0)`, `jobs_failed (INT DEFAULT 0)`, `total_llm_ms (BIGINT DEFAULT 0)`, `notes (TEXT NULL)`.
   - Tracks scheduled cron windows and `worker run-once` batch executions so users can inspect end-to-end batch duration and tune schedules. Pruned after 180 days.
 - **`stage_metrics`**:
-  - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`; `304 Not Modified` stays `'ok'` so success-rate rollups count conditional hits as healthy), `outcome (TEXT NULL CHECK (outcome IN ('fetched', 'not_modified')))` (set by `poll_feed` on successful HTTP 2xx / 304 responses; `NULL` for errors, skips, and other job types), `http_status (SMALLINT NULL)` (final HTTP status code recorded by `poll_feed` when a response was received; `NULL` otherwise), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on `enrich_item`: `enriched_at - items.fetched_at`), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
+  - `id (BIGSERIAL PK)`, `run_id (UUID NULL FK → pipeline_runs.id ON DELETE SET NULL)`, `job_type (TEXT NOT NULL)`, `feed_id (UUID NULL)`, `item_id (UUID NULL)`, `model_name (TEXT NULL)`, `prompt_config_id (UUID NULL)`, `user_prompt_config_id (UUID NULL)`, `interest_profile_version (INT NULL)`, `prompt_truncated (BOOLEAN NOT NULL DEFAULT FALSE)`, `status (TEXT NOT NULL)` (`ok` | `failed` | `skipped`; `304 Not Modified` stays `'ok'` so success-rate rollups count conditional hits as healthy), `outcome (TEXT NULL CHECK (outcome IN ('fetched', 'not_modified')))` (set by `poll_feed` on successful HTTP 2xx / 304 responses; `NULL` for errors, skips, and other job types), `http_status (SMALLINT NULL)` (final HTTP status code recorded by `poll_feed` when a response was received; `NULL` otherwise), `queue_wait_ms (INT NOT NULL)`, `duration_ms (INT NOT NULL)`, `llm_prompt_ms (INT NULL)`, `llm_gen_ms (INT NULL)`, `prompt_tokens (INT NULL)`, `completion_tokens (INT NULL)`, `readiness_lag_ms (BIGINT NULL)` (recorded on first non-backfill `enrich_item`: `enriched_at - items.fetched_at`; `NULL` on re-enrichments and backfills), `created_at (TIMESTAMPTZ NOT NULL DEFAULT now())`.
   - Indexed on `(job_type, created_at)` and `(feed_id, created_at)`. Enables fast exact SQL `p50`/`p95`/`avg` latency, tok/s, readiness lag, and per-feed GPU cost queries even after `jobs` rows are pruned at 30 days. Pruned after 180 days (~15–20 MB total at ~200 items/day).
 - **`app_settings`** (single row, `id SMALLINT PK CHECK (id = 1)`):
   - `1a` columns: `default_expiration_days (INT NOT NULL DEFAULT 30)`, `backfill_cap (INT NOT NULL DEFAULT 10)`, `default_poll_interval_minutes (INT NOT NULL DEFAULT 60)`, `last_retention_cleanup_at (TIMESTAMPTZ NULL)`, `updated_at`.
+  - `1d` synced columns: `llm_paused (BOOLEAN NOT NULL DEFAULT FALSE)`, `llm_quiet_hours_enabled (BOOLEAN NOT NULL DEFAULT FALSE)`, `llm_quiet_hours_start (SMALLINT NOT NULL DEFAULT 9)`, `llm_quiet_hours_end (SMALLINT NOT NULL DEFAULT 17)`, `enrichment_schedule_mode (TEXT NOT NULL DEFAULT 'continuous')`, `enrichment_cron_expression (TEXT NOT NULL DEFAULT '0 */2 * * *')`, `enrichment_window_minutes (INT NOT NULL DEFAULT 60)`, `enrichment_timezone (TEXT NOT NULL DEFAULT 'UTC')`.
+  - `1d` internal operational columns (never client-synced, no `sync_changes` event): `llm_unavailable_since (TIMESTAMPTZ NULL)`, `llm_last_error (TEXT NULL)`.
   - Env vars (`DEFAULT_*`) seed the row only in the initial migration; the DB is authoritative thereafter (changed via `smartrss settings set` in `1a`, and via the sync/settings API from `1b`/`1c`).
-  - `last_retention_cleanup_at` is an **internal operational** column: it is never client-synced and writing it does not emit an `app_settings` sync change. LLM/clustering/research columns are added in `1d`–`1f`.
+  - `last_retention_cleanup_at`, `llm_unavailable_since`, and `llm_last_error` are **internal operational** columns: they are never client-synced and writing them does not emit an `app_settings` sync change. Clustering/research columns are added in `1e`–`1f`.
 
 ## 5. Sync Surface, Conflict Resolution & Bulk Semantics
 
